@@ -523,3 +523,9 @@ capauth-gated tailnet REST gateway, with zero tmux/ttyd/worktree dependency (the
 `FakeSpawner` stands in). **P1** swaps in the real `TmuxSpawner` (git worktree + tmux
 + ttyd/sshx) on `.158`; **P2** is the Flutter session-switcher; **P3** wires `pi` +
 the coord board. The sovereign "phone drives my swarm" — built on what SKWorld owns.
+
+> **P1 input-validation requirement (RCE guard):** the real `TmuxSpawner` feeds
+> `repo`/`agent` into `git worktree`/`tmux`/`ttyd`. It MUST use argv-list `subprocess`
+> (no `shell=True`), allow-list `repo` roots, and constrain `agent`/session names to
+> `[A-Za-z0-9_-]+`. See spec §7 "P1 TmuxSpawner mandate" — capauth gating is not a
+> substitute for validating this input.

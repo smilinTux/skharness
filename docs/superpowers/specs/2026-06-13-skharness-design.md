@@ -105,6 +105,11 @@ with FastAPI `TestClient` + a fake capauth verifier.
   gateway + web-terminal), unlike Claude Code Remote Control.
 - **sshx option** — for E2E-encrypted, server-blind terminals, prefer `sshx` over
   `ttyd` in P1 (stronger sovereignty; the server never sees keystrokes).
+- **P1 TmuxSpawner mandate (RCE guard):** never build shell strings from `repo`/`agent`
+  — use argv-list `subprocess` (no `shell=True`); validate `repo` against an allow-list
+  of known repo roots; constrain `agent`/tmux-session names to `[A-Za-z0-9_-]+`. capauth
+  gating is not a substitute for input validation — a buggy/compromised authenticated
+  client still reaches this code.
 
 ## 8. Open items folded into the plan
 
