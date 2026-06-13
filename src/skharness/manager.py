@@ -20,7 +20,11 @@ class SessionManager:
         sid = os.urandom(6).hex()
         s = Session(id=sid, agent=agent, repo=repo, created_at=time.time())
         self.registry.add(s)
-        s = await self.spawner.spawn(s, prompt=prompt)
+        try:
+            s = await self.spawner.spawn(s, prompt=prompt)
+        except Exception:
+            self.registry.set_status(sid, SessionStatus.ENDED)
+            raise
         s.status = SessionStatus.RUNNING
         self.registry.update(s)
         return s

@@ -20,7 +20,9 @@ def build_app(*, manager: SessionManager, verify_caller: Verifier) -> FastAPI:
     def _auth(authorization: str | None) -> None:
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(401, "missing bearer token")
-        token = authorization[len("Bearer "):]
+        token = authorization[len("Bearer "):].strip()
+        if not token:
+            raise HTTPException(401, "missing bearer token")
         if not verify_caller(token):
             raise HTTPException(403, "unauthorized")
 
