@@ -12,12 +12,12 @@ from pathlib import Path
 
 import yaml
 
-from .types import RepoSpec
+from .types import QualityMode, RepoSpec, coerce_quality
 
 _REPO_KEYS = {
     "name", "path", "base_branch", "integration_branch", "test_cmd", "ci",
     "coverage_cmd", "ci_poll_timeout", "ci_scope", "automerge", "auto_revert",
-    "min_diff_coverage", "sandbox_image",
+    "min_diff_coverage", "sandbox_image", "min_quality",
 }
 
 
@@ -55,6 +55,8 @@ class Config:
     live_execution: bool = False
     mcp_endpoints: list[str] = field(default_factory=list)
     sandbox_image: str | None = None
+    default_quality: QualityMode = QualityMode.GATED   # per-interface default quality
+    #   (toggle spec 2.2 step 3); board/CLI runs fall back to this, then to gated.
 
     def repo(self, name: str) -> RepoSpec | None:
         return self.repo_map.get(name)
@@ -69,6 +71,8 @@ class Config:
         for name, spec in (raw.get("repo_map") or {}).items():
             spec = dict(spec)
             spec.setdefault("name", name)                 # key is the canonical name
+            if spec.get("min_quality") is not None:       # yaml str -> QualityMode floor
+                spec["min_quality"] = coerce_quality(spec["min_quality"])
             repo_map[name] = RepoSpec(**{k: v for k, v in spec.items() if k in _REPO_KEYS})
         caps_raw = raw.get("caps") or {}
         caps = Caps(**{k: v for k, v in caps_raw.items()
@@ -90,6 +94,7 @@ class Config:
             live_execution=bool(raw.get("live_execution", False)),
             mcp_endpoints=list(raw.get("mcp_endpoints") or []),
             sandbox_image=raw.get("sandbox_image"),
+            default_quality=coerce_quality(raw.get("default_quality")),
         )
 
 

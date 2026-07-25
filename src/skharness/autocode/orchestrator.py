@@ -11,7 +11,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .types import WorkItem, AssessBrief, DecisionItem
+from .types import (WorkItem, AssessBrief, DecisionItem, QualityMode,
+                    QUALITY_RANK, coerce_quality)
 from .executor import EXECUTORS
 from .config import Caps, Config
 from .harness import build_harness
@@ -66,22 +67,67 @@ def repo_tag(task: dict) -> str | None:
     return repos[0] if len(repos) == 1 else None
 
 
-def classify_kind(task: dict) -> str:
-    """Route to an executor kind by repo tag then source (skjoule vocab)."""
+def _quality_from_tags(task: dict) -> QualityMode | None:
+    """A per-task `quality:<mode>` tag (mirrors the `repo:<name>` tag vocabulary),
+    or None when absent. An unrecognized value fails closed (coerce -> gated)."""
+    for t in (task.get("tags") or []):
+        if t.startswith("quality:"):
+            return coerce_quality(t.split(":", 1)[1])
+    return None
+
+
+def _repo_floor(task: dict, config) -> QualityMode | None:
+    """The per-repo quality FLOOR (RepoSpec.min_quality, toggle spec G6), or None."""
+    name = repo_tag(task)
+    if not name or config is None:
+        return None
+    repo = getattr(config, "repo_map", {}).get(name)
+    mq = getattr(repo, "min_quality", None)
+    return None if mq is None else coerce_quality(mq)
+
+
+def resolve_quality(task: dict, config=None) -> QualityMode:
+    """Resolve the effective QualityMode for a task (toggle spec 2.2 chain):
+    per-task `quality:` tag > interface default (`config.default_quality`) > gated.
+    Then RAISE to the per-repo floor if one is set (a floor can only strengthen,
+    never weaken; quality is never lowered implicitly)."""
+    q = _quality_from_tags(task)
+    if q is None:
+        q = coerce_quality(getattr(config, "default_quality", None))
+    floor = _repo_floor(task, config)
+    if floor is not None and QUALITY_RANK[floor] > QUALITY_RANK[q]:
+        q = floor
+    return q
+
+
+def classify_kind(task: dict, config=None) -> str:
+    """Route to an executor kind by repo tag (+ quality) then source (skjoule vocab).
+
+    A repo-tagged task routes to `engineering-direct` only when its resolved quality
+    is DIRECT; every other quality (GATED, and fail-safe NONE) routes to the gated
+    `engineering` crown-jewel path."""
     if any(t.startswith("repo:") for t in (task.get("tags") or [])):
-        return "engineering"
+        return ("engineering-direct"
+                if resolve_quality(task, config) == QualityMode.DIRECT else "engineering")
     return {"itil": "ops", "email": "research", "telegram": "research",
             "order": "orders", "calendar": "calendar"}.get(task.get("source", "coord"),
                                                             "engineering")
 
 
-def _to_workitem(task: dict, *, unblocked: bool = True, verdict: str = "valid") -> WorkItem:
+def _to_workitem(task: dict, *, unblocked: bool = True, verdict: str = "valid",
+                 config=None) -> WorkItem:
     """Build a WorkItem, enriching the payload with the phase-0 facts the executor's
     selectable/run contract reads (unblocked, verdict) and mapping coord's
-    acceptance_criteria onto the `acceptance` key the executor expects."""
+    acceptance_criteria onto the `acceptance` key the executor expects.
+
+    Normalization happens here exactly once (toggle spec 2.2): the resolved
+    QualityMode (tag > default > gated, then raised to the repo floor) is written
+    into `payload["quality"]`, and `classify_kind` reads the same chain to pick the
+    executor kind. Downstream code reads only the normalized value."""
     payload = {**task, "unblocked": unblocked, "verdict": verdict,
-               "acceptance": task.get("acceptance_criteria") or task.get("acceptance") or []}
-    return WorkItem(kind=classify_kind(task), ref=task["id"],
+               "acceptance": task.get("acceptance_criteria") or task.get("acceptance") or [],
+               "quality": resolve_quality(task, config).value}
+    return WorkItem(kind=classify_kind(task, config), ref=task["id"],
                     source=task.get("source", "coord"), repo=repo_tag(task), payload=payload)
 
 
@@ -102,7 +148,7 @@ def deepdive_spawn(board, proposals, *, caps: Caps, run_id: str,
 
 def phase0_assess(*, board, harness, tasks_dir, caps: Caps, run_id: str,
                   dry_run: bool = False, codebase_context: str = "",
-                  deepdive_proposals=None, only: str | None = None
+                  deepdive_proposals=None, only: str | None = None, config=None
                   ) -> tuple[list[WorkItem], list[DecisionItem]]:
     """Reclaim stale claims, compute unblocked, assess each candidate, apply the
     verdict (stale rewrite / obsolete close / needs_decision queue), spawn capped
@@ -128,12 +174,12 @@ def phase0_assess(*, board, harness, tasks_dir, caps: Caps, run_id: str,
                             codebase_context=codebase_context)
         v = harness.assess(brief)
         if v.verdict == "valid":
-            candidates.append(_to_workitem(t, verdict="valid"))
+            candidates.append(_to_workitem(t, verdict="valid", config=config))
         elif v.verdict == "stale":
             if not dry_run:
                 board.update_task(tid, description=v.updated_description,
                                   acceptance_criteria=v.updated_acceptance, run_id=run_id)
-            candidates.append(_to_workitem(t, verdict="stale"))
+            candidates.append(_to_workitem(t, verdict="stale", config=config))
         elif v.verdict == "obsolete":
             if not dry_run:
                 board.close_task_obsolete(tid, v.reason, run_id=run_id)
@@ -260,10 +306,13 @@ def build_executors(config, board, run_id: str) -> dict:
     global EXECUTORS."""
     from . import stubs as _stubs        # noqa: F401  import self-registers the stubs
     from . import digest as digest_mod
+    from .direct import DirectExecutor
     from .engineering import EngineeringExecutor
     table = dict(EXECUTORS)
-    table["engineering"] = EngineeringExecutor(config, board,
-                                               journal.handle(run_id), digest_mod)
+    handle = journal.handle(run_id)
+    table["engineering"] = EngineeringExecutor(config, board, handle, digest_mod)
+    # the simple/unattended toggle: same helpers, one run, no gate, never merges.
+    table["engineering-direct"] = DirectExecutor(config, board, handle, digest_mod)
     return table
 
 
@@ -294,7 +343,7 @@ def run_once(*, board, harness, config, tasks_dir=None, run_id=None, dry_run=Non
     candidates, decisions = phase0_assess(
         board=board, harness=harness, tasks_dir=tasks_dir or _default_tasks_dir(),
         caps=caps, run_id=run_id, dry_run=dry, deepdive_proposals=deepdive_proposals,
-        only=task)
+        only=task, config=config)
 
     if kill_switch_active(config.enabled):
         return _checkpoint("triage")

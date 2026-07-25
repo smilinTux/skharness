@@ -2,6 +2,48 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
+
+
+class QualityMode(str, Enum):
+    """One quality axis, three values (toggle spec Decision 1).
+
+    GATED  -> the hardcore loop: worktree + Ralph rounds + 1-5 grade + twin gate
+              + merge policy (EngineeringExecutor, the crown jewel, verbatim).
+    DIRECT -> simple/unattended: ONE sandboxed harness run in a worktree, branch
+              + diff + PR produced, NO grade, NO gate, NEVER merges (DirectExecutor).
+    NONE   -> no engine at all: a plain live session (skcode/telegram only).
+
+    Ordered by strength (NONE < DIRECT < GATED); quality is only ever lowered by an
+    explicit, attributable choice, never implicitly. GATED is the always-fallback.
+    """
+    GATED = "gated"
+    DIRECT = "direct"
+    NONE = "none"
+
+
+# Strength ranking so a per-repo floor (RepoSpec.min_quality) can only raise, never
+# lower, a requested mode. Higher rank = stronger (more review) = safer.
+QUALITY_RANK: dict[QualityMode, int] = {
+    QualityMode.NONE: 0,
+    QualityMode.DIRECT: 1,
+    QualityMode.GATED: 2,
+}
+
+
+def coerce_quality(value) -> QualityMode:
+    """Normalize a str / QualityMode / None into a QualityMode (default GATED).
+
+    Unknown strings fail closed to GATED: quality is never lowered by a typo.
+    """
+    if isinstance(value, QualityMode):
+        return value
+    if value is None:
+        return QualityMode.GATED
+    try:
+        return QualityMode(str(value).strip().lower())
+    except ValueError:
+        return QualityMode.GATED
 
 
 @dataclass
@@ -28,6 +70,9 @@ class RepoSpec:                       # one entry of repo_map (autopilot.yaml)
     auto_revert: bool = False
     min_diff_coverage: float = 0.8
     sandbox_image: str | None = None
+    min_quality: QualityMode | None = None   # per-repo quality FLOOR (toggle spec G6):
+    #   e.g. min_quality=gated on a deployed-service repo upgrades any direct/none
+    #   request against it to gated. None means no floor (current behavior preserved).
 
 
 @dataclass
@@ -70,6 +115,9 @@ class GateResult:
     passed: bool
     notes: str
     artifact: str | None
+    mode: str = "gated"               # which QualityMode produced this result; default
+    #   "gated" preserves every existing construction site (and the twin gate's byte-
+    #   identical GateResult(...) returns) for full back-compat.
 
 
 @dataclass
