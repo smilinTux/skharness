@@ -224,6 +224,15 @@ class EngineeringExecutor:
         return proc.stdout.strip()
 
     def finalize(self, item: WorkItem, result: GateResult) -> None:
+        # G2 defense-in-depth: this executor owns the twin-gated merge path, so a
+        # non-gated result must never reach it. A missing `mode` attribute is
+        # treated as gated for back-compat (every pre-toggle GateResult had no
+        # mode field at all). Refuse BEFORE any commit/merge/push.
+        if getattr(result, "mode", "gated") != "gated":
+            raise RuntimeError(
+                "EngineeringExecutor cannot finalize a non-gated result; "
+                "non-gated work is finalized by its own executor "
+                "(toggle spec G1/G2/G4).")
         repo = self.resolve_repo(item)
         wt = self.journal.worktree_for(item.ref)
         pr_branch = f"autopilot/{item.ref}"

@@ -134,6 +134,22 @@ def test_g2_direct_merge_helper_is_structurally_refused():
         ex._merge(_spec(), "autopilot/t1")         # even if called directly, it refuses
 
 
+def test_g2_gated_finalize_refuses_non_gated_result(mocker):
+    """Inverse of the DirectExecutor guard: EngineeringExecutor (the GATED
+    executor) must refuse a result whose mode is not 'gated', before any
+    commit/merge/push, even though it never produces such a result itself."""
+    calls = _recording_run(mocker)
+    ex = EngineeringExecutor(_cfg(), board=mocker.Mock(), journal=mocker.Mock(),
+                             digest=mocker.Mock())
+    ex.journal.worktree_for.return_value = "/wt/t1"
+    direct = GateResult(score=None, passed=True, notes="ungated", artifact="/wt/t1",
+                        mode="direct")
+    with pytest.raises(RuntimeError):
+        ex.finalize(_item(), direct)
+    assert calls == []                              # refused BEFORE any git ran (no commit)
+    ex.digest.queue_decision.assert_not_called()
+
+
 # --------------------------------------------------------------------------- #
 # min_quality FLOOR (G6): a direct request is upgraded to gated on a floored repo #
 # --------------------------------------------------------------------------- #
