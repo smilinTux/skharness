@@ -7,6 +7,8 @@ import json
 import os
 import subprocess
 
+from skharness.harness import Harness
+
 from ..claude_code import frame
 from ..sandbox import LaunchSpec
 from ..types import (AssessBrief, GateResult, GradeBrief, HarnessResult,
@@ -100,7 +102,11 @@ def parse_event_stream(body: str) -> dict:
     return {}
 
 
-class BaseCliAdapter:
+class BaseCliAdapter(Harness):
+    """Task-plane adapter over the shared Docker sandbox. Subclasses the unified
+    Harness contract: it implements the task plane (assess/run_task/grade below)
+    and leaves the session plane at Harness's gated default. Concrete adapters
+    declare merged capabilities (task_plane=True, session_plane=False)."""
     name = "base"
 
     def __init__(self, sandbox, egress_hosts=None, live_execution: bool = False):

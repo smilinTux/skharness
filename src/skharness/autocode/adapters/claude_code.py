@@ -29,7 +29,9 @@ class ClaudeCodeAdapter(BaseCliAdapter):
 
     def capabilities(self):
         return {"session_resume": True, "structured_output": "json",
-                "sandbox": True, "tool_restrictions": True}
+                "sandbox": True, "tool_restrictions": True,
+                "task_plane": True, "session_plane": False,
+                "headless_api": "none", "hot_set_model": False}
 
     def _argv(self, prompt: str) -> list[str]:
         # Bound the agentic loop. Without --max-turns, `claude -p` runs unbounded
