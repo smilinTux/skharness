@@ -1,0 +1,65 @@
+from skharness.autocode.sandbox import Sandbox, LaunchSpec, AuthMount
+
+
+def _spec(**kw):
+    base = dict(name="claude-code", argv=["claude", "-p", "hi"], image="sandbox-claude:1",
+                worktree="/tmp/wt", auth_mounts=[AuthMount("/home/u/.claude/.credentials.json",
+                "/home/sbx/.claude/.credentials.json")], auth_env={"X": "1"},
+                egress_hosts=["api.anthropic.com"])
+    base.update(kw)
+    return LaunchSpec(**base)
+
+
+def test_docker_argv_is_hardened_and_confined():
+    argv = Sandbox()._docker_run_argv(_spec(), network="sbxnet", proxy_alias="sbxproxy")
+    j = " ".join(argv)
+    assert argv[0:2] == ["docker", "run"]
+    assert "--rm" in argv and "--network" in argv and "sbxnet" in argv
+    assert "--read-only" in argv
+    assert "--security-opt" in argv and "no-new-privileges" in j
+    assert "--cap-drop" in argv and "ALL" in argv
+    assert "--user" in argv
+    assert "type=bind,src=/tmp/wt,dst=/work" in j        # worktree RW at /work
+    assert "/home/sbx/.claude/.credentials.json" in j and "readonly" in j
+    assert any(a.startswith("HTTPS_PROXY=") and "sbxproxy" in a for a in argv)
+    assert "/var/run/docker.sock" not in j               # never mount the socket
+    assert argv[-3:] == ["claude", "-p", "hi"]           # harness argv is the tail
+
+
+def test_no_secret_paths_mounted():
+    j = " ".join(Sandbox()._docker_run_argv(_spec(), "n", "p"))
+    for secret in (".skcapstone", ".hermes", ".ssh", "skvault"):
+        assert secret not in j
+
+
+def test_container_name_is_inserted_without_disturbing_the_tail():
+    argv = Sandbox()._docker_run_argv(_spec(), "n", "p", container_name="sbxrun-x")
+    assert "--name" in argv
+    assert argv[argv.index("--name") + 1] == "sbxrun-x"
+    assert argv[-3:] == ["claude", "-p", "hi"]           # harness argv is still the tail
+
+
+def test_no_container_name_omits_the_flag():
+    argv = Sandbox()._docker_run_argv(_spec(), "n", "p")
+    assert "--name" not in argv
+    assert argv[-3:] == ["claude", "-p", "hi"]
+
+
+def test_stdin_spec_adds_interactive_flag():
+    argv = Sandbox()._docker_run_argv(_spec(stdin="hi"), network="n", proxy_alias="p")
+    assert "-i" in argv
+
+
+def test_no_stdin_spec_omits_interactive_flag():
+    argv = Sandbox()._docker_run_argv(_spec(), network="n", proxy_alias="p")
+    assert "-i" not in argv
+
+
+def test_auth_mount_parent_is_writable_tmpfs():
+    # docker auto-creates a cred-mount parent as root-owned; the sandbox must
+    # tmpfs it writable so the harness can write siblings (claude session-env).
+    argv = Sandbox()._docker_run_argv(_spec(), network="n", proxy_alias="p")
+    assert "--tmpfs" in argv
+    assert any(a == "/home/sbx/.claude:mode=1777" for a in argv), argv
+    # the RO cred still mounts inside it
+    assert any("/home/sbx/.claude/.credentials.json" in a and "readonly" in a for a in argv)
