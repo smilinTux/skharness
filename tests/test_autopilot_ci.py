@@ -230,3 +230,12 @@ def test_diff_coverage_scopes_cmd_to_changed_targets(mocker, tmp_path):
     cmd = run.call_args.args[0]
     assert cmd.startswith("pytest --cov --cov-report=xml")
     assert "tests/test_transport.py" in cmd
+
+
+def test_local_ci_timeout_is_red_not_a_hang(mocker):
+    """A hung local CI command must not hang finalize forever (it runs AFTER the
+    branch is pushed). A timeout is red, and the call is bounded by a timeout."""
+    run = mocker.patch("skharness.autocode.ci.subprocess.run",
+                       side_effect=subprocess.TimeoutExpired(cmd="make ci", timeout=1))
+    assert ci.external_ci_verdict(_local_repo("make ci"), "b", "sha") == "red"
+    assert run.call_args.kwargs.get("timeout") == ci._LOCAL_CI_TIMEOUT

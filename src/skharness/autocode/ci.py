@@ -13,6 +13,9 @@ from pathlib import Path
 from .types import RepoSpec
 
 _POLL_INTERVAL = 5  # seconds between gh polls; patched to a no-op sleep in tests
+#: Hard ceiling for a local: CI command. A hung test must never hang finalize
+#: (which runs this AFTER the branch is pushed); a timeout is treated as red.
+_LOCAL_CI_TIMEOUT = 900
 
 _RED_CONCLUSIONS = {"failure", "cancelled", "timed_out",
                     "action_required", "startup_failure"}
@@ -93,8 +96,12 @@ def external_ci_verdict(repo: RepoSpec, pr_branch: str, head_sha: str,
             time.sleep(_POLL_INTERVAL)
     if repo.ci.startswith("local:"):
         cmd = _scoped_cmd(repo.ci[len("local:"):], repo, worktree, diff)
-        proc = subprocess.run(cmd, shell=True, cwd=(worktree or repo.path),
-                              capture_output=True, text=True)
+        try:
+            proc = subprocess.run(cmd, shell=True, cwd=(worktree or repo.path),
+                                  capture_output=True, text=True,
+                                  timeout=_LOCAL_CI_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return "red"                 # a hung CI command is not a pass
         return "green" if proc.returncode == 0 else "red"
     return "red"
 
