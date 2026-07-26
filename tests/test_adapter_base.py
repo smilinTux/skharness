@@ -132,3 +132,36 @@ def test_claude_parse_extracts_from_result_string():
     a = ClaudeCodeAdapter(["Read"], sandbox=Sandbox())
     raw = {"type": "result", "result": '{"score":5,"passed":true,"notes":"ok"}', "is_error": False}
     assert a._parse(raw) == {"score": 5, "passed": True, "notes": "ok"}
+
+
+def test_run_retries_past_api_error_and_empty_then_returns_usable(monkeypatch):
+    """_run must not let a transient hard error or an empty/unparseable reply
+    become the answer: it retries and returns the first usable (non-empty) parse."""
+    sb = Sandbox(live_execution=True)
+    seq = [
+        {"is_error": True, "result": "API Error: 401 token expired"},   # hard error -> retry
+        {"result": {}},                                                 # empty parse -> retry
+        {"result": {"verdict": "valid", "reason": "ok"}},               # usable -> return
+    ]
+    calls = {"n": 0}
+    def fake_spawn(spec, **kw):
+        r = seq[calls["n"]]; calls["n"] += 1; return r
+    monkeypatch.setattr(sb, "spawn", fake_spawn)
+    a = _Fake(sb, egress_hosts=[])
+    out = a._run("instr", "data", worktree="/tmp/wt", repo=None)
+    assert out == {"verdict": "valid", "reason": "ok"}
+    assert calls["n"] == 3                                              # exhausted the two bad rolls
+
+
+def test_run_gives_up_after_bounded_attempts(monkeypatch):
+    """When every attempt hard-errors, _run stops after _RUN_ATTEMPTS and returns
+    the last (empty) parse rather than looping forever."""
+    sb = Sandbox(live_execution=True)
+    calls = {"n": 0}
+    def fake_spawn(spec, **kw):
+        calls["n"] += 1; return {"is_error": True, "result": "still down"}
+    monkeypatch.setattr(sb, "spawn", fake_spawn)
+    a = _Fake(sb, egress_hosts=[])
+    out = a._run("instr", "data", worktree="/tmp/wt", repo=None)
+    assert out == {}
+    assert calls["n"] == BaseCliAdapter._RUN_ATTEMPTS
