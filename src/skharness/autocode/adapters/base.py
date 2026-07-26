@@ -161,8 +161,24 @@ class BaseCliAdapter(Harness):
         return self.sandbox.spawn(spec, repo_remote_host=self._remote_host(repo),
                                   ci_host=self._ci_host(repo))
 
+    # A judgment call (assess/grade) must not turn a transient hiccup into a
+    # wrong answer. The sandboxed CLI intermittently returns a hard API error
+    # (rate limit, socket) or a prose-only reply with no extractable JSON; either
+    # yields an empty parse that the callers default to needs_decision / no-score.
+    # Retry a bounded number of times before giving up, so one bad roll does not
+    # silently escalate a valid task.
+    _RUN_ATTEMPTS = 3
+
     def _run(self, instruction: str, data: str, *, worktree: str, repo) -> dict:
-        return self._parse(self._run_raw(instruction, data, worktree=worktree, repo=repo))
+        parsed: dict = {}
+        for _ in range(self._RUN_ATTEMPTS):
+            raw = self._run_raw(instruction, data, worktree=worktree, repo=repo)
+            if not (isinstance(raw, dict) and raw.get("is_error")):
+                parsed = self._parse(raw)
+                if parsed:                      # non-empty parse == usable answer
+                    return parsed
+            # hard API error, or empty/unparseable reply: try again
+        return parsed
 
     # -- the three seam methods (prompts copied verbatim from ClaudeCodeAdapter) --
     def assess(self, brief: AssessBrief) -> Verdict:

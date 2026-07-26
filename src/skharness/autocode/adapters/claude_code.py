@@ -3,9 +3,31 @@ deny-by-default tool firewall (fail closed) from claude_code.py; the spawn is th
 harness-agnostic Sandbox."""
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from ..claude_code import ForbiddenToolError, is_forbidden
 from ..sandbox import AuthMount, Sandbox
 from .base import BaseCliAdapter, extract_json
+
+_CRED_PATH = "~/.claude/.credentials.json"
+
+
+def _oauth_token(cred_path: str | None = None) -> str | None:
+    """The Claude OAuth access token from the host credential file, or None when
+    it is absent/unreadable/unparseable. The sandboxed `claude` CLI authenticates
+    from CLAUDE_CODE_OAUTH_TOKEN in the environment; the bare .credentials.json
+    mount is NOT read by the CLI in the sandbox image (it reports 'Not logged in'),
+    so the token is injected as env instead. Fail soft: None -> no token env.
+
+    ``cred_path`` defaults to the module-level ``_CRED_PATH`` resolved at call time
+    (not bound as a default arg), so the path stays overridable in tests."""
+    try:
+        raw = Path(cred_path or _CRED_PATH).expanduser().read_text()
+        tok = json.loads(raw).get("claudeAiOauth", {}).get("accessToken")
+    except (OSError, ValueError):
+        return None
+    return tok or None
 
 
 class ClaudeCodeAdapter(BaseCliAdapter):
@@ -52,7 +74,11 @@ class ClaudeCodeAdapter(BaseCliAdapter):
                           "/home/sbx/.claude/.credentials.json")]
 
     def _auth_env(self):
-        return {}
+        # Inject the OAuth access token so the sandboxed CLI authenticates. Without
+        # this the CLI reports "Not logged in", assess/grade return {}, and every
+        # live task escalates at phase 0. Empty when no credential is available.
+        tok = _oauth_token()
+        return {"CLAUDE_CODE_OAUTH_TOKEN": tok} if tok else {}
 
     def _parse(self, raw: dict) -> dict:
         # claude-code --output-format json wraps the model reply as a STRING in

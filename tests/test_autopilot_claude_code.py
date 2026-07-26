@@ -69,3 +69,36 @@ def test_untrusted_text_is_data_never_instruction():
     assert prompt.index(instruction) < prompt.index(DATA_BEGIN)   # instruction first
     assert prompt.index(DATA_BEGIN) < prompt.index(data) < prompt.index(DATA_END)
     assert prompt.split(DATA_BEGIN)[0].find(data) == -1          # nothing leaks above the frame
+
+
+def test_oauth_token_injected_as_env(tmp_path, monkeypatch):
+    """The sandboxed CLI authenticates from CLAUDE_CODE_OAUTH_TOKEN, not the bare
+    credentials mount. _auth_env must inject the access token from the credential."""
+    from skharness.autocode.adapters import claude_code as cc
+    cred = tmp_path / ".credentials.json"
+    cred.write_text('{"claudeAiOauth": {"accessToken": "sk-ant-oat-TESTTOKEN"}}')
+    monkeypatch.setattr(cc, "_CRED_PATH", str(cred))
+    assert cc._oauth_token() == "sk-ant-oat-TESTTOKEN"
+    a = ClaudeCodeAdapter(ALLOWED)
+    assert a._auth_env() == {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-TESTTOKEN"}
+
+
+def test_auth_env_fails_soft_when_credential_absent(tmp_path, monkeypatch):
+    """No credential file -> no token env (old behavior), never a crash."""
+    from skharness.autocode.adapters import claude_code as cc
+    monkeypatch.setattr(cc, "_CRED_PATH", str(tmp_path / "does-not-exist.json"))
+    assert cc._oauth_token() is None
+    assert ClaudeCodeAdapter(ALLOWED)._auth_env() == {}
+
+
+def test_auth_env_fails_soft_on_malformed_credential(tmp_path, monkeypatch):
+    """Unparseable or shape-mismatched credential -> {} , never a crash."""
+    from skharness.autocode.adapters import claude_code as cc
+    bad = tmp_path / ".credentials.json"
+    bad.write_text("{ not json")
+    monkeypatch.setattr(cc, "_CRED_PATH", str(bad))
+    assert cc._oauth_token() is None
+    empty = tmp_path / "empty.json"
+    empty.write_text('{"claudeAiOauth": {}}')
+    monkeypatch.setattr(cc, "_CRED_PATH", str(empty))
+    assert cc._oauth_token() is None
