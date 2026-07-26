@@ -355,6 +355,16 @@ def run_once(*, board, harness, config, tasks_dir=None, run_id=None, dry_run=Non
     if kill_switch_active(config.enabled):
         return _checkpoint("assess")
 
+    if not dry:
+        # Advisory self-check: surface the failure modes that silently stalled
+        # live runs (un-shimmed node, stale proxy image, expired token) BEFORE a
+        # coding round is wasted. Never blocks -- a doctor bug must not wedge a run.
+        from . import doctor
+        for c in doctor.preflight():
+            if c.status != "ok":
+                print(f"autopilot preflight [{c.status}] {c.name}: {c.detail}"
+                      + (f" -- fix: {c.fix}" if c.fix else ""))
+
     candidates, decisions = phase0_assess(
         board=board, harness=harness, tasks_dir=tasks_dir or _default_tasks_dir(),
         caps=caps, run_id=run_id, dry_run=dry, deepdive_proposals=deepdive_proposals,
