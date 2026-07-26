@@ -36,6 +36,20 @@ def is_complete(text: str | None, signal: str = "COMPLETE") -> bool:
     return parse_promise(text) == signal
 
 
+def twin_gate_passed(gr: GateResult, ci_status: str, cov: float | None,
+                     repo: RepoSpec) -> bool:
+    """The load-bearing twin gate: LLM 5/5 + an independent COMPLETE promise token,
+    ANDed with external CI green and diff-coverage at/above the repo floor.
+
+    The SINGLE source of truth for the crown-jewel predicate: EngineeringExecutor.run
+    (the gated Ralph loop) and the ratify one-shot both call it, so the two grade
+    paths can never drift. The gate conformance test pins it through run(); do not
+    weaken it."""
+    cov_ok = cov is not None and cov >= repo.min_diff_coverage
+    return (gr.score == 5 and is_complete(gr.notes)
+            and ci_status == "green" and cov_ok)
+
+
 class EngineeringExecutor:
     kind = "engineering"
 
@@ -162,10 +176,10 @@ class EngineeringExecutor:
             self.board.score_task(item.ref, round=rnd, score=(gr.score or 0),
                                   notes=strip_promise(gr.notes), harness=harness.name)
             last = gr
-            cov_ok = cov is not None and cov >= repo.min_diff_coverage
-            # deterministic twin gate: LLM 5/5 + promise ANDed with CI green + coverage
-            if (gr.score == 5 and is_complete(gr.notes)
-                    and ci_status == "green" and cov_ok):
+            # deterministic twin gate: LLM 5/5 + promise ANDed with CI green +
+            # coverage. The predicate is the shared twin_gate_passed (also used by
+            # the ratify one-shot) so the gate has one definition, never two.
+            if twin_gate_passed(gr, ci_status, cov, repo):
                 return GateResult(score=5, passed=True,
                                   notes=strip_promise(gr.notes), artifact=gr.artifact)
             feedback = strip_promise(gr.notes)
