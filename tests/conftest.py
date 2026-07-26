@@ -19,6 +19,15 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip)
 
 
+@pytest.fixture(autouse=True)
+def _allow_empty_store(monkeypatch):
+    """Tests run against throwaway, empty stores. The skos cold-start guard
+    correctly refuses to emit from an un-restored store in production, but in the
+    suite that (recently added) guard turns valid tests red. Opt the test process
+    into the documented fresh-init bypass."""
+    monkeypatch.setenv("SKOS_ALLOW_EMPTY_STORE", "1")
+
+
 @pytest.fixture
 def data_root(tmp_path, monkeypatch):
     """Point SK_DATA_ROOT at a throwaway dir for every test."""

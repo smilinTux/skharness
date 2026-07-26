@@ -250,8 +250,23 @@ def phase2_swarm(selected, *, harness, board, caps: Caps, ledger: CapLedger,
         rnd = int((state.get(item.ref, {}).get("round", 0) or 0)) + 1
         ledger.add(getattr(result, "tokens", 0), getattr(result, "cost_usd", 0.0))
         if result.passed:
-            ex.finalize(item, result)
-            state[item.ref] = {"state": "finalized", "round": rnd, "score": result.score}
+            try:
+                ex.finalize(item, result)
+                state[item.ref] = {"state": "finalized", "round": rnd, "score": result.score}
+            except Exception as exc:                # noqa: BLE001 - must never vanish
+                # A gate-PASSED item whose finalize (CI re-check / PR open / merge)
+                # raises must not silently disappear: _commit_and_push may already
+                # have pushed autopilot/<ref>, so a swallowed error reads as "no
+                # work done". Surface it as an operator decision instead.
+                decisions.append(DecisionItem(
+                    qid=stable_qid("finalize-failed", item.ref),
+                    prompt=(f"Task {item.ref} PASSED the gate but finalize failed: "
+                            f"{type(exc).__name__}: {exc}. Branch autopilot/{item.ref} "
+                            f"may already be pushed; open/merge it manually or retry."),
+                    options={"retry": "retry", "skip": "skip"},
+                    action_ref=item.ref, priority="high"))
+                state[item.ref] = {"state": "finalize-failed", "round": rnd,
+                                   "score": result.score}
         else:
             decisions.append(ex.escalate(item, result.notes))
             state[item.ref] = {"state": "escalated", "round": rnd, "score": result.score}

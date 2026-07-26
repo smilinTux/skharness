@@ -220,6 +220,22 @@ def test_phase2_finalizes_and_scores_on_pass():
     assert state["t-1"]["state"] == "finalized" and decisions == []
 
 
+def test_phase2_surfaces_finalize_failure_as_decision():
+    # A gate-PASSED item whose finalize raises (CI re-check / PR open / merge) must
+    # not vanish: the branch may already be pushed. It becomes an operator decision.
+    ex = _RunExec(GateResult(score=5, passed=True, notes="ok", artifact="pr#1"))
+    ex.finalize = MagicMock(side_effect=RuntimeError("gh pr create exploded"))
+    board = MagicMock()
+    decisions = []
+    state = orch.phase2_swarm([(_wi("t-9"), ex)], harness=SimpleNamespace(name="h"),
+                              board=board, caps=Caps(), ledger=CapLedger(Caps()),
+                              decisions=decisions, run_id="r1")
+    assert state["t-9"]["state"] == "finalize-failed"
+    assert len(decisions) == 1
+    assert "finalize failed" in decisions[0].prompt.lower()
+    assert "gh pr create exploded" in decisions[0].prompt
+
+
 def test_phase2_escalates_on_non_convergence():
     ex = _RunExec(GateResult(score=4, passed=False, notes="thin tests", artifact=None))
     board = MagicMock()

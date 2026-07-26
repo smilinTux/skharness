@@ -71,29 +71,59 @@ def test_untrusted_text_is_data_never_instruction():
     assert prompt.split(DATA_BEGIN)[0].find(data) == -1          # nothing leaks above the frame
 
 
-def test_oauth_token_injected_as_env(tmp_path, monkeypatch):
-    """The sandboxed CLI authenticates from CLAUDE_CODE_OAUTH_TOKEN, not the bare
-    credentials mount. _auth_env must inject the access token from the credential."""
+_FUTURE_MS = 10_000_000_000_000     # expiresAt far in the future -> not stale
+
+
+def test_oauth_token_injected_from_credential(tmp_path, monkeypatch):
+    """With no env token, _auth_env injects the (valid) access token from the
+    host credential so the sandboxed CLI authenticates."""
     from skharness.autocode.adapters import claude_code as cc
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     cred = tmp_path / ".credentials.json"
-    cred.write_text('{"claudeAiOauth": {"accessToken": "sk-ant-oat-TESTTOKEN"}}')
+    cred.write_text('{"claudeAiOauth": {"accessToken": "sk-ant-oat-TESTTOKEN",'
+                    ' "expiresAt": %d}}' % _FUTURE_MS)
     monkeypatch.setattr(cc, "_CRED_PATH", str(cred))
     assert cc._oauth_token() == "sk-ant-oat-TESTTOKEN"
-    a = ClaudeCodeAdapter(ALLOWED)
-    assert a._auth_env() == {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-TESTTOKEN"}
+    assert ClaudeCodeAdapter(ALLOWED)._auth_env() == {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-TESTTOKEN"}
+
+
+def test_env_token_takes_precedence_over_credential(tmp_path, monkeypatch):
+    """A provisioned long-lived CLAUDE_CODE_OAUTH_TOKEN wins over the short-lived
+    credential -- the reliable path for headless/cron runs."""
+    from skharness.autocode.adapters import claude_code as cc
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-LONGLIVED")
+    cred = tmp_path / ".credentials.json"
+    cred.write_text('{"claudeAiOauth": {"accessToken": "sk-ant-shortlived",'
+                    ' "expiresAt": %d}}' % _FUTURE_MS)
+    monkeypatch.setattr(cc, "_CRED_PATH", str(cred))
+    assert cc._oauth_token() == "sk-ant-LONGLIVED"
+
+
+def test_expired_credential_token_warns_but_still_returned(tmp_path, monkeypatch, capsys):
+    """An expired access token is surfaced (warning) rather than silently dropped,
+    so the failure reads as a clear 401 not a confusing no-token."""
+    from skharness.autocode.adapters import claude_code as cc
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    cred = tmp_path / ".credentials.json"
+    cred.write_text('{"claudeAiOauth": {"accessToken": "sk-ant-EXPIRED", "expiresAt": 1}}')
+    monkeypatch.setattr(cc, "_CRED_PATH", str(cred))
+    assert cc._oauth_token() == "sk-ant-EXPIRED"
+    assert "expired" in capsys.readouterr().out.lower()
 
 
 def test_auth_env_fails_soft_when_credential_absent(tmp_path, monkeypatch):
-    """No credential file -> no token env (old behavior), never a crash."""
+    """No env token and no credential file -> no token env, never a crash."""
     from skharness.autocode.adapters import claude_code as cc
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     monkeypatch.setattr(cc, "_CRED_PATH", str(tmp_path / "does-not-exist.json"))
     assert cc._oauth_token() is None
     assert ClaudeCodeAdapter(ALLOWED)._auth_env() == {}
 
 
 def test_auth_env_fails_soft_on_malformed_credential(tmp_path, monkeypatch):
-    """Unparseable or shape-mismatched credential -> {} , never a crash."""
+    """Unparseable or shape-mismatched credential -> None, never a crash."""
     from skharness.autocode.adapters import claude_code as cc
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     bad = tmp_path / ".credentials.json"
     bad.write_text("{ not json")
     monkeypatch.setattr(cc, "_CRED_PATH", str(bad))
