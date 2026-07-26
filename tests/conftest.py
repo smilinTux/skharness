@@ -28,6 +28,17 @@ def _allow_empty_store(monkeypatch):
     monkeypatch.setenv("SKOS_ALLOW_EMPTY_STORE", "1")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_health(tmp_path_factory, monkeypatch):
+    """Point harness health telemetry at a throwaway file for EVERY test. Any test
+    that exercises _run/assess records events; without isolation those fake events
+    would land in the real ~/.skcapstone health log and skew the adaptive retry
+    budget (which reads that log) in production. Isolation keeps telemetry a pure
+    observation of real runs."""
+    hp = tmp_path_factory.mktemp("health") / "health.jsonl"
+    monkeypatch.setenv("SKHARNESS_HEALTH_PATH", str(hp))
+
+
 @pytest.fixture
 def data_root(tmp_path, monkeypatch):
     """Point SK_DATA_ROOT at a throwaway dir for every test."""
