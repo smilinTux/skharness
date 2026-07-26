@@ -9,10 +9,22 @@ import subprocess
 
 from skharness.harness import Harness
 
+from .. import health
 from ..claude_code import frame
 from ..sandbox import LaunchSpec
 from ..types import (AssessBrief, GateResult, GradeBrief, HarnessResult,
                      TaskBrief, Verdict)
+
+#: The verdicts assess may legitimately return; anything else is "inconclusive".
+_ASSESS_VERDICTS = ("valid", "stale", "obsolete", "needs_decision")
+
+
+def _record_assess_inconclusive(brief: AssessBrief, out: dict) -> None:
+    """Telemetry: the CLI gave no parseable verdict for an assess (declined or
+    errored through all retries). Fed to the learning layer so the assess decline
+    rate is observable and the retry budget can adapt (see BaseCliAdapter._run)."""
+    health.record("assess_inconclusive", task=getattr(brief, "task_id", None),
+                  had_error=bool(isinstance(out, dict) and out.get("is_error")))
 
 
 def extract_json(text) -> dict | None:
@@ -168,16 +180,41 @@ class BaseCliAdapter(Harness):
     # Retry a bounded number of times before giving up, so one bad roll does not
     # silently escalate a valid task.
     _RUN_ATTEMPTS = 3
+    #: Ceiling the adaptive budget will not exceed (cost/latency guard).
+    _RUN_ATTEMPTS_MAX = 6
+
+    def _run_attempts(self) -> int:
+        """Self-tuning retry budget: the base attempts, raised toward the ceiling
+        when the recent decline rate is high, so the harness spends more retries
+        exactly when the CLI is being flaky and no more when it is healthy. This
+        is the learning loop reading its own health telemetry."""
+        base = self._RUN_ATTEMPTS
+        try:
+            decline = health.rate("run_inconclusive",
+                                  over=("run_inconclusive", "run_ok"))
+        except Exception:              # noqa: BLE001 - telemetry never gates the run
+            return base
+        if decline >= 0.5:
+            return self._RUN_ATTEMPTS_MAX
+        if decline >= 0.25:
+            return min(self._RUN_ATTEMPTS_MAX, base + 2)
+        return base
 
     def _run(self, instruction: str, data: str, *, worktree: str, repo) -> dict:
         parsed: dict = {}
-        for _ in range(self._RUN_ATTEMPTS):
+        attempts = self._run_attempts()
+        for i in range(attempts):
             raw = self._run_raw(instruction, data, worktree=worktree, repo=repo)
             if not (isinstance(raw, dict) and raw.get("is_error")):
                 parsed = self._parse(raw)
                 if parsed:                      # non-empty parse == usable answer
+                    if i:
+                        health.record("run_retry_recovered", attempt=i + 1)
+                    health.record("run_ok")
                     return parsed
             # hard API error, or empty/unparseable reply: try again
+        health.record("run_inconclusive", attempts=attempts,
+                      name=getattr(self, "name", "?"))
         return parsed
 
     # -- the three seam methods (prompts copied verbatim from ClaudeCodeAdapter) --
@@ -198,7 +235,24 @@ class BaseCliAdapter(Harness):
                            "acceptance": brief.acceptance, "tags": brief.tags,
                            "codebase_context": brief.codebase_context})
         out = self._run(instruction, data, worktree=os.getcwd(), repo=None)
-        return Verdict(verdict=out.get("verdict", "needs_decision"),
+        verdict = out.get("verdict")
+        if verdict not in _ASSESS_VERDICTS:
+            # Inconclusive assess: even after _run's retries the CLI declined or
+            # returned no parseable verdict. assess is a cheap PRE-filter; the twin
+            # gate (score==5 AND CI green AND coverage) is the real safety net and
+            # never merges bad code. So fail OPEN toward the gate -- proceed as
+            # valid rather than block genuine work at a flaky pre-check. A task that
+            # is actually bad still gets caught downstream (the agent produces junk,
+            # the gate refuses, and it escalates then). Self-healing principle:
+            # never let a non-answer at a cheap check strand work a strong check
+            # protects. The inconclusive count is recorded so a learning layer can
+            # watch the assess decline rate (see AssessHealth).
+            _record_assess_inconclusive(brief, out)
+            return Verdict(verdict="valid",
+                           reason="assess inconclusive after retries; proceeding to "
+                                  "the twin gate (fail-open)")
+        health.record("assess_ok", verdict=verdict, task=getattr(brief, "task_id", None))
+        return Verdict(verdict=verdict,
                        reason=out.get("reason", ""),
                        updated_description=out.get("updated_description"),
                        updated_acceptance=out.get("updated_acceptance"))

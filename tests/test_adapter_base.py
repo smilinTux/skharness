@@ -165,3 +165,45 @@ def test_run_gives_up_after_bounded_attempts(monkeypatch):
     out = a._run("instr", "data", worktree="/tmp/wt", repo=None)
     assert out == {}
     assert calls["n"] == BaseCliAdapter._RUN_ATTEMPTS
+
+
+def _brief():
+    return AssessBrief(task_id="t", title="T", description="d", acceptance=[],
+                       tags=[], repo="r", codebase_context="")
+
+
+def test_assess_fails_open_to_valid_on_inconclusive(tmp_path, monkeypatch):
+    """A cheap pre-filter must not strand work the strong twin gate protects: an
+    inconclusive assess (no parseable verdict after retries) proceeds as valid."""
+    monkeypatch.setenv("SKHARNESS_HEALTH_PATH", str(tmp_path / "h.jsonl"))
+    a = _Fake(Sandbox(), egress_hosts=[])
+    monkeypatch.setattr(a, "_run", lambda *args, **kw: {})     # inconclusive
+    v = a.assess(_brief())
+    assert v.verdict == "valid" and "fail-open" in v.reason
+    from skharness.autocode import health
+    assert health.recent("assess_inconclusive")               # telemetry recorded
+
+
+def test_assess_honors_explicit_needs_decision(tmp_path, monkeypatch):
+    """An EXPLICIT model needs_decision is still honored (only the non-answer
+    fails open)."""
+    monkeypatch.setenv("SKHARNESS_HEALTH_PATH", str(tmp_path / "h.jsonl"))
+    a = _Fake(Sandbox(), egress_hosts=[])
+    monkeypatch.setattr(a, "_run",
+                        lambda *args, **kw: {"verdict": "needs_decision", "reason": "contradictory"})
+    v = a.assess(_brief())
+    assert v.verdict == "needs_decision" and v.reason == "contradictory"
+
+
+def test_run_attempts_adapt_to_decline_rate(tmp_path, monkeypatch):
+    """Self-tuning: the retry budget climbs toward the ceiling when the recent
+    decline rate is high, and sits at base when the CLI is healthy."""
+    monkeypatch.setenv("SKHARNESS_HEALTH_PATH", str(tmp_path / "h.jsonl"))
+    from skharness.autocode import health
+    a = _Fake(Sandbox(), egress_hosts=[])
+    assert a._run_attempts() == a._RUN_ATTEMPTS                # no data -> base
+    for _ in range(8):
+        health.record("run_inconclusive")
+    for _ in range(2):
+        health.record("run_ok")                               # 80% decline
+    assert a._run_attempts() == a._RUN_ATTEMPTS_MAX
