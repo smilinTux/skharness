@@ -54,7 +54,8 @@ class OpenCodeAdapter(BaseCliAdapter):
                 "task_plane": True, "session_plane": False,
                 "headless_api": "none", "hot_set_model": False}
 
-    def _argv(self, prompt: str) -> list[str]:
+    def _argv(self, prompt: str, light: bool = False) -> list[str]:
+        # light (assess/grade judgment) accepted for the unified seam.
         # `--format json` emits the raw NDJSON event stream (confirmed from
         # `opencode run --help`); without it opencode prints formatted text. The
         # prompt is NOT a positional arg here: `opencode run "<msg>"` silently

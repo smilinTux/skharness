@@ -79,7 +79,16 @@ class ClaudeCodeAdapter(BaseCliAdapter):
                 "task_plane": True, "session_plane": False,
                 "headless_api": "none", "hot_set_model": False}
 
-    def _argv(self, prompt: str) -> list[str]:
+    def _argv(self, prompt: str, light: bool = False) -> list[str]:
+        # light = a JUDGMENT call (assess/grade): answer the JSON question in a
+        # single turn with NO tools. These calls need no repo access, but running
+        # them as a full agentic session (many turns + Bash/Edit/Write, cwd mounted
+        # at a huge home dir) let the model wander and HEDGE to needs_decision on a
+        # task it otherwise grades valid -- the flake that stranded runs at phase 0.
+        # One turn, no tools => it just answers, fast and stable.
+        if light:
+            return ["claude", "-p", prompt, "--dangerously-skip-permissions",
+                    "--max-turns", "1", "--output-format", "json"]
         # Bound the agentic loop. Without --max-turns, `claude -p` runs unbounded
         # turns: on a focused TDD task it writes the correct code early, then keeps
         # exploring/re-verifying until the sandbox run_timeout (1800s) KILLS it at

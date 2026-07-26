@@ -132,3 +132,17 @@ def test_auth_env_fails_soft_on_malformed_credential(tmp_path, monkeypatch):
     empty.write_text('{"claudeAiOauth": {}}')
     monkeypatch.setattr(cc, "_CRED_PATH", str(empty))
     assert cc._oauth_token() is None
+
+
+def test_light_argv_is_single_turn_no_tools():
+    """A judgment call (assess/grade) runs one turn with NO tools, so the model
+    just answers the JSON question instead of wandering into needs_decision."""
+    a = ClaudeCodeAdapter(ALLOWED)
+    argv = a._argv("PROMPT", light=True)
+    assert argv[argv.index("--max-turns") + 1] == "1"
+    assert "--allowedTools" not in argv            # no tools in judgment mode
+    assert argv[argv.index("--output-format") + 1] == "json"
+    # the full (agentic) argv is unchanged and still carries the tool allowlist
+    full = a._argv("PROMPT")
+    assert full[full.index("--max-turns") + 1] == str(a.max_turns)
+    assert "--allowedTools" in full

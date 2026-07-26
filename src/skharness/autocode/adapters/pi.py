@@ -52,7 +52,9 @@ class PiAdapter(BaseCliAdapter):
                 "task_plane": True, "session_plane": False,
                 "headless_api": "none", "hot_set_model": False}
 
-    def _argv(self, prompt: str) -> list[str]:
+    def _argv(self, prompt: str, light: bool = False) -> list[str]:
+        # light (assess/grade judgment) accepted for the unified seam; pi's
+        # --no-session already runs a single non-agentic shot.
         if not self.model:
             return ["pi", "-p", prompt, "--mode", "json", "--no-session"]
         return ["pi", "-p", prompt, "--mode", "json", "--no-session",

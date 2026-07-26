@@ -127,7 +127,7 @@ class BaseCliAdapter(Harness):
         self.live_execution = live_execution
 
     # -- hooks each concrete adapter provides --
-    def _argv(self, prompt: str) -> list[str]: raise NotImplementedError
+    def _argv(self, prompt: str, light: bool = False) -> list[str]: raise NotImplementedError
     def _image(self) -> str: raise NotImplementedError
     def _auth_mounts(self) -> list: raise NotImplementedError
     def _auth_env(self) -> dict: raise NotImplementedError
@@ -162,10 +162,11 @@ class BaseCliAdapter(Harness):
         return None
 
     # -- shared spawn helpers --
-    def _run_raw(self, instruction: str, data: str, *, worktree: str, repo) -> dict:
+    def _run_raw(self, instruction: str, data: str, *, worktree: str, repo,
+                 light: bool = False) -> dict:
         prompt = frame(instruction, data)
         image = getattr(repo, "sandbox_image", None) or self._image()
-        spec = LaunchSpec(name=self.name, argv=self._argv(prompt), image=image,
+        spec = LaunchSpec(name=self.name, argv=self._argv(prompt, light=light), image=image,
                           worktree=worktree, auth_mounts=self._auth_mounts(),
                           auth_env=self._auth_env(), egress_hosts=self.egress_hosts,
                           config_files=self._config_files(),
@@ -200,11 +201,12 @@ class BaseCliAdapter(Harness):
             return min(self._RUN_ATTEMPTS_MAX, base + 2)
         return base
 
-    def _run(self, instruction: str, data: str, *, worktree: str, repo) -> dict:
+    def _run(self, instruction: str, data: str, *, worktree: str, repo,
+             light: bool = False) -> dict:
         parsed: dict = {}
         attempts = self._run_attempts()
         for i in range(attempts):
-            raw = self._run_raw(instruction, data, worktree=worktree, repo=repo)
+            raw = self._run_raw(instruction, data, worktree=worktree, repo=repo, light=light)
             if not (isinstance(raw, dict) and raw.get("is_error")):
                 parsed = self._parse(raw)
                 if parsed:                      # non-empty parse == usable answer
@@ -234,7 +236,7 @@ class BaseCliAdapter(Harness):
                            "description": brief.description,
                            "acceptance": brief.acceptance, "tags": brief.tags,
                            "codebase_context": brief.codebase_context})
-        out = self._run(instruction, data, worktree=os.getcwd(), repo=None)
+        out = self._run(instruction, data, worktree=os.getcwd(), repo=None, light=True)
         verdict = out.get("verdict")
         if verdict not in _ASSESS_VERDICTS:
             # Inconclusive assess: even after _run's retries the CLI declined or
@@ -261,7 +263,7 @@ class BaseCliAdapter(Harness):
             # treat the task as valid and let the twin gate be the real arbiter --
             # same fail-open-toward-the-gate principle, applied to a wobbly verdict
             # rather than a missing one.
-            confirm = self._run(instruction, data, worktree=os.getcwd(), repo=None)
+            confirm = self._run(instruction, data, worktree=os.getcwd(), repo=None, light=True)
             if confirm.get("verdict") != "needs_decision":
                 health.record("assess_needs_decision_unconfirmed",
                               task=getattr(brief, "task_id", None),
@@ -305,6 +307,6 @@ class BaseCliAdapter(Harness):
         data = json.dumps({"task_id": brief.task_id, "diff": brief.diff,
                            "acceptance": brief.acceptance, "ci_status": brief.ci_status,
                            "diff_coverage": brief.diff_coverage})
-        out = self._run(instruction, data, worktree=brief.worktree, repo=brief.repo)
+        out = self._run(instruction, data, worktree=brief.worktree, repo=brief.repo, light=True)
         return GateResult(score=out.get("score"), passed=bool(out.get("passed")),
                           notes=out.get("notes", ""), artifact=out.get("artifact"))
