@@ -1,3 +1,5 @@
+import os
+from pathlib import Path
 import types as _t
 import pytest
 from skharness.autocode.engineering import EngineeringExecutor, _revert_impl
@@ -111,11 +113,39 @@ def test_make_worktree_git_argv(mocker, cfg):
     item = WorkItem(kind="engineering", ref="t1", source="coord", repo=None, payload={})
     spec = cfg.repo_map["skrender"]
     wt = ex.make_worktree(item, spec)
-    argv = run.call_args_list[0].args[0]
+    # the pre-clear (self-healing) fires subprocess calls first; find the add
+    adds = [c.args[0] for c in run.call_args_list
+            if c.args[0][3:5] == ["worktree", "add"]]
+    argv = adds[0]
     assert argv[:6] == ["git", "-C", "/repos/skrender", "worktree", "add", "-b"]
     assert argv[6] == "autopilot/t1"          # new branch name
     assert argv[7] == wt                       # worktree path
     assert argv[8] == "main"                   # base_branch checkout point
+
+
+def test_make_worktree_is_idempotent_across_retries(tmp_path):
+    """Self-healing: a second make_worktree for the same task must succeed even
+    though the first left the worktree dir and local branch behind (the collision
+    that stranded every retry live)."""
+    import subprocess
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t", "HOME": str(tmp_path), "PATH": os.environ["PATH"]}
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, env=env)
+    (repo / "f").write_text("x")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True, env=env)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, env=env)
+    spec = RepoSpec(name="r", path=str(repo), base_branch="main", integration_branch="main",
+                    test_cmd="pytest", ci="none")
+    cfg = _t.SimpleNamespace(repo_map={"r": spec}, automerge_repos=[])
+    ex = EngineeringExecutor(cfg, board=object(), journal=object())
+    item = WorkItem(kind="engineering", ref="t9", source="coord", repo=None, payload={})
+    wt1 = ex.make_worktree(item, spec)
+    assert Path(wt1).exists()
+    # second call for the SAME ref would previously raise CalledProcessError
+    wt2 = ex.make_worktree(item, spec)
+    assert Path(wt2).exists() and wt2 == wt1
 
 
 def test_prune_worktree_git_argv(mocker, cfg):

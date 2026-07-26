@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import hashlib
 import re
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import health
 from .ci import external_ci_verdict, diff_coverage
 from .types import DecisionItem, GateResult, GradeBrief, RepoSpec, TaskBrief, WorkItem
 
@@ -101,10 +103,37 @@ class EngineeringExecutor:
         except OSError:
             pass
         branch = f"autopilot/{item.ref}"
+        # Self-healing: a prior attempt on this task may have left the worktree
+        # dir and/or the local branch behind (a killed run, an escalation after
+        # coding, a crash mid-finalize). `git worktree add -b` hard-fails on a
+        # pre-existing PATH or BRANCH, which would strand EVERY retry of the task
+        # (observed live: the loop's attempt 1 created autopilot/<ref>, attempts
+        # 2-4 all died here). Clear the stale local state first so a re-run is
+        # idempotent. Only local state is touched; a pushed origin branch is left
+        # for finalize's push to reconcile.
+        self._clear_stale_worktree(repo, wt, branch, item.ref)
         subprocess.run(["git", "-C", repo.path, "worktree", "add", "-b",
                         branch, wt, repo.base_branch],
                        check=True, capture_output=True, text=True)
         return wt
+
+    def _clear_stale_worktree(self, repo: RepoSpec, wt: str, branch: str, ref: str) -> None:
+        """Best-effort removal of a leftover worktree dir + local branch so
+        make_worktree is idempotent across retries. Never raises."""
+        healed = False
+        r = subprocess.run(["git", "-C", repo.path, "worktree", "remove", "--force", wt],
+                           capture_output=True, text=True)
+        healed = healed or r.returncode == 0
+        subprocess.run(["git", "-C", repo.path, "worktree", "prune"],
+                       capture_output=True, text=True)
+        if Path(wt).exists():                        # untracked leftovers on disk
+            shutil.rmtree(wt, ignore_errors=True)
+            healed = True
+        r = subprocess.run(["git", "-C", repo.path, "branch", "-D", branch],
+                           capture_output=True, text=True)
+        healed = healed or r.returncode == 0
+        if healed:
+            health.record("worktree_healed", task=ref, branch=branch)
 
     def prune_worktree(self, repo: RepoSpec, wt: str) -> None:
         subprocess.run(["git", "-C", repo.path, "worktree", "remove", "--force", wt],
