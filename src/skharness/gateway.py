@@ -1,30 +1,22 @@
-"""skharness gateway — capauth-gated FastAPI over the SessionManager. Bind to a
-Tailscale IP only (never a public port). `verify_caller` is the auth seam: a real
-capauth verifier in production, a fake in tests."""
+"""skharness gateway - capauth-gated FastAPI over the SessionManager. Bind to a
+Tailscale IP only (never a public port). The bearer gate lives in auth.py and is
+shared with skcode-hostd.
+"""
 
 from __future__ import annotations
-
-from typing import Callable
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from skharness.auth import Verifier, require_bearer
 from skharness.manager import SessionManager
-
-Verifier = Callable[[str], bool]
 
 
 def build_app(*, manager: SessionManager, verify_caller: Verifier) -> FastAPI:
     app = FastAPI(title="skharness")
 
     def _auth(authorization: str | None) -> None:
-        if not authorization or not authorization.startswith("Bearer "):
-            raise HTTPException(401, "missing bearer token")
-        token = authorization[len("Bearer "):].strip()
-        if not token:
-            raise HTTPException(401, "missing bearer token")
-        if not verify_caller(token):
-            raise HTTPException(403, "unauthorized")
+        require_bearer(authorization, verify_caller)
 
     @app.get("/sessions")
     async def list_sessions(authorization: str | None = Header(default=None)):

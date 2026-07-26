@@ -7,10 +7,10 @@ name = "skharness"
 version = "0.3.0"
 description = "Sovereign phone-drives-my-agent-swarm harness (execution: sessions + autocode engine)"
 requires-python = ">=3.10"
-dependencies = ["fastapi>=0.110", "pydantic>=2.0", "pyyaml>=6.0"]
+dependencies = ["fastapi>=0.110", "pydantic>=2.0", "pyyaml>=6.0", "uvicorn>=0.27", "websockets>=12.0"]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-mock>=3.10", "httpx>=0.27"]
+dev = ["pytest>=7.0", "pytest-mock>=3.10", "pytest-asyncio>=0.23", "httpx>=0.27"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -18,6 +18,8 @@ where = ["src"]
 # docker/sandbox build contexts live at the repo root (not importable package
 # data); they are shipped in sdists via MANIFEST.in. The autocode engine and its
 # adapters are pure-Python subpackages discovered by find above.
+[tool.setuptools.package-data]
+skharness = ["client/*.html"]
 
 [tool.ruff]
 line-length = 99

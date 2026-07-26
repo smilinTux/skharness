@@ -36,3 +36,38 @@ pip install -e .            # fastapi + pydantic
 
 ## Status
 `v0.1.0`, P0 session core (spec + plan under `docs/superpowers/`). Mirror: smilinTux (private).
+
+## skcode-hostd (P0, read-only)
+
+`skcode-hostd` is the read-only remote-control daemon over the unified Harness
+session plane. It owns ONE harness (the claude-code tmux adapter) and exposes
+exactly three capauth-gated data routes plus a self-contained static client. There
+is NO write surface: no spawn, inject, kill, dispatch, rename, archive, or model
+switch. A test (`tests/test_daemon.py::test_no_write_surface`) proves POST/DELETE
+return 405 and `/inject` / `/dispatch` return 404.
+
+Routes:
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/v1/hosts/self` | host + harness identity |
+| GET | `/api/v1/sessions` | list live + historical sessions |
+| GET | `/api/v1/sessions/{sid}` | one session, or 404 |
+| WS | `/api/v1/sessions/{sid}/stream` | typed `SessionEvent` stream (`?token=`) |
+| GET | `/` and `/app` | the static read-only web client |
+
+HTTP routes require a `Bearer` token; the WebSocket takes the token as a
+`?token=` query param (browsers cannot set headers on a WS). The capauth verifier
+in P0 is a fail-closed deny-all placeholder: real verification lands with the
+pairing work (spec 7.6), so the daemon rejects every token until then by design.
+
+Run (Tailscale IP only, never `0.0.0.0`):
+
+```bash
+~/.skenv/bin/python -m skharness --host <your-tailscale-ip> --port 9390 --host-id .158
+```
+
+Port `:9390` has a KNOWN deploy-time conflict: `skcomms.transports.broker_server`
+may already hold `0.0.0.0:9390` on this host, and a wildcard listener owns the
+tailnet-IP:9390 address too. Resolve before deploy (move the broker off 9390, or
+pass `--port <free>` and record it in `~/.skcapstone/docs/PORTS.md`).
