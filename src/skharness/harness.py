@@ -32,7 +32,7 @@ the existing dict-based ``capabilities()`` returns and the ``warn_missing_capabi
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import TYPE_CHECKING, AsyncIterator, TypedDict
 
 # The unified registry IS the autocode registry: one dict, one answer. Re-exported
@@ -42,6 +42,10 @@ from skharness.autocode.harness import (
     register_harness,  # noqa: F401  (re-export)
     warn_missing_capabilities,  # noqa: F401
 )
+
+# The one typed stream event lives in skharness.events; re-exported here so the
+# session-plane signatures and callers share a single SessionEvent (no placeholder).
+from skharness.events import EventType, SessionEvent  # noqa: F401  (re-export)
 
 if TYPE_CHECKING:                               # task-plane types (no runtime import)
     from skharness.autocode.types import (
@@ -83,32 +87,42 @@ class HarnessCapabilities(TypedDict):
 
 @dataclass
 class SessionDescriptor:
-    """Immutable-except-by-rule description of a session (skcode ADR 2)."""
-    harness: str                    # "pi" | "opencode" | "claude-code"
-    model: str                      # role or concrete id (resolved via skgateway)
-    host: str                       # node id
-    repo: str                       # allowlisted repo root
-    branch: str                     # git branch / worktree ref
-    profile: str = "sandbox"        # "full" | "sandbox"
-    permission_mode: str = "manual"  # "manual" | "auto"
+    """The one session record (skcode ADR 2).
+
+    Captures a session both as a spawn request (all fields default, no sid yet)
+    and as a live/historical row returned by the read-only session plane. This is
+    what ``list_sessions()`` yields and the daemon serializes over ``/api/v1``.
+    """
+    sid: str = ""                    # session id (tmux window name for claude-code)
+    host: str = ""                   # node id, e.g. ".158"
+    harness: str = ""                # "pi" | "opencode" | "claude-code" | "fake"
+    repo: str = ""                   # allowlisted repo root
+    branch: str = ""                 # git branch / worktree ref
+    model: str = ""                  # role or concrete id (resolved via skgateway)
+    state: str = "running"           # "running" | "idle" | "ended" | "spawning"
+    last_activity: float = 0.0       # epoch seconds of last observed activity
+    last_message: str = ""           # last assistant line (for the list preview)
+    quality: str = "sandbox"         # quality mode: "full" | "sandbox"
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SessionDescriptor":
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in known})
 
 
 @dataclass
 class HarnessSession:
-    """A live (or archived) session handle the session plane returns."""
+    """A live (or archived) session handle the write session plane returns
+    (spawn/fork). Read-only P0 does not construct these; kept for the spawn
+    signature the write plane will fill later."""
     sid: str
     descriptor: SessionDescriptor | None = None
     status: str = "spawning"        # spawning | running | archived
     branch: str = ""
     forked_from: str | None = None
-
-
-@dataclass
-class SessionEvent:
-    """One ordered event on a session stream: assistant text deltas, tool calls,
-    tool results, diffs, status transitions, needs-input markers."""
-    kind: str                       # "text" | "tool" | "status" | "needs_input" | ...
-    data: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -174,8 +188,8 @@ class Harness(ABC):
         raise NotImplementedError(
             f"harness {self.name!r} does not implement the session plane (spawn)")
 
-    async def list_sessions(self) -> list[HarnessSession]:
-        """Live sessions this harness owns on THIS host."""
+    async def list_sessions(self) -> list["SessionDescriptor"]:
+        """Live (and, for claude-code, historical) sessions on THIS host."""
         raise NotImplementedError(
             f"harness {self.name!r} does not implement the session plane (list_sessions)")
 
@@ -208,6 +222,41 @@ class Harness(ABC):
         """Stop + persist the session (not a destructive kill)."""
         raise NotImplementedError(
             f"harness {self.name!r} does not implement the session plane (archive)")
+
+
+# ---------------------------------------------------------------------------
+# FakeHarness: the session-plane CI double (read-only).
+#
+# In-memory seeded sessions + per-sid event lists. Drives every skcode-hostd
+# daemon test with no real tmux and no real bind. It overrides ONLY the read-only
+# subset (list_sessions + stream); every write verb stays at the base gated raise,
+# so the double has no write path of its own.
+# ---------------------------------------------------------------------------
+
+class FakeHarness(Harness):
+    name = "fake"
+
+    def __init__(
+        self,
+        *,
+        sessions: list[SessionDescriptor] | None = None,
+        events: dict[str, list[SessionEvent]] | None = None,
+    ) -> None:
+        self._sessions = list(sessions) if sessions else []
+        self._events = dict(events) if events else {}
+
+    def capabilities(self) -> HarnessCapabilities:
+        return {"session_resume": False, "structured_output": "none",
+                "sandbox": False, "tool_restrictions": False,
+                "task_plane": False, "session_plane": True,
+                "headless_api": "none", "hot_set_model": False}
+
+    async def list_sessions(self) -> list[SessionDescriptor]:
+        return list(self._sessions)
+
+    async def stream(self, sid: str) -> AsyncIterator[SessionEvent]:
+        for ev in self._events.get(sid, []):
+            yield ev
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +319,7 @@ class TaskSessionShim:
         raise NotImplementedError(
             "TaskSessionShim.stream lands with the read-only session plane")
         if False:                               # pragma: no cover - keeps this an async generator
-            yield SessionEvent(kind="text")
+            yield SessionEvent(type=EventType.STATUS)
 
     async def inject(self, sid: str, msg: InputMessage) -> None:
         """Read-only shim: injection is unsupported (declared via capabilities)."""
@@ -302,7 +351,7 @@ def build_harness(name: str, config) -> Harness:
 __all__ = [
     "Harness", "HarnessCapabilities", "HARNESSES",
     "register_harness", "build_harness", "warn_missing_capabilities",
-    "SessionTaskBridge", "TaskSessionShim",
-    "SessionDescriptor", "HarnessSession", "SessionEvent",
+    "SessionTaskBridge", "TaskSessionShim", "FakeHarness",
+    "SessionDescriptor", "HarnessSession", "SessionEvent", "EventType",
     "InputMessage", "BackgroundTask",
 ]
