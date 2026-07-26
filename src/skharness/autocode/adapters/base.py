@@ -251,6 +251,26 @@ class BaseCliAdapter(Harness):
             return Verdict(verdict="valid",
                            reason="assess inconclusive after retries; proceeding to "
                                   "the twin gate (fail-open)")
+        if verdict == "needs_decision":
+            # A single needs_decision may be a flaky HEDGE, not a real ambiguity:
+            # the same well-formed task grades `valid` on most calls and
+            # needs_decision on some (the newer CLI is cautious about the framed
+            # prompt). Escalating a valid task to a human on one bad roll is the
+            # failure we are killing. So CONFIRM with a second opinion; escalate
+            # only when the confirmation ALSO says needs_decision. If it does not,
+            # treat the task as valid and let the twin gate be the real arbiter --
+            # same fail-open-toward-the-gate principle, applied to a wobbly verdict
+            # rather than a missing one.
+            confirm = self._run(instruction, data, worktree=os.getcwd(), repo=None)
+            if confirm.get("verdict") != "needs_decision":
+                health.record("assess_needs_decision_unconfirmed",
+                              task=getattr(brief, "task_id", None),
+                              confirm=confirm.get("verdict"))
+                return Verdict(verdict="valid",
+                               reason="needs_decision not confirmed on a second "
+                                      "opinion; proceeding to the twin gate")
+            health.record("assess_needs_decision_confirmed",
+                          task=getattr(brief, "task_id", None))
         health.record("assess_ok", verdict=verdict, task=getattr(brief, "task_id", None))
         return Verdict(verdict=verdict,
                        reason=out.get("reason", ""),

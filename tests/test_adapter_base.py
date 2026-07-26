@@ -207,3 +207,25 @@ def test_run_attempts_adapt_to_decline_rate(tmp_path, monkeypatch):
     for _ in range(2):
         health.record("run_ok")                               # 80% decline
     assert a._run_attempts() == a._RUN_ATTEMPTS_MAX
+
+
+def test_assess_needs_decision_unconfirmed_proceeds(tmp_path, monkeypatch):
+    """A lone needs_decision that a second opinion does NOT confirm is treated as a
+    flaky hedge: proceed as valid (the twin gate is the real arbiter)."""
+    monkeypatch.setenv("SKHARNESS_HEALTH_PATH", str(tmp_path / "h.jsonl"))
+    a = _Fake(Sandbox(), egress_hosts=[])
+    seq = iter([{"verdict": "needs_decision", "reason": "hedge"},
+                {"verdict": "valid", "reason": "ok"}])
+    monkeypatch.setattr(a, "_run", lambda *args, **kw: next(seq))
+    v = a.assess(_brief())
+    assert v.verdict == "valid" and "not confirmed" in v.reason
+
+
+def test_assess_needs_decision_confirmed_escalates(tmp_path, monkeypatch):
+    """A needs_decision the second opinion ALSO returns is a real ambiguity: escalate."""
+    monkeypatch.setenv("SKHARNESS_HEALTH_PATH", str(tmp_path / "h.jsonl"))
+    a = _Fake(Sandbox(), egress_hosts=[])
+    monkeypatch.setattr(a, "_run",
+                        lambda *args, **kw: {"verdict": "needs_decision", "reason": "contradictory"})
+    v = a.assess(_brief())
+    assert v.verdict == "needs_decision" and v.reason == "contradictory"
