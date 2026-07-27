@@ -4,9 +4,11 @@ isolated worktree, grade to 5/5 behind the external-CI twin gate, finalize.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import shutil
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -363,26 +365,98 @@ class EngineeringExecutor:
             # Verified work reached finalize: settle the build's joule P&L (mint the
             # value, spend the real token cost) now that a commit SHA exists.
             self._settle_economics(item, self._head_sha(wt))
-        ci_status = external_ci_verdict(repo, pr_branch, self._head_sha(wt), worktree=wt)
+        # Always open the PR: it is the visible record AND the surface GitHub CI
+        # runs on. Auto-merge then merges THAT PR on GitHub (updating origin +
+        # leaving history), never a silent local merge.
+        pr_url = self._open_pr(repo, pr_branch, item)
         automerge = (repo.name in self.config.automerge_repos
-                     and repo.ci != "none" and ci_status == "green"
-                     and result.passed and repo.automerge)
+                     and repo.ci != "none" and result.passed and repo.automerge)
         if automerge:
-            sha = self._merge(repo, pr_branch)
-            merge = {"sha": sha, "pr": None, "branch": pr_branch, "ts": _now_iso()}
-            self.board._write_task_raw(
-                item.ref,
-                lambda d: d.setdefault("meta", {}).setdefault("autopilot", {})
-                          .__setitem__("merge", merge))
-            self.board.complete_task("autopilot", item.ref)
-            self.prune_worktree(repo, wt)
-        else:
-            pr_url = self._open_pr(repo, pr_branch, item)
+            # GitHub-safe auto-merge: the twin gate already passed (local CI green +
+            # score 5 + coverage); before merging to a shared/deployed branch we ALSO
+            # require the repo's real GitHub checks to be green, and we HOLD for human
+            # review on any red or on a security-scanner flag (e.g. GitGuardian) --
+            # a flagged PR must never auto-merge. Never merge on an unknown/timeout.
+            verdict = self._github_checks_verdict(repo, pr_branch)
+            if verdict == "green" and self._gh_merge(repo, pr_branch):
+                self.board._write_task_raw(
+                    item.ref,
+                    lambda d: d.setdefault("meta", {}).setdefault("autopilot", {})
+                              .__setitem__("merge", {"pr": pr_url, "branch": pr_branch,
+                                                     "ts": _now_iso(), "auto": True}))
+                self.board.complete_task("autopilot", item.ref)
+                self.prune_worktree(repo, wt)
+                health.record("automerge", task=item.ref, pr=pr_url, verdict="green")
+                print(f"autopilot[{item.ref}] AUTO-MERGED {pr_url} (GitHub CI green)")
+                return
+            health.record("automerge_held", task=item.ref, pr=pr_url, verdict=verdict)
             self.digest.queue_decision(
-                prompt=f"Merge PR {pr_url} for task {item.ref}?",
+                prompt=(f"auto-merge HELD ({verdict}) for PR {pr_url} task {item.ref} -- "
+                        f"review then merge/close"),
                 options={"yes": "merge", "no": "close", "defer": "later"},
                 action_ref=f"merge:{item.ref}", priority="high")
-            # leave the task claimed (not completed) until the operator approves
+            print(f"autopilot[{item.ref}] auto-merge held ({verdict}); {pr_url} queued for review")
+            return
+        # PR-only (auto-merge off for this repo): queue the review decision.
+        self.digest.queue_decision(
+            prompt=f"Merge PR {pr_url} for task {item.ref}?",
+            options={"yes": "merge", "no": "close", "defer": "later"},
+            action_ref=f"merge:{item.ref}", priority="high")
+        # leave the task claimed (not completed) until the operator approves
+
+    # -- GitHub-safe auto-merge helpers --------------------------------------
+    _AUTOMERGE_CI_TIMEOUT = 1500     # seconds to wait for GitHub checks to settle
+    _AUTOMERGE_CORE = ("lint", "test", "qa", "pytest")   # quality gates that MUST pass
+    _AUTOMERGE_SECURITY = ("gitguardian", "security")    # a flag here HOLDS the merge
+
+    def _github_checks_verdict(self, repo: RepoSpec, pr_branch: str) -> str:
+        """Poll the PR's GitHub checks. Returns one of:
+
+          green   -- every discovered core CI check passed and no security check failed
+          red     -- a core CI check failed (do not merge)
+          blocked -- a security check (GitGuardian) failed -> hold for human review
+          timeout -- core checks still pending at the deadline (never merge on unknown)
+
+        Release jobs (publish-*) and any other unrelated checks are ignored -- they
+        are not quality gates for the change.
+        """
+        deadline = time.monotonic() + self._AUTOMERGE_CI_TIMEOUT
+
+        def _hit(names, name):
+            n = (name or "").lower()
+            return any(k in n for k in names)
+
+        while True:
+            proc = subprocess.run(
+                ["gh", "pr", "checks", pr_branch, "--json", "name,bucket"],
+                cwd=repo.path, capture_output=True, text=True)
+            try:
+                checks = json.loads(proc.stdout or "[]")
+            except Exception:
+                checks = []
+            core = [c for c in checks if _hit(self._AUTOMERGE_CORE, c.get("name"))]
+            sec = [c for c in checks if _hit(self._AUTOMERGE_SECURITY, c.get("name"))]
+            if any(c.get("bucket") == "fail" for c in sec):
+                return "blocked"
+            if any(c.get("bucket") == "fail" for c in core):
+                return "red"
+            pending = [c for c in core + sec if c.get("bucket") == "pending"]
+            if core and not pending:
+                return "green"        # all core passed, no security fail, none pending
+            if time.monotonic() >= deadline:
+                return "timeout"      # never green on unknown/still-pending
+            time.sleep(20)
+
+    def _gh_merge(self, repo: RepoSpec, pr_branch: str) -> bool:
+        """Merge the PR on GitHub (updates origin, deletes the branch). Returns
+        False on failure (e.g. a required check GitHub itself blocks on) so the
+        caller falls back to a human decision rather than silently dropping it."""
+        proc = subprocess.run(
+            ["gh", "pr", "merge", pr_branch, "--merge", "--delete-branch"],
+            cwd=repo.path, capture_output=True, text=True)
+        if proc.returncode != 0:
+            print(f"autopilot: gh pr merge failed for {pr_branch}: {proc.stderr.strip()}")
+        return proc.returncode == 0
 
 
 def _revert_impl(board, config, task_id: str, agent: str = "autopilot") -> dict:
