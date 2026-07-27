@@ -112,7 +112,22 @@ def check_decline_signal(threshold: float = 0.5) -> Check:
 
 
 #: The checks a preflight runs, cheapest/most-diagnostic first.
-CHECKS = (check_shim_delegation, check_auth, check_sandbox_proxy_image, check_decline_signal)
+def check_concurrency() -> Check:
+    """Report the resource-scaled build concurrency for THIS host (informational):
+    how many builds a full run will execute at once, and the room above/below it."""
+    try:
+        from .autoscale import describe
+        from .config import Config
+        cfg = Config.load()
+        cap = int(getattr(cfg.caps, "max_concurrent", 3) or 3)
+        mode = getattr(cfg.caps, "concurrency", "recommended")
+        return Check("concurrency", "ok", describe(mode, cap))
+    except Exception as exc:                      # informational -> warn, never fail
+        return Check("concurrency", "warn", f"could not resolve concurrency: {exc}")
+
+
+CHECKS = (check_shim_delegation, check_auth, check_sandbox_proxy_image,
+          check_decline_signal, check_concurrency)
 
 
 def preflight() -> list[Check]:
