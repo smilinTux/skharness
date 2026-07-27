@@ -281,8 +281,12 @@ class BaseCliAdapter(Harness):
 
     def run_task(self, brief: TaskBrief) -> HarnessResult:
         instruction = (
-            "Implement the task in the current git worktree, test-driven "
-            "(failing test first). Match the repo's conventions.")
+            "FIRST check whether the task's acceptance criteria are ALREADY fully "
+            "satisfied by existing code in the current worktree (read the files the "
+            "acceptance names). If they ARE already satisfied, make NO changes and "
+            "stop -- do not re-implement working code. Otherwise implement the task "
+            "in the current git worktree, test-driven (failing test first), matching "
+            "the repo's conventions.")
         data = json.dumps({"task_id": brief.task_id, "title": brief.title,
                            "description": brief.description,
                            "acceptance": brief.acceptance,
