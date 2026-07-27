@@ -31,7 +31,8 @@ def config_path() -> Path:
 
 @dataclass
 class Caps:
-    max_concurrent: int = 3
+    max_concurrent: int = 3               # HARD ceiling; the autoscaler never exceeds it
+    concurrency: str = "recommended"      # min | recommended | max | <int> (resource-scaled)
     new_tasks_per_run: int = 10
     max_tokens_per_run: int = 2_000_000
     max_usd_per_day: float = 25.0

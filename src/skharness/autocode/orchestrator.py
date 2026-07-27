@@ -18,7 +18,7 @@ from .types import (WorkItem, AssessBrief, DecisionItem, QualityMode,
 from .executor import EXECUTORS
 from .config import Caps, Config
 from .harness import build_harness
-from . import journal
+from . import health, journal
 
 
 @dataclass
@@ -249,7 +249,16 @@ def phase2_swarm(selected, *, harness, board, caps: Caps, ledger: CapLedger,
     state = dict(state or {})
     _lock = threading.Lock()
     _budget_hit = [False]                           # append the budget decision ONCE
-    workers = max(1, int(getattr(caps, "max_concurrent", 1) or 1))
+    # Resource-based autoscaler: scale the worker count to THIS host's capacity
+    # (min | recommended | max | <int>), clamped to the hard cap. One config runs
+    # correctly on a 4-core box and a big laptop -- each scales to itself.
+    from .autoscale import describe, resolve
+    hard_cap = int(getattr(caps, "max_concurrent", 3) or 3)
+    workers = resolve(getattr(caps, "concurrency", "recommended"), hard_cap=hard_cap)
+    if len(selected) > 1:
+        health.record("swarm_concurrency", workers=workers,
+                      mode=getattr(caps, "concurrency", "recommended"), items=len(selected))
+        print(f"autopilot: {describe(getattr(caps, 'concurrency', 'recommended'), hard_cap)}")
 
     def _process(item, ex) -> None:
         if kill_switch_active(enabled):

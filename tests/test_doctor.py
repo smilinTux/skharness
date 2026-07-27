@@ -82,7 +82,7 @@ def test_preflight_runs_all_and_records(tmp_path, monkeypatch):
     monkeypatch.setenv("SKHARNESS_HEALTH_PATH", str(tmp_path / "h.jsonl"))
     results = doctor.preflight()
     assert {r.name for r in results} == {"shim-delegation", "auth",
-                                         "proxy-image", "decline-rate"}
+                                         "proxy-image", "decline-rate", "concurrency"}
     assert health.recent("preflight")               # verdict recorded
 
 
