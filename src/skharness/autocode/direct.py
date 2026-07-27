@@ -83,6 +83,10 @@ class DirectExecutor(EngineeringExecutor):
         wt = self.journal.worktree_for(item.ref)
         pr_branch = f"autopilot/{item.ref}"
         self._commit_and_push(repo, wt, pr_branch, item)   # harness edits are uncommitted
+        if result.passed:
+            # Direct-mode work passed its gate + ships a reviewed PR: settle its
+            # joule P&L too (inherited from EngineeringExecutor, best-effort).
+            self._settle_economics(item, self._head_sha(wt))
         pr_url = self._open_pr(repo, pr_branch, item)
         self.digest.queue_decision(
             prompt=f"Merge PR {pr_url} for task {item.ref}? "
