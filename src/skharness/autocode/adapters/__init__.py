@@ -13,7 +13,8 @@ def _g(config, key, default=None):
 
 register_harness("claude-code", lambda c: ClaudeCodeAdapter(
     _g(c, "allowed_tools", []) or [], mcp_endpoints=_g(c, "mcp_endpoints"),
-    live_execution=_g(c, "live_execution", False), image=_g(c, "sandbox_image")))
+    live_execution=_g(c, "live_execution", False), image=_g(c, "sandbox_image"),
+    model=_g(c, "harness_model") or "sonnet"))
 register_harness("pi", lambda c: PiAdapter(
     model=_g(c, "harness_model"), base_url=_g(c, "harness_base_url"),
     egress_hosts=_g(c, "mcp_endpoints") or [], live_execution=_g(c, "live_execution", False),
