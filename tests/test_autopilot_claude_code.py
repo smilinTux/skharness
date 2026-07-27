@@ -21,6 +21,19 @@ def test_argv_carries_skip_permissions_json_and_allowlist():
         "Read,Edit,Write,Bash,mcp__skcapstone__coord_score"
 
 
+def test_argv_pins_the_model_on_both_paths():
+    # The sandbox has a fresh HOME (no settings.json), so the model MUST be pinned
+    # explicitly or `claude` uses the CLI default. Default is sonnet (Ralph work is
+    # mechanical TDD); both the agentic (full) and judgment (light) calls pin it.
+    a = ClaudeCodeAdapter(ALLOWED)
+    assert a.model == "sonnet"
+    for argv in (a._argv("P", light=False), a._argv("P", light=True)):
+        assert argv[argv.index("--model") + 1] == "sonnet"
+    # explicit override flows through
+    b = ClaudeCodeAdapter(ALLOWED, model="opus")
+    assert b._argv("P")[b._argv("P").index("--model") + 1] == "opus"
+
+
 @pytest.mark.parametrize("tool", [
     "capauth_secret_get", "skstacks_secret_get", "skstacks_secret_set",
     "kms_rotate", "kms_list_keys", "kms_status", "trustee_restart", "trustee_rotate",

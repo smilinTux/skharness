@@ -58,7 +58,7 @@ class ClaudeCodeAdapter(BaseCliAdapter):
     name = "claude-code"
 
     def __init__(self, allowed_tools, mcp_endpoints=None, live_execution: bool = False,
-                 sandbox=None, image=None, max_turns: int = 50):
+                 sandbox=None, image=None, max_turns: int = 50, model: str = "sonnet"):
         for t in allowed_tools:
             if is_forbidden(t):
                 raise ForbiddenToolError(
@@ -67,6 +67,12 @@ class ClaudeCodeAdapter(BaseCliAdapter):
         self.image = image or "sandbox-claude:1"
         # cap the agentic loop so a round returns within the sandbox run_timeout
         self.max_turns = int(max_turns)
+        # Pin the model EXPLICITLY. The sandbox has a fresh HOME (no settings.json),
+        # so an unpinned `claude` uses the CLI built-in default -- which could drift
+        # (or silently be an expensive tier) across a Ralph run's many implement +
+        # grade calls. Ralph work is mechanical TDD; Sonnet is the right cost/quality
+        # point. Configurable via autopilot.yaml `harness_model`.
+        self.model = model or "sonnet"
         egress = list(mcp_endpoints or [])
         if "api.anthropic.com" not in egress:
             egress.append("api.anthropic.com")
@@ -88,6 +94,7 @@ class ClaudeCodeAdapter(BaseCliAdapter):
         # One turn, no tools => it just answers, fast and stable.
         if light:
             return ["claude", "-p", prompt, "--dangerously-skip-permissions",
+                    "--model", self.model,
                     "--max-turns", "1", "--output-format", "json"]
         # Bound the agentic loop. Without --max-turns, `claude -p` runs unbounded
         # turns: on a focused TDD task it writes the correct code early, then keeps
@@ -96,6 +103,7 @@ class ClaudeCodeAdapter(BaseCliAdapter):
         # control to grade/commit/PR. A bounded round always RETURNS; the Ralph loop
         # (fresh session, re-reads disk each round) continues any unfinished work.
         return ["claude", "-p", prompt, "--dangerously-skip-permissions",
+                "--model", self.model,
                 "--max-turns", str(self.max_turns),
                 "--output-format", "json", "--allowedTools", ",".join(self.allowed_tools)]
 
