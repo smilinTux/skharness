@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 import types as _t
@@ -286,9 +287,9 @@ def _final_ex(mocker, cfg, repo_name, ci_status="green"):
     mocker.patch.object(ex, "_head_sha", return_value="sha1")
     mocker.patch.object(ex, "_commit_and_push")     # git commit+push of harness edits
     mocker.patch.object(ex, "prune_worktree")
-    mocker.patch.object(ex, "_merge", return_value="mergesha")
+    mocker.patch.object(ex, "_gh_merge", return_value=True)
+    mocker.patch.object(ex, "_github_checks_verdict", return_value=ci_status)
     mocker.patch.object(ex, "_open_pr", return_value="https://gh/pr/1")
-    mocker.patch("skharness.autocode.engineering.external_ci_verdict", return_value=ci_status)
     item = WorkItem(kind="engineering", ref="t1", source="coord", repo=None,
                     payload={"tags": [f"repo:{repo_name}"], "title": "t"})
     return ex, item
@@ -301,7 +302,7 @@ def test_finalize_automerges_when_whitelisted_and_green(mocker):
     cfg = _t.SimpleNamespace(repo_map={"skrender": spec}, automerge_repos=["skrender"])
     ex, item = _final_ex(mocker, cfg, "skrender", ci_status="green")
     ex.finalize(item, GateResult(score=5, passed=True, notes="", artifact="pr"))
-    ex._merge.assert_called_once()
+    ex._gh_merge.assert_called_once()               # merged ON GitHub, not locally
     ex.board.complete_task.assert_called_once_with("autopilot", "t1")
     ex.board._write_task_raw.assert_called_once()   # records meta.autopilot.merge
     ex.digest.queue_decision.assert_not_called()
@@ -314,22 +315,73 @@ def test_finalize_pr_only_when_not_whitelisted(mocker):
     cfg = _t.SimpleNamespace(repo_map={"skrender": spec}, automerge_repos=[])  # not whitelisted
     ex, item = _final_ex(mocker, cfg, "skrender", ci_status="green")
     ex.finalize(item, GateResult(score=5, passed=True, notes="", artifact="pr"))
-    ex._merge.assert_not_called()
+    ex._gh_merge.assert_not_called()
+    ex._github_checks_verdict.assert_not_called()   # no CI poll when not whitelisted
     ex.board.complete_task.assert_not_called()      # left claimed
     ex._commit_and_push.assert_called_once()        # harness edits committed + pushed
     ex._open_pr.assert_called_once()
     ex.digest.queue_decision.assert_called_once()
 
 
-def test_finalize_pr_only_when_ci_red(mocker):
+def test_finalize_holds_when_github_ci_red(mocker):
     spec = _spec("skrender")
     spec.automerge = True
     spec.ci = "github"
     cfg = _t.SimpleNamespace(repo_map={"skrender": spec}, automerge_repos=["skrender"])
     ex, item = _final_ex(mocker, cfg, "skrender", ci_status="red")
     ex.finalize(item, GateResult(score=5, passed=True, notes="", artifact="pr"))
-    ex._merge.assert_not_called()
+    ex._gh_merge.assert_not_called()                # never merge a red PR
     ex._open_pr.assert_called_once()
+    ex.digest.queue_decision.assert_called_once()   # held for review
+    ex.board.complete_task.assert_not_called()
+
+
+def test_finalize_holds_when_security_flagged(mocker):
+    # A GitGuardian (or other security-scanner) flag must HOLD the merge for human
+    # review, even with the twin gate + core CI green.
+    spec = _spec("skrender")
+    spec.automerge = True
+    spec.ci = "github"
+    cfg = _t.SimpleNamespace(repo_map={"skrender": spec}, automerge_repos=["skrender"])
+    ex, item = _final_ex(mocker, cfg, "skrender", ci_status="blocked")
+    ex.finalize(item, GateResult(score=5, passed=True, notes="", artifact="pr"))
+    ex._gh_merge.assert_not_called()
+    ex.digest.queue_decision.assert_called_once()
+    ex.board.complete_task.assert_not_called()
+
+
+def _verdict_for(mocker, checks):
+    ex = EngineeringExecutor(_t.SimpleNamespace(repo_map={}, automerge_repos=[]),
+                             board=mocker.Mock(), journal=mocker.Mock())
+    mocker.patch("skharness.autocode.engineering.subprocess.run",
+                 return_value=_t.SimpleNamespace(stdout=json.dumps(checks), returncode=0))
+    return ex._github_checks_verdict(_spec("skrender"), "b")
+
+
+def test_github_verdict_green_ignores_release_jobs(mocker):
+    # Core gates pass, GitGuardian passes, a failing publish-* release job is IGNORED.
+    v = _verdict_for(mocker, [
+        {"name": "lint", "bucket": "pass"},
+        {"name": "test (3.12)", "bucket": "pass"},
+        {"name": "qa (3.11)", "bucket": "pass"},
+        {"name": "pytest (py3.12)", "bucket": "pass"},
+        {"name": "GitGuardian Security Checks", "bucket": "pass"},
+        {"name": "publish-npm", "bucket": "fail"},   # release job, not a quality gate
+    ])
+    assert v == "green"
+
+
+def test_github_verdict_red_on_core_failure(mocker):
+    v = _verdict_for(mocker, [{"name": "test (3.12)", "bucket": "fail"},
+                              {"name": "lint", "bucket": "pass"}])
+    assert v == "red"
+
+
+def test_github_verdict_blocked_on_security_flag(mocker):
+    v = _verdict_for(mocker, [{"name": "lint", "bucket": "pass"},
+                              {"name": "test (3.12)", "bucket": "pass"},
+                              {"name": "GitGuardian Security Checks", "bucket": "fail"}])
+    assert v == "blocked"
 
 
 def test_revert_reverts_sha_and_reopens(mocker):
