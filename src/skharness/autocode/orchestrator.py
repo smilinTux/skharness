@@ -150,21 +150,37 @@ def deepdive_spawn(board, proposals, *, caps: Caps, run_id: str,
 
 def phase0_assess(*, board, harness, tasks_dir, caps: Caps, run_id: str,
                   dry_run: bool = False, codebase_context: str = "",
-                  deepdive_proposals=None, only: str | None = None, config=None
+                  deepdive_proposals=None, only: str | None = None,
+                  only_ids=None, only_tag: str | None = None, config=None
                   ) -> tuple[list[WorkItem], list[DecisionItem]]:
     """Reclaim stale claims, compute unblocked, assess each candidate, apply the
     verdict (stale rewrite / obsolete close / needs_decision queue), spawn capped
     deep-dive tasks. Returns (candidates, decisions).
 
-    ``only`` scopes assessment to a single task id (a targeted canary/--task run),
-    so one task does not trigger a live assess call for the whole board.
+    Selection SCOPE (so a run assesses only the chosen work, not the whole board):
+      ``only``     -- a single task id (targeted canary/--task run).
+      ``only_ids`` -- an explicit BATCH of task ids (--tasks): the run assesses +
+                      builds exactly these, in their given order.
+      ``only_tag`` -- only unblocked tasks carrying this tag (--tag, e.g. a
+                      per-node assignment tag or ``autopilot``).
+    Any scope means "no new deep-dive work is spawned" -- a scoped run does the
+    named work and nothing else. Unscoped -> the full board-wide triage.
     """
     if not dry_run:
         board.release_stale_claims("autopilot", 3600)
     by_id = {t.get("id"): t for t in load_raw_tasks(tasks_dir)}
     candidates: list[WorkItem] = []
     decisions: list[DecisionItem] = []
-    ids = [only] if only else sorted(board.unblocked_task_ids())
+    if only_ids:
+        ids = list(only_ids)
+    elif only_tag:
+        ids = [tid for tid in sorted(board.unblocked_task_ids())
+               if only_tag in ((by_id.get(tid) or {}).get("tags") or [])]
+    elif only:
+        ids = [only]
+    else:
+        ids = sorted(board.unblocked_task_ids())
+    scoped = bool(only or only_ids or only_tag)
     for tid in ids:
         t = by_id.get(tid)
         if not t or t.get("status") in ("completed", "closed", "obsolete"):
@@ -190,7 +206,7 @@ def phase0_assess(*, board, harness, tasks_dir, caps: Caps, run_id: str,
                                           prompt=v.reason or f"Task {tid} needs a decision.",
                                           options={"promote": "promote", "skip": "skip"},
                                           action_ref=tid, priority=t.get("priority") or "high"))
-    if not only:                        # a targeted --task run never spawns new work
+    if not scoped:                      # a targeted/batch/tag run never spawns new work
         deepdive_spawn(board, deepdive_proposals, caps=caps, run_id=run_id, dry_run=dry_run)
     return candidates, decisions
 
@@ -374,7 +390,8 @@ def build_executors(config, board, run_id: str) -> dict:
 
 def run_once(*, board, harness, config, tasks_dir=None, run_id=None, dry_run=None,
              ledger: CapLedger | None = None, deepdive_proposals=None,
-             executors=None, task: str | None = None) -> dict:
+             executors=None, task: str | None = None,
+             tasks=None, tag: str | None = None) -> dict:
     """Execute one daily cycle: assess -> triage -> swarm -> report. Journals
     per-item state so a re-run resumes (see the resume task). Guardrails (kill
     switch, caps, dry-run) are layered in the following tasks."""
@@ -409,7 +426,7 @@ def run_once(*, board, harness, config, tasks_dir=None, run_id=None, dry_run=Non
     candidates, decisions = phase0_assess(
         board=board, harness=harness, tasks_dir=tasks_dir or _default_tasks_dir(),
         caps=caps, run_id=run_id, dry_run=dry, deepdive_proposals=deepdive_proposals,
-        only=task, config=config)
+        only=task, only_ids=tasks, only_tag=tag, config=config)
 
     if kill_switch_active(config.enabled):
         return _checkpoint("triage")
@@ -420,6 +437,12 @@ def run_once(*, board, harness, config, tasks_dir=None, run_id=None, dry_run=Non
     selected = [(it, ex) for it, ex in selected if it.ref not in done]  # resume: skip settled
     if task is not None:
         selected = [(it, ex) for it, ex in selected if it.ref == task]
+    elif tasks:
+        _batch = set(tasks)
+        selected = [(it, ex) for it, ex in selected if it.ref in _batch]
+    elif tag:
+        selected = [(it, ex) for it, ex in selected
+                    if tag in (it.payload.get("tags") or [])]
 
     if not dry:
         if kill_switch_active(config.enabled):
@@ -432,24 +455,48 @@ def run_once(*, board, harness, config, tasks_dir=None, run_id=None, dry_run=Non
     journal.write_run(run_id, {"run_id": run_id, "phase": "report", "items": state,
                                "decisions": len(decisions), "dry_run": dry,
                                "preview": report.get("digest_preview") if dry else None})
+
+    # Spin-down: reclaim THIS run's transient build artifacts (worktrees + exited
+    # sandbox containers/networks) so disk/RAM don't creep across runs. Only on a
+    # LIVE run; the mode (cold|teardown|off) comes from config. Best-effort.
+    cleanup_out = None
+    if not dry:
+        try:
+            mode = getattr(config, "cleanup_after_run", "cold")
+            if mode and mode != "off":
+                from . import cleanup
+                repo_paths = [r.path for r in getattr(config, "repo_map", {}).values()
+                              if getattr(r, "path", None)]
+                cleanup_out = cleanup.reclaim(mode, repo_paths=repo_paths,
+                                              refs=[it.ref for it, _ in selected])
+                health.record("cleanup", **{k: v for k, v in cleanup_out.items()
+                                            if k != "error"})
+                print(f"autopilot: cleanup {cleanup_out}")
+        except Exception as exc:                       # cleanup must never fail a run
+            health.record("cleanup_error", error=str(exc)[:120])
     return {"run_id": run_id, "dry_run": dry,
             "selected": [it.ref for it, _ in selected],
-            "decisions": len(decisions), "report": report}
+            "decisions": len(decisions), "report": report, "cleanup": cleanup_out}
 
 
 def run_cli(*, dry_run: bool = True, canary: bool = False, task=None,
-           harness: str = "stub") -> dict:
+           harness: str = "stub", tasks=None, tag: str | None = None) -> dict:
     """CLI bridge for `skos autopilot run`. Dry-run (default) runs against the
     StubHarness. Canary/live build the real sandboxed harness, but only when
-    harness.live_execution is enabled in config (else a clear disabled message);
-    a canary targets one task."""
+    harness.live_execution is enabled in config (else a clear disabled message).
+
+    Selection scope: ``task`` = one card (canary); ``tasks`` = an explicit BATCH
+    of card ids; ``tag`` = only cards carrying that tag. A scoped run assesses +
+    builds exactly the named work (nothing board-wide) on the autoscaled pool.
+    """
     config = Config.load()
     from skcapstone.coordination import Board
     from skcapstone.mcp_tools._helpers import _shared_root
     board = Board(_shared_root())
     if dry_run and not canary:
         from .harness import StubHarness
-        return run_once(board=board, harness=StubHarness(), config=config, dry_run=True)
+        return run_once(board=board, harness=StubHarness(), config=config, dry_run=True,
+                        task=task, tasks=tasks, tag=tag)
     if not getattr(config, "live_execution", False):
         return {"disabled": "live/canary requires harness.live_execution=true in "
                             "autopilot.yaml; enable only after the v1.5 confinement "
@@ -458,4 +505,5 @@ def run_cli(*, dry_run: bool = True, canary: bool = False, task=None,
         return {"error": "a canary requires --task <id> (it targets one task)."}
     name = None if harness in ("stub", "", None) else harness
     h = build_harness(config, name)
-    return run_once(board=board, harness=h, config=config, dry_run=False, task=task)
+    return run_once(board=board, harness=h, config=config, dry_run=False,
+                    task=task, tasks=tasks, tag=tag)

@@ -70,6 +70,31 @@ def test_phase0_reclaims_then_computes_unblocked(tmp_path):
     assert decisions == []
 
 
+def test_phase0_only_ids_scopes_to_the_batch(tmp_path):
+    # A batch (--tasks / only_ids) assesses EXACTLY those ids, in the given order,
+    # never the rest of the unblocked board.
+    for i in "abc":
+        _write_task(tmp_path, f"t-{i}", tags=["repo:skos"], acceptance_criteria=["works"])
+    board = _board(["t-a", "t-b", "t-c"])
+    harness = MagicMock()
+    harness.assess.return_value = Verdict(verdict="valid", reason="")
+    cands, _ = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                                  caps=Caps(), run_id="r", only_ids=["t-c", "t-a"])
+    assert [c.ref for c in cands] == ["t-c", "t-a"]   # exactly the batch, in order
+    assert harness.assess.call_count == 2             # t-b never assessed
+
+
+def test_phase0_only_tag_filters_unblocked(tmp_path):
+    _write_task(tmp_path, "t-1", tags=["repo:skos", "autopilot"], acceptance_criteria=["w"])
+    _write_task(tmp_path, "t-2", tags=["repo:skos"], acceptance_criteria=["w"])
+    board = _board(["t-1", "t-2"])
+    harness = MagicMock()
+    harness.assess.return_value = Verdict(verdict="valid", reason="")
+    cands, _ = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                                  caps=Caps(), run_id="r", only_tag="autopilot")
+    assert [c.ref for c in cands] == ["t-1"]          # only the tagged card
+
+
 def test_phase0_applies_verdicts(tmp_path):
     _write_task(tmp_path, "stale", tags=["repo:skos"])
     _write_task(tmp_path, "dead", tags=["repo:skos"])
