@@ -7,6 +7,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -234,43 +236,73 @@ def phase1_triage(candidates, harness, *, repo_map, decisions,
 def phase2_swarm(selected, *, harness, board, caps: Caps, ledger: CapLedger,
                  decisions, run_id: str, state=None, enabled: bool = True) -> dict:
     """Run each routed item's produce-then-grade loop, write each round's score to
-    the coord record, finalize cleared items and escalate non-converging ones. The
-    token/dollar ceiling is checked between items (spec section 14). v1 is sequential
-    (concurrency 1, always <= caps.max_concurrent)."""
+    the coord record, finalize cleared items and escalate non-converging ones.
+
+    Concurrency: up to ``caps.max_concurrent`` items run AT ONCE (a thread per
+    item). Each item's build is fully isolated -- its own worktree, sandbox, and
+    PR branch -- so the expensive parts (the sandbox rounds, and finalize's CI
+    wait) run in parallel, unlocked. The only shared state is guarded briefly:
+    the git repo + the "autopilot" agent file are serialized inside the executor
+    (``_GIT_LOCK`` / ``_BOARD_LOCK``); the run's ledger/decisions/state/journal
+    are serialized here by ``_lock``. The token/dollar ceiling is checked before
+    each item starts. max_concurrent<=1 keeps the exact old sequential behaviour."""
     state = dict(state or {})
-    for item, ex in selected:                       # concurrency cap: caps.max_concurrent
+    _lock = threading.Lock()
+    _budget_hit = [False]                           # append the budget decision ONCE
+    workers = max(1, int(getattr(caps, "max_concurrent", 1) or 1))
+
+    def _process(item, ex) -> None:
         if kill_switch_active(enabled):
-            break
-        if ledger.exceeded():
-            decisions.append(DecisionItem(qid=stable_qid("budget-hit", run_id),
-                prompt="Autopilot hit its budget ceiling (token/dollar limits); stopped early.",
-                options={"ok": "acknowledge"}, action_ref=run_id, priority="high"))
-            break
-        result = ex.run(item, harness)
-        rnd = int((state.get(item.ref, {}).get("round", 0) or 0)) + 1
-        ledger.add(getattr(result, "tokens", 0), getattr(result, "cost_usd", 0.0))
+            return
+        with _lock:
+            if ledger.exceeded():
+                if not _budget_hit[0]:              # only the first over-budget item escalates
+                    _budget_hit[0] = True
+                    decisions.append(DecisionItem(qid=stable_qid("budget-hit", run_id),
+                        prompt="Autopilot hit its budget ceiling (token/dollar limits); stopped early.",
+                        options={"ok": "acknowledge"}, action_ref=run_id, priority="high"))
+                return
+        result = ex.run(item, harness)              # ISOLATED build -- unlocked
+        with _lock:
+            ledger.add(getattr(result, "tokens", 0), getattr(result, "cost_usd", 0.0))
+            rnd = int((state.get(item.ref, {}).get("round", 0) or 0)) + 1
         if result.passed:
             try:
-                ex.finalize(item, result)
-                state[item.ref] = {"state": "finalized", "round": rnd, "score": result.score}
+                ex.finalize(item, result)           # long CI wait -- unlocked; git/board self-guarded
+                entry = {"state": "finalized", "round": rnd, "score": result.score}
             except Exception as exc:                # noqa: BLE001 - must never vanish
                 # A gate-PASSED item whose finalize (CI re-check / PR open / merge)
                 # raises must not silently disappear: _commit_and_push may already
                 # have pushed autopilot/<ref>, so a swallowed error reads as "no
                 # work done". Surface it as an operator decision instead.
-                decisions.append(DecisionItem(
-                    qid=stable_qid("finalize-failed", item.ref),
-                    prompt=(f"Task {item.ref} PASSED the gate but finalize failed: "
-                            f"{type(exc).__name__}: {exc}. Branch autopilot/{item.ref} "
-                            f"may already be pushed; open/merge it manually or retry."),
-                    options={"retry": "retry", "skip": "skip"},
-                    action_ref=item.ref, priority="high"))
-                state[item.ref] = {"state": "finalize-failed", "round": rnd,
-                                   "score": result.score}
+                with _lock:
+                    decisions.append(DecisionItem(
+                        qid=stable_qid("finalize-failed", item.ref),
+                        prompt=(f"Task {item.ref} PASSED the gate but finalize failed: "
+                                f"{type(exc).__name__}: {exc}. Branch autopilot/{item.ref} "
+                                f"may already be pushed; open/merge it manually or retry."),
+                        options={"retry": "retry", "skip": "skip"},
+                        action_ref=item.ref, priority="high"))
+                entry = {"state": "finalize-failed", "round": rnd, "score": result.score}
         else:
-            decisions.append(ex.escalate(item, result.notes))
-            state[item.ref] = {"state": "escalated", "round": rnd, "score": result.score}
-        journal.write_run(run_id, {"run_id": run_id, "phase": "swarm", "items": state})
+            d = ex.escalate(item, result.notes)
+            with _lock:
+                decisions.append(d)
+            entry = {"state": "escalated", "round": rnd, "score": result.score}
+        with _lock:
+            state[item.ref] = entry
+            journal.write_run(run_id, {"run_id": run_id, "phase": "swarm", "items": dict(state)})
+
+    if workers <= 1:
+        for item, ex in selected:                   # exact old sequential path
+            if kill_switch_active(enabled):
+                break
+            _process(item, ex)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_process, item, ex) for item, ex in selected]
+            for f in futures:
+                f.result()                          # surface any worker exception
     return state
 
 

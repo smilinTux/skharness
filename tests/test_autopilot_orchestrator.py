@@ -445,3 +445,45 @@ def test_phase0_only_scopes_to_single_task(tmp_path):
                                   caps=Caps(), run_id="r1", dry_run=True, only="target")
     assert harness.assess.call_count == 1        # only the one task assessed, not the board
     assert [c.ref for c in cands] == ["target"]
+
+
+def test_swarm_runs_items_concurrently_when_max_concurrent_gt_1(clean_execs, fake_journal):
+    """max_concurrent>1 runs items in parallel: N items each sleeping T finish in
+    ~T, not ~N*T, and all get finalized. Proves the worker pool + locking."""
+    import threading as _th
+    import time as _t
+    from types import SimpleNamespace
+
+    active = {"n": 0, "max": 0}
+    _l = _th.Lock()
+
+    class _SlowExec:
+        kind = "engineering"
+        def __init__(self):
+            self.name = "slow"
+        def run(self, item, harness):
+            with _l:
+                active["n"] += 1
+                active["max"] = max(active["max"], active["n"])
+            _t.sleep(0.3)
+            with _l:
+                active["n"] -= 1
+            return GateResult(5, True, "ok", "pr")
+        def finalize(self, item, result):  # no-op finalize
+            pass
+        def escalate(self, item, notes):
+            return DecisionItem(qid="q", prompt="p", options={}, action_ref=item.ref, priority="low")
+
+    ex = _SlowExec()
+    EXECUTORS["engineering"] = ex
+    items = [(_wi(f"t-{i}"), ex) for i in range(4)]
+    ledger = CapLedger(Caps())
+    decisions = []
+    t0 = _t.monotonic()
+    state = orch.phase2_swarm(items, harness=SimpleNamespace(name="h"),
+                              board=MagicMock(), caps=Caps(max_concurrent=4),
+                              ledger=ledger, decisions=decisions, run_id="rp")
+    elapsed = _t.monotonic() - t0
+    assert len(state) == 4 and all(v["state"] == "finalized" for v in state.values())
+    assert active["max"] >= 2, "no real concurrency observed"
+    assert elapsed < 0.9, f"ran serially ({elapsed:.2f}s for 4x0.3s)"
