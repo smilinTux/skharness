@@ -45,6 +45,7 @@ class Config:
     allowed_tools: list[str] = field(default_factory=list)
     repo_map: dict[str, RepoSpec] = field(default_factory=dict)
     automerge_repos: list[str] = field(default_factory=list)
+    cleanup_after_run: str = "cold"       # spin-down: cold (keep image) | teardown | off
     caps: Caps = field(default_factory=Caps)
     digest_chat: str | None = None
     epic_id: str | None = None
@@ -84,6 +85,7 @@ class Config:
             allowed_tools=list(raw.get("allowed_tools") or []),
             repo_map=repo_map,
             automerge_repos=list(raw.get("automerge_repos") or []),
+            cleanup_after_run=raw.get("cleanup_after_run", "cold"),
             caps=caps,
             digest_chat=raw.get("digest_chat"),
             epic_id=raw.get("epic_id"),
