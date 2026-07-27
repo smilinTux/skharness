@@ -60,6 +60,56 @@ class EngineeringExecutor:
         self.board = board
         self.journal = journal
         self.digest = digest
+        # Per-build LLM usage, keyed by item.ref, accrued across rounds in run()
+        # and settled into the SKJoule wallet at finalize() on a twin-gate pass.
+        self._build_usage: dict = {}   # item.ref -> joules.BuildUsage
+
+    def _agent(self) -> str:
+        """The agent whose wallet earns/pays for this build's work."""
+        import os
+
+        return (os.environ.get("SKAGENT")
+                or getattr(self.config, "agent", None)
+                or "lumina")
+
+    def _accrue_usage(self, ref: str, hr) -> None:
+        """Fold one implement round's tokens + cost into the build's running usage.
+
+        Best-effort telemetry: never raises into the build loop.
+        """
+        try:
+            from .joules import BuildUsage
+
+            u = self._build_usage.setdefault(ref, BuildUsage())
+            raw = getattr(hr, "raw", None)
+            if isinstance(raw, dict) and raw.get("usage"):
+                r = BuildUsage.from_claude_json(raw)
+                u.add(input_tokens=r.input_tokens, output_tokens=r.output_tokens,
+                      cost_usd=r.cost_usd, turns=r.turns, model=r.model)
+            else:  # older/stub result: fall back to the summed fields
+                u.add(output_tokens=int(getattr(hr, "tokens", 0) or 0),
+                      cost_usd=float(getattr(hr, "cost_usd", 0.0) or 0.0), turns=1)
+        except Exception as exc:
+            health.record("usage_accrue_error", task=ref, error=str(exc)[:120])
+
+    def _settle_economics(self, item: WorkItem, sha: str) -> None:
+        """Settle the build's joule P&L on a twin-gate pass (mint value, spend real
+        token cost). Best-effort: a wallet failure never affects the finalized PR."""
+        try:
+            from .joules import BuildUsage, settle
+
+            usage = self._build_usage.pop(item.ref, None) or BuildUsage()
+            econ = settle(self._agent(), item.ref,
+                          priority=item.payload.get("priority"),
+                          score=5, usage=usage, commit_sha=sha)
+            health.record("build_economics", task=item.ref, minted=econ.minted,
+                          cost_usd=econ.cost_usd, net_joules=econ.net_joules,
+                          joules_per_usd=round(econ.joules_per_usd, 2),
+                          tokens=econ.tokens, recorded=econ.recorded)
+            if econ.recorded:
+                print(f"autopilot[{item.ref}] {econ.summary()}")
+        except Exception as exc:
+            health.record("build_economics_error", task=item.ref, error=str(exc)[:120])
 
     def _repo_names(self, item: WorkItem) -> list[str]:
         return [t.split(":", 1)[1] for t in item.payload.get("tags", [])
@@ -187,14 +237,43 @@ class EngineeringExecutor:
         pr_branch = f"autopilot/{item.ref}"
         feedback: str | None = None
         last: GateResult | None = None
+        empty_rounds = 0
         for rnd in range(1, self._MAX_ROUNDS + 1):
             # Ralph: a FRESH harness session that re-reads disk state each round.
             tb = TaskBrief(task_id=item.ref, repo=repo, worktree=wt,
                            title=p.get("title", ""), description=p.get("description", ""),
                            acceptance=p.get("acceptance", []),
                            prior_feedback=feedback, round=rnd)
-            harness.run_task(tb)
+            hr = harness.run_task(tb)
+            self._accrue_usage(item.ref, hr)   # token/cost telemetry for the joule P&L
             diff = self._diff(repo, wt)
+            # No-op guard (efficiency): a build that produces NO diff can never
+            # pass the gate, so grinding all MAX_ROUNDS on it burns tokens for
+            # nothing -- the exact failure that made a stale card (its work already
+            # on the base branch) cost ~28 min. One empty round may be a flaky
+            # run, so retry ONCE with explicit feedback; a second empty round means
+            # the change is genuinely already present (stale card) or the agent
+            # cannot write, so bail with a distinct no-op result the operator can
+            # act on (mark complete / revise) rather than a generic gate failure.
+            if not diff.strip():
+                empty_rounds += 1
+                health.record("empty_diff_round", task=item.ref, round=rnd,
+                              consecutive=empty_rounds)
+                if empty_rounds >= 2:
+                    return GateResult(
+                        score=None, passed=False, artifact=None,
+                        notes=("no-op: the agent produced no diff in 2 rounds. The "
+                               "acceptance is likely ALREADY satisfied on the base "
+                               "branch (stale card) or the harness cannot write. "
+                               "This is not a gate failure -- review the card."))
+                feedback = ("You produced NO changes to the repository. If the "
+                            "acceptance criteria are ALREADY satisfied by existing "
+                            "code on this branch, do not re-implement -- instead make "
+                            "a minimal no-op-safe adjustment ONLY if something is "
+                            "genuinely missing. Otherwise create/edit the required "
+                            "files now; an empty diff cannot pass review.")
+                continue   # nothing to grade on an empty diff; skip CI/grade
+            empty_rounds = 0
             ci_status = external_ci_verdict(repo, pr_branch, self._head_sha(wt),
                                             worktree=wt, diff=diff)
             cov = diff_coverage(repo, wt, diff)
@@ -280,6 +359,10 @@ class EngineeringExecutor:
         wt = self.journal.worktree_for(item.ref)
         pr_branch = f"autopilot/{item.ref}"
         self._commit_and_push(repo, wt, pr_branch, item)   # harness edits are uncommitted
+        if result.passed:
+            # Verified work reached finalize: settle the build's joule P&L (mint the
+            # value, spend the real token cost) now that a commit SHA exists.
+            self._settle_economics(item, self._head_sha(wt))
         ci_status = external_ci_verdict(repo, pr_branch, self._head_sha(wt), worktree=wt)
         automerge = (repo.name in self.config.automerge_repos
                      and repo.ci != "none" and ci_status == "green"

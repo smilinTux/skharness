@@ -247,6 +247,21 @@ def test_run_caps_at_four_rounds_then_fails(mocker, cfg):
     assert ex.board.score_task.call_count == 4
 
 
+def test_run_bails_fast_on_noop_empty_diff(mocker, cfg):
+    # Efficiency: a build that produces NO diff (a stale card whose work is already
+    # on the base branch, or a harness that cannot write) can never pass the gate,
+    # so it must bail after one retry -- never grind all 4 rounds, never grade an
+    # empty diff. This is the exact 28-min waste the guard kills.
+    ex, harness, item = _run_ex(mocker, cfg, grades=[])
+    mocker.patch.object(ex, "_diff", return_value="")   # agent produced no changes
+    res = ex.run(item, harness)
+    assert res.passed is False
+    assert "no-op" in (res.notes or "").lower()
+    assert harness.run_task.call_count == 2   # one flaky-retry, then bail (not 4)
+    assert harness.grade.call_count == 0      # never grade / CI / score an empty diff
+    assert ex.board.score_task.call_count == 0
+
+
 def test_twin_gate_blocks_merge_when_ci_red_even_at_five(mocker, cfg):
     grades = [GateResult(score=5, passed=True,
                          notes="<promise>COMPLETE</promise>", artifact="pr")] * 6
