@@ -237,6 +237,7 @@ class EngineeringExecutor:
         pr_branch = f"autopilot/{item.ref}"
         feedback: str | None = None
         last: GateResult | None = None
+        empty_rounds = 0
         for rnd in range(1, self._MAX_ROUNDS + 1):
             # Ralph: a FRESH harness session that re-reads disk state each round.
             tb = TaskBrief(task_id=item.ref, repo=repo, worktree=wt,
@@ -246,6 +247,33 @@ class EngineeringExecutor:
             hr = harness.run_task(tb)
             self._accrue_usage(item.ref, hr)   # token/cost telemetry for the joule P&L
             diff = self._diff(repo, wt)
+            # No-op guard (efficiency): a build that produces NO diff can never
+            # pass the gate, so grinding all MAX_ROUNDS on it burns tokens for
+            # nothing -- the exact failure that made a stale card (its work already
+            # on the base branch) cost ~28 min. One empty round may be a flaky
+            # run, so retry ONCE with explicit feedback; a second empty round means
+            # the change is genuinely already present (stale card) or the agent
+            # cannot write, so bail with a distinct no-op result the operator can
+            # act on (mark complete / revise) rather than a generic gate failure.
+            if not diff.strip():
+                empty_rounds += 1
+                health.record("empty_diff_round", task=item.ref, round=rnd,
+                              consecutive=empty_rounds)
+                if empty_rounds >= 2:
+                    return GateResult(
+                        score=None, passed=False, artifact=None,
+                        notes=("no-op: the agent produced no diff in 2 rounds. The "
+                               "acceptance is likely ALREADY satisfied on the base "
+                               "branch (stale card) or the harness cannot write. "
+                               "This is not a gate failure -- review the card."))
+                feedback = ("You produced NO changes to the repository. If the "
+                            "acceptance criteria are ALREADY satisfied by existing "
+                            "code on this branch, do not re-implement -- instead make "
+                            "a minimal no-op-safe adjustment ONLY if something is "
+                            "genuinely missing. Otherwise create/edit the required "
+                            "files now; an empty diff cannot pass review.")
+                continue   # nothing to grade on an empty diff; skip CI/grade
+            empty_rounds = 0
             ci_status = external_ci_verdict(repo, pr_branch, self._head_sha(wt),
                                             worktree=wt, diff=diff)
             cov = diff_coverage(repo, wt, diff)
