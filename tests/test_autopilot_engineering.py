@@ -248,6 +248,31 @@ def test_run_caps_at_four_rounds_then_fails(mocker, cfg):
     assert ex.board.score_task.call_count == 4
 
 
+def test_run_salvages_to_review_when_grade_inconclusive_but_ci_green(mocker, cfg):
+    # Grade-resilience: the grader returns no score (inconclusive) but CI is green,
+    # coverage is met, and the diff is real -> salvage to a human-reviewed PR after
+    # ONE round instead of stranding sound work or burning all 4 rounds.
+    grades = [GateResult(score=None, passed=False, notes="", artifact=None)] * 6
+    ex, harness, item = _run_ex(mocker, cfg, grades)   # _diff="DIFF", ci=green, cov=0.95
+    salvage = mocker.patch.object(ex, "_salvage_to_review", return_value="https://gh/pr/9")
+    res = ex.run(item, harness)
+    assert res.passed is False                 # never a gate pass (grade never said 5)
+    salvage.assert_called_once()               # opened a PR for review
+    assert "https://gh/pr/9" in (res.notes or "")
+    assert harness.grade.call_count == 1       # bailed after ONE round, not 4
+
+
+def test_run_does_not_salvage_when_ci_red(mocker, cfg):
+    # Inconclusive grade + RED ci must NOT salvage (no PR); it keeps trying / fails.
+    grades = [GateResult(score=None, passed=False, notes="", artifact=None)] * 6
+    ex, harness, item = _run_ex(mocker, cfg, grades, ci_status="red")
+    salvage = mocker.patch.object(ex, "_salvage_to_review", return_value="x")
+    res = ex.run(item, harness)
+    assert res.passed is False
+    salvage.assert_not_called()                # red CI -> no salvage
+    assert harness.grade.call_count == 4       # ran the full cap
+
+
 def test_run_bails_fast_on_noop_empty_diff(mocker, cfg):
     # Efficiency: a build that produces NO diff (a stale card whose work is already
     # on the base branch, or a harness that cannot write) can never pass the gate,

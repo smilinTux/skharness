@@ -292,6 +292,20 @@ class EngineeringExecutor:
             if twin_gate_passed(gr, ci_status, cov, repo):
                 return GateResult(score=5, passed=True,
                                   notes=strip_promise(gr.notes), artifact=gr.artifact)
+            # Grade-resilience: the grader could not certify (score None == the
+            # adapter returned no parseable verdict even after its retries -- a
+            # flaky/transient grade), BUT the DETERMINISTIC signals are strong: CI
+            # green + coverage met + a real diff. Sound work must not be stranded or
+            # burn the remaining rounds on a grader that will not answer. Salvage it
+            # to a HUMAN-reviewed PR (never auto-merged -- the grade never said 5).
+            cov_ok = cov is None or cov >= getattr(repo, "min_diff_coverage", 0.8)
+            if gr.score is None and ci_status == "green" and diff.strip() and cov_ok:
+                health.record("grade_inconclusive_ci_green", task=item.ref, round=rnd)
+                pr_url = self._salvage_to_review(item, repo, wt, pr_branch)
+                return GateResult(
+                    score=None, passed=False, artifact=pr_url,
+                    notes=(f"grade inconclusive but CI green + coverage met; opened "
+                           f"PR {pr_url} for human review (NOT auto-merged)."))
             feedback = strip_promise(gr.notes)
         return GateResult(score=(last.score if last else None), passed=False,
                           notes=f"did not converge in {self._MAX_ROUNDS} rounds: "
@@ -346,6 +360,19 @@ class EngineeringExecutor:
             print(f"autopilot: gh pr create failed for {pr_branch} (base={base}): "
                   f"{proc.stderr.strip()}")
         return proc.stdout.strip()
+
+    def _salvage_to_review(self, item: WorkItem, repo: RepoSpec, wt: str,
+                           pr_branch: str) -> str:
+        """The grader could not certify but CI + coverage hold: commit + push the
+        work and open a PR for HUMAN review. NEVER auto-merges (the grade never
+        reached 5). Returns the PR url; the orchestrator escalates it as a decision.
+        """
+        self._commit_and_push(repo, wt, pr_branch, item)
+        pr_url = self._open_pr(repo, pr_branch, item)
+        self._build_usage.pop(item.ref, None)   # drop unsettled usage (no mint on a non-pass)
+        health.record("grade_salvaged_to_review", task=item.ref, pr=pr_url)
+        print(f"autopilot[{item.ref}] grade inconclusive; salvaged to PR {pr_url} for review")
+        return pr_url
 
     def finalize(self, item: WorkItem, result: GateResult) -> None:
         # G2 defense-in-depth: this executor owns the twin-gated merge path, so a
