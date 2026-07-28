@@ -14,11 +14,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .types import (WorkItem, AssessBrief, DecisionItem, QualityMode,
-                    QUALITY_RANK, coerce_quality)
+                    QUALITY_RANK, coerce_quality, ClaimRaced)
 from .executor import EXECUTORS
 from .config import Caps, Config
 from .harness import build_harness
-from . import health, journal
+from . import fleet_dispatch, health, journal
 
 
 @dataclass
@@ -167,7 +167,8 @@ def phase0_assess(*, board, harness, tasks_dir, caps: Caps, run_id: str,
     named work and nothing else. Unscoped -> the full board-wide triage.
     """
     if not dry_run:
-        board.release_stale_claims("autopilot", 3600)
+        for agent in sorted({"autopilot", fleet_dispatch.claim_agent_name()}):
+            board.release_stale_claims(agent, 3600)
     by_id = {t.get("id"): t for t in load_raw_tasks(tasks_dir)}
     candidates: list[WorkItem] = []
     decisions: list[DecisionItem] = []
@@ -287,7 +288,14 @@ def phase2_swarm(selected, *, harness, board, caps: Caps, ledger: CapLedger,
                         prompt="Autopilot hit its budget ceiling (token/dollar limits); stopped early.",
                         options={"ok": "acknowledge"}, action_ref=run_id, priority="high"))
                 return
-        result = ex.run(item, harness)              # ISOLATED build -- unlocked
+        try:
+            result = ex.run(item, harness)          # ISOLATED build -- unlocked
+        except ClaimRaced as exc:
+            with _lock:
+                state[item.ref] = {"state": "claim-raced", "detail": str(exc)}
+                journal.write_run(run_id, {"run_id": run_id, "phase": "swarm",
+                                           "items": dict(state)})
+            return
         with _lock:
             ledger.add(getattr(result, "tokens", 0), getattr(result, "cost_usd", 0.0))
             rnd = int((state.get(item.ref, {}).get("round", 0) or 0)) + 1
@@ -391,7 +399,7 @@ def build_executors(config, board, run_id: str) -> dict:
 def run_once(*, board, harness, config, tasks_dir=None, run_id=None, dry_run=None,
              ledger: CapLedger | None = None, deepdive_proposals=None,
              executors=None, task: str | None = None,
-             tasks=None, tag: str | None = None) -> dict:
+             tasks=None, tag: str | None = None, placer=None) -> dict:
     """Execute one daily cycle: assess -> triage -> swarm -> report. Journals
     per-item state so a re-run resumes (see the resume task). Guardrails (kill
     switch, caps, dry-run) are layered in the following tasks."""
@@ -444,9 +452,17 @@ def run_once(*, board, harness, config, tasks_dir=None, run_id=None, dry_run=Non
         selected = [(it, ex) for it, ex in selected
                     if tag in (it.payload.get("tags") or [])]
 
+    off_node: list[tuple] = []
     if not dry:
         if kill_switch_active(config.enabled):
             return _checkpoint("swarm")
+        if placer is None and getattr(config, "fleet_dispatch", True):
+            placer = fleet_dispatch.default_placer()
+        selected, off_node = fleet_dispatch.partition_local(
+            selected, placer=placer, self_node=fleet_dispatch.self_node())
+        for item, decision in off_node:
+            state[item.ref] = {"state": "off-node", "node": decision.node,
+                               "reason": decision.reason}
         state = phase2_swarm(selected, harness=harness, board=board, caps=caps,
                              ledger=ledger, decisions=decisions, run_id=run_id,
                              state=state, enabled=config.enabled)
@@ -476,6 +492,8 @@ def run_once(*, board, harness, config, tasks_dir=None, run_id=None, dry_run=Non
             health.record("cleanup_error", error=str(exc)[:120])
     return {"run_id": run_id, "dry_run": dry,
             "selected": [it.ref for it, _ in selected],
+            "off_node": [{"ref": it.ref, "node": d.node, "reason": d.reason}
+                         for it, d in off_node],
             "decisions": len(decisions), "report": report, "cleanup": cleanup_out}
 
 

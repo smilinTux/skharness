@@ -144,3 +144,11 @@ class DecisionItem:
     options: dict
     action_ref: str | None
     priority: str
+
+
+class ClaimRaced(Exception):
+    """The coord claim was won by another runtime (stale-placement guard).
+
+    Raised instead of executing when claim_task reports the card claimed by a
+    different agent name; the swarm records a skip, never a double-run.
+    """

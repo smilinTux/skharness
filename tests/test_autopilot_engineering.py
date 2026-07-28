@@ -97,7 +97,7 @@ def test_claim_calls_board_then_journal(mocker, cfg):
     manager = mocker.Mock()
     manager.attach_mock(board.claim_task, "claim")
     manager.attach_mock(journal.record_claim, "record")
-    ex = EngineeringExecutor(cfg, board=board, journal=journal)
+    ex = EngineeringExecutor(cfg, board=board, journal=journal, agent_name="autopilot")
     item = WorkItem(kind="engineering", ref="t1", source="coord", repo=None,
                     payload={"tags": ["repo:skrender"]})
     ex.claim(item)
@@ -183,7 +183,8 @@ def test_strip_promise_removes_tag_and_trims():
 
 
 def _run_ex(mocker, cfg, grades, ci_status="green", cov=0.95):
-    ex = EngineeringExecutor(cfg, board=mocker.Mock(), journal=mocker.Mock())
+    ex = EngineeringExecutor(cfg, board=mocker.Mock(), journal=mocker.Mock(),
+                             agent_name="autopilot")
     mocker.patch.object(ex, "make_worktree", return_value="/wt/t1")
     mocker.patch.object(ex, "prune_worktree")
     mocker.patch.object(ex, "_diff", return_value="DIFF")
@@ -307,7 +308,7 @@ def test_twin_gate_blocks_when_coverage_under_min(mocker, cfg):
 
 def _final_ex(mocker, cfg, repo_name, ci_status="green"):
     ex = EngineeringExecutor(cfg, board=mocker.Mock(), journal=mocker.Mock(),
-                             digest=mocker.Mock())
+                             digest=mocker.Mock(), agent_name="autopilot")
     ex.journal.worktree_for.return_value = "/wt/t1"
     mocker.patch.object(ex, "_head_sha", return_value="sha1")
     mocker.patch.object(ex, "_commit_and_push")     # git commit+push of harness edits
