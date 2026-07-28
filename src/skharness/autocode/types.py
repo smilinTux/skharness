@@ -1,7 +1,7 @@
 """Autopilot data contracts (spec section 10). Plain dataclasses, no I/O."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 
@@ -66,6 +66,11 @@ class RepoSpec:                       # one entry of repo_map (autopilot.yaml)
     coverage_cmd: str | None = None   # emits Cobertura/lcov; None -> PR-only
     ci_poll_timeout: int = 1200       # seconds to poll github-actions before red
     ci_scope: str = "full"            # "full" (whole suite) | "changed" (tests for the diff)
+    advisory_checks: list[str] = field(default_factory=list)   # CI checks that are
+    #   non-blocking for auto-merge even on failure, e.g. ["lint"] for a repo whose
+    #   GitHub lint job is `continue-on-error` (advisory). A name matched here is
+    #   dropped from the auto-merge core gate; security checks are NEVER advisory.
+    #   Empty (default) preserves strict behavior: every core check must pass.
     automerge: bool = False
     auto_revert: bool = False
     min_diff_coverage: float = 0.8

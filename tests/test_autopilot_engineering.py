@@ -428,6 +428,45 @@ def test_github_verdict_blocked_on_security_flag(mocker):
     assert v == "blocked"
 
 
+def _verdict_for_spec(mocker, spec, checks):
+    ex = EngineeringExecutor(_t.SimpleNamespace(repo_map={}, automerge_repos=[]),
+                             board=mocker.Mock(), journal=mocker.Mock())
+    mocker.patch("skharness.autocode.engineering.subprocess.run",
+                 return_value=_t.SimpleNamespace(stdout=json.dumps(checks), returncode=0))
+    return ex._github_checks_verdict(spec, "b")
+
+
+def test_github_verdict_advisory_check_does_not_block(mocker):
+    # A repo whose GitHub lint job is `continue-on-error` declares advisory_checks=["lint"].
+    # A failing lint check must NOT hold the merge when the real gates (tests) are green.
+    spec = _spec("skrender")
+    spec.advisory_checks = ["lint"]
+    v = _verdict_for_spec(mocker, spec, [
+        {"name": "lint", "bucket": "fail"},              # advisory -> not a gate
+        {"name": "test (3.12)", "bucket": "pass"},
+        {"name": "GitGuardian Security Checks", "bucket": "pass"},
+    ])
+    assert v == "green"
+
+
+def test_github_verdict_advisory_does_not_relax_real_failures(mocker):
+    # advisory_checks=["lint"] must not mask a genuine core-test failure.
+    spec = _spec("skrender")
+    spec.advisory_checks = ["lint"]
+    v = _verdict_for_spec(mocker, spec, [
+        {"name": "lint", "bucket": "fail"},
+        {"name": "test (3.12)", "bucket": "fail"},        # a real gate failed -> red
+    ])
+    assert v == "red"
+
+
+def test_github_verdict_lint_still_gates_by_default(mocker):
+    # Without advisory_checks, lint remains a hard gate (strict default preserved).
+    v = _verdict_for(mocker, [{"name": "lint", "bucket": "fail"},
+                              {"name": "test (3.12)", "bucket": "pass"}])
+    assert v == "red"
+
+
 def test_revert_reverts_sha_and_reopens(mocker):
     spec = _spec("skrender")
     cfg = _t.SimpleNamespace(repo_map={"skrender": spec}, automerge_repos=[])

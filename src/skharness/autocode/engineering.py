@@ -474,6 +474,7 @@ class EngineeringExecutor:
         """Poll the PR's GitHub checks. Returns one of:
 
           green   -- every discovered core CI check passed and no security check failed
+                     (checks named in repo.advisory_checks are not core gates)
           red     -- a core CI check failed (do not merge)
           blocked -- a security check (GitGuardian) failed -> hold for human review
           timeout -- core checks still pending at the deadline (never merge on unknown)
@@ -495,7 +496,10 @@ class EngineeringExecutor:
                 checks = json.loads(proc.stdout or "[]")
             except Exception:
                 checks = []
-            core = [c for c in checks if _hit(self._AUTOMERGE_CORE, c.get("name"))]
+            advisory = tuple(a.lower() for a in getattr(repo, "advisory_checks", ()) or ())
+            core = [c for c in checks
+                    if _hit(self._AUTOMERGE_CORE, c.get("name"))
+                    and not _hit(advisory, c.get("name"))]   # advisory != a merge gate
             sec = [c for c in checks if _hit(self._AUTOMERGE_SECURITY, c.get("name"))]
             if any(c.get("bucket") == "fail" for c in sec):
                 return "blocked"

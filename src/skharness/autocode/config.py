@@ -16,8 +16,8 @@ from .types import QualityMode, RepoSpec, coerce_quality
 
 _REPO_KEYS = {
     "name", "path", "base_branch", "integration_branch", "test_cmd", "ci",
-    "coverage_cmd", "ci_poll_timeout", "ci_scope", "automerge", "auto_revert",
-    "min_diff_coverage", "sandbox_image", "min_quality",
+    "coverage_cmd", "ci_poll_timeout", "ci_scope", "advisory_checks", "automerge",
+    "auto_revert", "min_diff_coverage", "sandbox_image", "min_quality",
 }
 
 
