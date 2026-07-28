@@ -39,6 +39,15 @@ def _isolate_health(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("SKHARNESS_HEALTH_PATH", str(hp))
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_fleet(monkeypatch, tmp_path):
+    """Point the fleet dispatch gate at an empty tree so orchestrator tests
+    never consult the live ~/.skcapstone/fleet. The gate stays inert (no
+    admitted nodes) unless a test builds its own tree under this root or
+    overrides SKFLEET_ROOT itself."""
+    monkeypatch.setenv("SKFLEET_ROOT", str(tmp_path / "fleet-hermetic"))
+
+
 @pytest.fixture
 def data_root(tmp_path, monkeypatch):
     """Point SK_DATA_ROOT at a throwaway dir for every test."""

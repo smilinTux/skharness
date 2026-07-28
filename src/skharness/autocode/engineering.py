@@ -72,11 +72,14 @@ def twin_gate_passed(gr: GateResult, ci_status: str, cov: float | None,
 class EngineeringExecutor:
     kind = "engineering"
 
-    def __init__(self, config, board, journal, digest=None) -> None:
+    def __init__(self, config, board, journal, digest=None, *,
+                 agent_name: str | None = None) -> None:
         self.config = config
         self.board = board
         self.journal = journal
         self.digest = digest
+        from .fleet_dispatch import claim_agent_name
+        self.agent_name = agent_name or claim_agent_name()
         # Per-build LLM usage, keyed by item.ref, accrued across rounds in run()
         # and settled into the SKJoule wallet at finalize() on a twin-gate pass.
         self._build_usage: dict = {}   # item.ref -> joules.BuildUsage
@@ -155,9 +158,15 @@ class EngineeringExecutor:
 
     def claim(self, item: WorkItem) -> None:
         """Claim the coord task before any work (a second runtime cannot double-
-        execute), then record the lease start so a crash is reclaimable."""
-        with _BOARD_LOCK:                   # shared autopilot agent file (read-modify-write)
-            self.board.claim_task("autopilot", item.ref)
+        execute), then record the lease start so a crash is reclaimable. The
+        claimer is node-scoped (autopilot-<node>) so a stale fleet placement
+        loses the race loudly (ClaimRaced) instead of double-running."""
+        from .types import ClaimRaced
+        with _BOARD_LOCK:                   # shared agent file (read-modify-write)
+            try:
+                self.board.claim_task(self.agent_name, item.ref)
+            except ValueError as exc:
+                raise ClaimRaced(f"{item.ref}: {exc}") from exc
         self.journal.record_claim(item.ref, claimed_at=_now_iso())
 
     def _worktree_path(self, item: WorkItem, repo: RepoSpec) -> str:
@@ -430,8 +439,8 @@ class EngineeringExecutor:
                     lambda d: d.setdefault("meta", {}).setdefault("autopilot", {})
                               .__setitem__("merge", {"pr": pr_url, "branch": pr_branch,
                                                      "ts": _now_iso(), "auto": True}))
-                with _BOARD_LOCK:           # shared autopilot agent file
-                    self.board.complete_task("autopilot", item.ref)
+                with _BOARD_LOCK:           # shared agent file
+                    self.board.complete_task(self.agent_name, item.ref)
                 self.prune_worktree(repo, wt)
                 health.record("automerge", task=item.ref, pr=pr_url, verdict="green")
                 print(f"autopilot[{item.ref}] AUTO-MERGED {pr_url} (GitHub CI green)")

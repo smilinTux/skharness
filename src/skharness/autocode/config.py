@@ -59,6 +59,7 @@ class Config:
     sandbox_image: str | None = None
     default_quality: QualityMode = QualityMode.GATED   # per-interface default quality
     #   (toggle spec 2.2 step 3); board/CLI runs fall back to this, then to gated.
+    fleet_dispatch: bool = True           # consult the fleet scheduler before swarm
 
     def repo(self, name: str) -> RepoSpec | None:
         return self.repo_map.get(name)
@@ -98,6 +99,7 @@ class Config:
             mcp_endpoints=list(raw.get("mcp_endpoints") or []),
             sandbox_image=raw.get("sandbox_image"),
             default_quality=coerce_quality(raw.get("default_quality")),
+            fleet_dispatch=bool(raw.get("fleet_dispatch", True)),
         )
 
 
