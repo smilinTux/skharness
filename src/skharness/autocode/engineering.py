@@ -433,18 +433,23 @@ class EngineeringExecutor:
             # review on any red or on a security-scanner flag (e.g. GitGuardian) --
             # a flagged PR must never auto-merge. Never merge on an unknown/timeout.
             verdict = self._github_checks_verdict(repo, pr_branch)
-            if verdict == "green" and self._gh_merge(repo, pr_branch):
-                self.board._write_task_raw(
-                    item.ref,
-                    lambda d: d.setdefault("meta", {}).setdefault("autopilot", {})
-                              .__setitem__("merge", {"pr": pr_url, "branch": pr_branch,
-                                                     "ts": _now_iso(), "auto": True}))
-                with _BOARD_LOCK:           # shared agent file
-                    self.board.complete_task(self.agent_name, item.ref)
+            if verdict == "green":
+                # Prune the local worktree BEFORE the merge: `gh pr merge --delete-branch`
+                # also deletes the LOCAL branch, which errors while a worktree still holds
+                # it, making a SUCCESSFUL GitHub merge look like a failure (false "held").
+                # CI, coverage, and the PR are already done, so the worktree is unneeded.
                 self.prune_worktree(repo, wt)
-                health.record("automerge", task=item.ref, pr=pr_url, verdict="green")
-                print(f"autopilot[{item.ref}] AUTO-MERGED {pr_url} (GitHub CI green)")
-                return
+                if self._gh_merge(repo, pr_branch):
+                    self.board._write_task_raw(
+                        item.ref,
+                        lambda d: d.setdefault("meta", {}).setdefault("autopilot", {})
+                                  .__setitem__("merge", {"pr": pr_url, "branch": pr_branch,
+                                                         "ts": _now_iso(), "auto": True}))
+                    with _BOARD_LOCK:           # shared agent file
+                        self.board.complete_task(self.agent_name, item.ref)
+                    health.record("automerge", task=item.ref, pr=pr_url, verdict="green")
+                    print(f"autopilot[{item.ref}] AUTO-MERGED {pr_url} (GitHub CI green)")
+                    return
             health.record("automerge_held", task=item.ref, pr=pr_url, verdict=verdict)
             self.digest.queue_decision(
                 prompt=(f"auto-merge HELD ({verdict}) for PR {pr_url} task {item.ref} -- "

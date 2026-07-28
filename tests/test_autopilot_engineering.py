@@ -334,6 +334,24 @@ def test_finalize_automerges_when_whitelisted_and_green(mocker):
     ex.digest.queue_decision.assert_not_called()
 
 
+def test_finalize_prunes_worktree_before_merge(mocker):
+    """Auto-merge must prune the LOCAL worktree BEFORE `gh pr merge --delete-branch`,
+    else deleting the worktree-held branch fails and a successful GitHub merge is
+    misread as a failure. Regression: a pi build reported 'held (green)' despite
+    the PR merging on GitHub."""
+    spec = _spec("skrender")
+    spec.automerge = True
+    spec.ci = "github"
+    cfg = _t.SimpleNamespace(repo_map={"skrender": spec}, automerge_repos=["skrender"])
+    ex, item = _final_ex(mocker, cfg, "skrender", ci_status="green")
+    order = mocker.Mock()
+    order.attach_mock(ex.prune_worktree, "prune")
+    order.attach_mock(ex._gh_merge, "merge")
+    ex.finalize(item, GateResult(score=5, passed=True, notes="", artifact="pr"))
+    seq = [c[0] for c in order.mock_calls]
+    assert seq.index("prune") < seq.index("merge")
+
+
 def test_finalize_pr_only_when_not_whitelisted(mocker):
     spec = _spec("skrender")
     spec.automerge = True
