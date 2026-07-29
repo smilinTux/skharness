@@ -334,6 +334,38 @@ def test_finalize_automerges_when_whitelisted_and_green(mocker):
     ex.digest.queue_decision.assert_not_called()
 
 
+def test_finalize_carveout_holds_protected_diff(mocker):
+    """The drill: a score-5, CI-green diff that touches a guardrail file must be
+    HELD for human review, never auto-merged. This is what keeps the operator
+    from loosening its own leash."""
+    spec = _spec("skrender")
+    spec.automerge = True
+    spec.ci = "github"
+    cfg = _t.SimpleNamespace(repo_map={"skrender": spec}, automerge_repos=["skrender"])
+    ex, item = _final_ex(mocker, cfg, "skrender", ci_status="green")
+    mocker.patch.object(ex, "_fleet_root", return_value="/nonexistent-fleet-root")
+    mocker.patch.object(ex, "_changed_paths", return_value=["src/skcapstone/itil.py"])
+    ex.finalize(item, GateResult(score=5, passed=True, notes="", artifact="pr"))
+    ex._gh_merge.assert_not_called()                # never merges a guardrail change
+    ex._github_checks_verdict.assert_not_called()   # short-circuits before the CI poll
+    ex.digest.queue_decision.assert_called_once()   # held for human review
+    ex.board.complete_task.assert_not_called()
+
+
+def test_finalize_carveout_allows_normal_diff(mocker):
+    """A normal diff (no guardrail files) still auto-merges: the carve-out does
+    not over-block ordinary work."""
+    spec = _spec("skrender")
+    spec.automerge = True
+    spec.ci = "github"
+    cfg = _t.SimpleNamespace(repo_map={"skrender": spec}, automerge_repos=["skrender"])
+    ex, item = _final_ex(mocker, cfg, "skrender", ci_status="green")
+    mocker.patch.object(ex, "_fleet_root", return_value="/nonexistent-fleet-root")
+    mocker.patch.object(ex, "_changed_paths", return_value=["src/skcapstone/fleet/cron.py"])
+    ex.finalize(item, GateResult(score=5, passed=True, notes="", artifact="pr"))
+    ex._gh_merge.assert_called_once()               # ordinary work merges as before
+
+
 def test_finalize_prunes_worktree_before_merge(mocker):
     """Auto-merge must prune the LOCAL worktree BEFORE `gh pr merge --delete-branch`,
     else deleting the worktree-held branch fails and a successful GitHub merge is

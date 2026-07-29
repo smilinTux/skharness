@@ -244,6 +244,24 @@ class EngineeringExecutor:
                               capture_output=True, text=True)
         return proc.stdout
 
+    def _fleet_root(self):
+        """The fleet objects tree root (where the carve-out manifest lives), or a
+        nonexistent path when the fleet substrate is absent (manifest treated as
+        absent -> core guardrails still protected)."""
+        try:
+            from skcapstone.fleet.paths import default_paths
+            return default_paths().root
+        except Exception:
+            return "/nonexistent-fleet-root"
+
+    def _changed_paths(self, repo: RepoSpec, pr_branch: str) -> list[str]:
+        """Repo-relative files the PR branch changes vs its base (for the carve-out)."""
+        base = getattr(repo, "base_branch", "main")
+        r = subprocess.run(
+            ["git", "-C", repo.path, "diff", "--name-only", f"{base}...{pr_branch}"],
+            capture_output=True, text=True)
+        return [ln for ln in (r.stdout or "").splitlines() if ln.strip()]
+
     def _head_sha(self, wt: str) -> str:
         proc = subprocess.run(["git", "-C", wt, "rev-parse", "HEAD"],
                               capture_output=True, text=True)
@@ -426,6 +444,26 @@ class EngineeringExecutor:
         pr_url = self._open_pr(repo, pr_branch, item)
         automerge = (repo.name in self.config.automerge_repos
                      and repo.ci != "none" and result.passed and repo.automerge)
+        # Constitutional carve-out: a diff touching the operator's own guardrails
+        # (freeze, twin gate, signing, escalation, this detector) ALWAYS goes to
+        # human review, never auto-merge, even at score 5 with green CI. A test
+        # cannot catch a diff that deletes a guardrail check, so this path-level
+        # gate is the backstop. The core guardrails are protected with or without
+        # the signed manifest; the manifest adds more.
+        if automerge:
+            from . import protected
+            if protected.changed_paths_are_protected(
+                    self._fleet_root(), self._changed_paths(repo, pr_branch)):
+                health.record("carveout_held", task=item.ref, pr=pr_url)
+                self.digest.queue_decision(
+                    prompt=(f"CARVE-OUT HELD: PR {pr_url} task {item.ref} touches "
+                            "protected guardrail files (freeze / twin gate / signing / "
+                            "escalation / carve-out). Never auto-merges regardless of "
+                            "grade or CI; review then merge by hand."),
+                    options={"reviewed": "merge", "no": "close"},
+                    action_ref=f"carveout:{item.ref}", priority="high")
+                print(f"autopilot[{item.ref}] CARVE-OUT HELD {pr_url} (touches guardrails)")
+                return
         if automerge:
             # GitHub-safe auto-merge: the twin gate already passed (local CI green +
             # score 5 + coverage); before merging to a shared/deployed branch we ALSO
