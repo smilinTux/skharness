@@ -81,6 +81,29 @@ def test_default_placer_places_and_persists_on_control_plane(monkeypatch, tmp_pa
 
 
 @pytest.mark.needs_skcapstone
+def test_default_placer_unrecognized_self_builds_local(monkeypatch, tmp_path, capsys):
+    # A node whose computed name is not in the roster (SKFLEET_NODE unset -> hostname
+    # fallback) must NOT route every card off-node and strand all work. It falls back
+    # to unmanaged (local build) and warns loudly.
+    from skcapstone.fleet import sknoded, store
+    from skcapstone.fleet.paths import FleetPaths
+
+    monkeypatch.setenv("SKFLEET_ROOT", str(tmp_path / "fleet"))
+    monkeypatch.setattr("skcapstone.fleet.sknoded.node_capacity",
+                        lambda: {"cores": 8, "ram_gb": 16.0, "disk_gb": 100.0,
+                                 "gpu": None, "vram_gb": None})
+    paths = FleetPaths(root=tmp_path / "fleet")
+    operator = store.Writer(role="operator", node="node-158", identity="")
+    monkeypatch.setenv("SKFLEET_NODE", "node-158")
+    sknoded.run_once(paths, "node-158")
+    store.write_spec(paths, "node", "node-158", {"cordoned": False}, writer=operator)
+    sknoded.run_once(paths, "node-158")
+    monkeypatch.setenv("SKFLEET_NODE", "node-not-enrolled")   # self is not in the roster
+    assert fd.default_placer() is None                        # unmanaged -> build local
+    assert "not in the fleet roster" in capsys.readouterr().err
+
+
+@pytest.mark.needs_skcapstone
 def test_default_placer_frozen_skips_everything(monkeypatch, tmp_path):
     from skcapstone.fleet import sknoded, store
     from skcapstone.fleet.paths import FleetPaths
