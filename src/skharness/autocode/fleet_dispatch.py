@@ -95,6 +95,19 @@ def default_placer() -> Callable[[WorkItem], DispatchDecision] | None:
     if not views:
         return None                                  # unmanaged tree: run local
     me = self_node_name()
+    if not any(v.name == me for v in views):
+        # This node's computed name is not in the roster (almost always SKFLEET_NODE
+        # is unset, so the name fell back to the hostname while the node enrolled
+        # under a friendly name). With the gate active every card would route
+        # off-node and NOTHING would ever build here: the run silently strands all
+        # work. Treat an unrecognized self as unmanaged (build local) and warn
+        # loudly so the misconfiguration is visible rather than eating cards.
+        import sys
+        print(f"autopilot: WARNING self node {me!r} is not in the fleet roster "
+              f"({sorted(v.name for v in views)}); building locally. "
+              f"Set SKFLEET_NODE to this node's roster name to enable placement.",
+              file=sys.stderr)
+        return None
     is_control_plane = any(v.name == me and v.labels.get("control-plane") == "true"
                            for v in views)
     frozen = store.is_frozen(paths)
