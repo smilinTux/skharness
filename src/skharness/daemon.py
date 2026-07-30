@@ -1,13 +1,16 @@
-"""skcode-hostd - read-only P0 daemon (skcode remote-control, spec 8.1).
+"""skcode-hostd daemon (skcode remote-control, spec 8.1).
 
 One host daemon owning ONE Harness (its session plane). Exposes the three
-capauth-gated read data routes (list sessions, get one, stream one over WS) plus
-one grade-only write-ish route: POST /sessions/{sid}/ratify. Ratify runs the
-autocode twin gate over the session's existing worktree diff and NEVER merges,
-commits, or pushes, so the daemon stays safe. There is still NO
-spawn/inject/kill/dispatch route: the mutating write surface does not exist in
-P0. Bind a Tailscale IP only (serve.py enforces this). The bearer gate is the
-shared skharness.auth (same as the gateway).
+capauth-gated read data routes (list sessions, get one, stream one over WS), one
+grade-only write-ish route (POST /sessions/{sid}/ratify), and the P1 session
+INJECT write surface (POST /sessions/{sid}/inject: send operator text into a
+running session as keystrokes). Ratify runs the autocode twin gate over the
+session's existing worktree diff and NEVER merges, commits, or pushes; inject
+only sends keystrokes into the session's PTY. There is still NO
+spawn/kill/dispatch route. Every gated route fails closed on the shared
+skharness.auth bearer: with the P0 deny-all verifier still in force, every caller
+is 401/403 and NOTHING actuates, so inject is inert in prod until the real
+verifier lands (R2.4). Bind a Tailscale IP only (serve.py enforces this).
 """
 from __future__ import annotations
 
@@ -117,6 +120,24 @@ def build_daemon_app(
         return JSONResponse({"sid": sid, "score": result.score,
                              "passed": result.passed, "notes": result.notes,
                              "artifact": result.artifact, "mode": result.mode})
+
+    @app.post("/api/v1/sessions/{sid}/inject")
+    async def inject_session(sid: str, request: Request,
+                             authorization: str | None = Header(default=None)):
+        # The P1 session WRITE surface: send operator text into a running session
+        # as keystrokes. Gated exactly like the other bearer routes and fails
+        # closed BEFORE any actuation: with the P0 deny-all verifier a request
+        # with no/invalid token is 401/403 and harness.inject is never reached.
+        _auth(authorization)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        text = (body or {}).get("text", "")
+        result = await harness.inject(sid, text)
+        if audit_log is not None:
+            audit_log(f"inject {sid} {'OK' if result.get('injected') else 'NOOP'}")
+        return JSONResponse(result)
 
     @app.websocket("/api/v1/sessions/{sid}/stream")
     async def stream(websocket: WebSocket, sid: str):

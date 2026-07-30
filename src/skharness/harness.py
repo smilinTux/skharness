@@ -198,8 +198,15 @@ class Harness(ABC):
         raise NotImplementedError(
             f"harness {self.name!r} does not implement the session plane (stream)")
 
-    async def inject(self, sid: str, msg: InputMessage) -> None:
-        """Inject operator input: text | transcribed voice | file refs."""
+    async def inject(self, sid: str, text: str) -> dict:
+        """Inject operator text into a running session as keystrokes (P1 WRITE).
+
+        Returns a small result dict, e.g. ``{"sid": sid, "injected": True}`` on
+        success, or ``{"sid": sid, "injected": False, "reason": ...}`` when the
+        session is unknown/invalid (a clean no-op, never a raise, and it never
+        touches the PTY in that case). This is a WRITE verb: the daemon route
+        that drives it stays behind the capauth bearer gate (see daemon.py).
+        """
         raise NotImplementedError(
             f"harness {self.name!r} does not implement the session plane (inject)")
 
@@ -328,7 +335,7 @@ class TaskSessionShim:
         if False:                               # pragma: no cover - keeps this an async generator
             yield SessionEvent(type=EventType.STATUS)
 
-    async def inject(self, sid: str, msg: InputMessage) -> None:
+    async def inject(self, sid: str, text: str) -> dict:
         """Read-only shim: injection is unsupported (declared via capabilities)."""
         raise NotImplementedError(
             "TaskSessionShim is read-only; inject is unsupported "
