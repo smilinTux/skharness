@@ -118,6 +118,22 @@ def test_static_client_served_unauthenticated():
     assert "text/html" in r.headers["content-type"]
 
 
+def test_module_manifest_served_unauthenticated_with_operator_facet():
+    # Public discovery metadata: no bearer required, and it carries both facets.
+    c = _client()
+    r = c.get("/.well-known/skworld-module.json")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["id"] == "skcode"
+    assert body["auth"]["audience"] == "skcode"
+    assert body["operator"]["proposedStandardActions"] == [
+        "restart-hostd",
+        "archive-stale-session",
+    ]
+    # URLs resolve against the request origin (the TestClient base).
+    assert body["entry"]["url"].endswith("/app")
+
+
 # ---- POST /sessions/{sid}/ratify : grade-only, capauth-gated, never merges ---
 
 class _GradingHarness(FakeHarness):
