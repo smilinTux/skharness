@@ -64,10 +64,10 @@ pairing work (spec 7.6), so the daemon rejects every token until then by design.
 Run (Tailscale IP only, never `0.0.0.0`):
 
 ```bash
-~/.skenv/bin/python -m skharness --host <your-tailscale-ip> --port 9390 --host-id .158
+~/.skenv/bin/python -m skharness --host <your-tailscale-ip> --port 9394 --host-id .158
 ```
 
-Port `:9390` has a KNOWN deploy-time conflict: `skcomms.transports.broker_server`
-may already hold `0.0.0.0:9390` on this host, and a wildcard listener owns the
-tailnet-IP:9390 address too. Resolve before deploy (move the broker off 9390, or
-pass `--port <free>` and record it in `~/.skcapstone/docs/PORTS.md`).
+skcode-hostd defaults to `:9394` (SKWorld platform spec R0.4). Port `:9390` is
+owned by `skcomms.transports.broker_server` (its honest, documented default), so
+the two no longer collide on a shared host. Override with `--port <free>` and
+record it in `~/.skcapstone/docs/PORTS.md` if `:9394` is taken.

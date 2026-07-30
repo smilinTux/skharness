@@ -1,8 +1,8 @@
-"""skcode-hostd runner. Binds a Tailscale IP ONLY (never 0.0.0.0), port 9390.
+"""skcode-hostd runner. Binds a Tailscale IP ONLY (never 0.0.0.0), port 9394.
 
-The port 9390 default has a KNOWN deploy-time conflict: skcomms broker_server may
-already hold 0.0.0.0:9390 on this host. Resolve it before deploy (move the
-broker, or pass --port). See the plan's Global Constraints.
+Port 9390 is owned by the skcomms broker_server (its honest, documented default).
+skcode-hostd therefore takes 9394 as its ratified default (SKWorld platform spec
+R0.4) so the two never collide on a shared host. Pass --port to override.
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from skharness.auth import Verifier
 from skharness.daemon import build_daemon_app
 from skharness.harnesses.claude_code import ClaudeCodeHarness
 
-DEFAULT_PORT = 9390
+DEFAULT_PORT = 9394
 
 _WILDCARD = {"0.0.0.0", "::"}
 
