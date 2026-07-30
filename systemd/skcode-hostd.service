@@ -1,0 +1,56 @@
+# skcode-hostd.service: read-only skcode remote-control daemon (P0).
+#
+# systemd USER unit (systemctl --user). Runs the skcode-hostd daemon from
+# src/skharness/serve.py, which binds a Tailscale IP ONLY (never 0.0.0.0) on
+# port 9394 and exposes exactly the three capauth-gated read routes plus the
+# static client. There is NO write surface.
+#
+# SHIPPED SAFE BY DEFAULT:
+#   - The bind host comes from ${SKCODE_HOSTD_TAILSCALE_IP} (the EnvironmentFile
+#     below). serve.py's resolve_bind() REFUSES a wildcard/public address, so a
+#     blank or 0.0.0.0 value fails the unit closed rather than exposing a port.
+#   - SKCODE_REAL_VERIFIER is deliberately NOT set here. serve.py's
+#     select_verifier() then defaults to the P0 deny-all placeholder, so the RCE
+#     surface stays gated. Enabling the real capauth verifier is a DELIBERATE
+#     opt-in (see skcode-hostd.env.example and README.md); do it only after the
+#     pairing/verifier is provisioned.
+#
+# This unit is installed but NOT auto-enabled or auto-started. The operator
+# decides when to `systemctl --user enable/start` it (see systemd/README.md).
+
+[Unit]
+Description=skcode-hostd read-only remote-control daemon (tailnet-only, deny-all default)
+Documentation=https://github.com/smilinTux/skharness
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+# --host is sourced from the env file; serve.py refuses a wildcard/public bind.
+# SKCODE_REAL_VERIFIER is intentionally NOT set, so the daemon runs deny-all.
+ExecStart=%h/.skenv/bin/python -m skharness --host ${SKCODE_HOSTD_TAILSCALE_IP} --port 9394 --host-id ${SKCODE_HOSTD_HOST_ID}
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=skcode-hostd
+
+# Tunables (Tailscale IP + node id). Referenced by name only, never committed.
+# Not optional: without it the ${SKCODE_HOSTD_TAILSCALE_IP} bind is blank and
+# serve.py fails the unit closed (the intended safe behavior).
+EnvironmentFile=%h/.config/skcode-hostd/skcode-hostd.env
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=%h/.skenv/bin:/usr/local/bin:/usr/bin:/bin
+
+# Standard sk hardening. ProtectHome=read-only with explicit ReadWritePaths for
+# the two dirs the daemon persists into (session registry + transcripts).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.skharness %h/.skcapstone
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
