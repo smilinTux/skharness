@@ -7,6 +7,7 @@ R0.4) so the two never collide on a shared host. Pass --port to override.
 from __future__ import annotations
 
 import argparse
+import sys
 
 from skharness.auth import Verifier
 from skharness.daemon import build_daemon_app
@@ -35,7 +36,24 @@ def build_default_verifier() -> Verifier:
     return _deny_all
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None) -> int | None:
+    """``skcode-hostd`` entry point.
+
+    ``skcode-hostd operator ...`` routes to the operator-facet CLI (spec 4.2, the
+    seam Atlas's skcode adapter drives). Anything else is the daemon runner, whose
+    ``--host`` contract is unchanged (backwards compatible with
+    ``python -m skharness --host <ip>``).
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] == "operator":
+        from skharness.operator_cli import main as operator_main
+
+        return operator_main(args[1:])
+    _serve(args)
+    return 0
+
+
+def _serve(argv: list[str]) -> None:
     import uvicorn
 
     parser = argparse.ArgumentParser(prog="skcode-hostd")
