@@ -14,9 +14,12 @@ so the task-plane claude-code adapter there is untouched.
 
 All tmux calls go through an injectable argv `runner` (never shell=True), so unit
 tests use a fake runner and never touch real tmux. The read subset is
-list_sessions + stream; the only write verb is `archive` (stop + persist), which
-is NOT a destructive kill: it persists the session's transcript to the historical
-sessions dir FIRST, then stops the tmux window. There is no spawn/inject path here.
+list_sessions + stream; the write verbs are `archive` (stop + persist) and
+`inject` (send operator text into a running session as keystrokes, skcode P1).
+`archive` is NOT a destructive kill: it persists the session's transcript to the
+historical sessions dir FIRST, then stops the tmux window. `inject` targets the
+same tmux window with `send-keys` and is safe on a missing/invalid sid (a clean
+no-op that never touches tmux). There is no spawn path here.
 """
 from __future__ import annotations
 
@@ -202,6 +205,36 @@ class ClaudeCodeHarness(Harness):
         #    the whole `skchat-agents` session (least-destructive stop of the PTY).
         self._runner(["tmux", "kill-window", "-t", target])
         return {"sid": sid, "archived": True, "transcript_path": str(path)}
+
+    async def inject(self, sid: str, text: str) -> dict:
+        """Inject operator `text` into a running session as tmux keystrokes (P1).
+
+        Sends `text` followed by an Enter keypress to the session's tmux window
+        via the injectable argv runner (never shell=True):
+        ``tmux send-keys -t skchat-agents:<sid> <text> Enter``. This is a WRITE
+        verb; the daemon route that calls it stays behind the capauth bearer gate.
+
+        Idempotent + safe: an invalid sid, or a sid with no live tmux window
+        (already archived / never running), returns a clean ``injected: False``
+        no-op result rather than raising, and NEVER touches tmux.
+        """
+        if not _SID_RE.match(sid):
+            return {"sid": sid, "injected": False, "reason": "invalid session id"}
+
+        live_ids = {s.sid for s in self._list_windows()}
+        if sid not in live_ids:
+            return {
+                "sid": sid,
+                "injected": False,
+                "reason": "no live session (already archived or never running)",
+            }
+
+        target = f"{self.tmux_session}:{sid}"
+        # Send the text, then a separate Enter keypress so the running CLI reads
+        # it as a submitted line. argv-based runner => no shell, and the sid is
+        # charset-validated above, so nothing here is shell-interpolated.
+        self._runner(["tmux", "send-keys", "-t", target, text, "Enter"])
+        return {"sid": sid, "injected": True}
 
     async def stream(self, sid: str) -> AsyncIterator[SessionEvent]:
         now = time.time()

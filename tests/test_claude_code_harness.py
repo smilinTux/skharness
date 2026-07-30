@@ -243,3 +243,58 @@ async def test_archive_is_idempotent(tmp_path):
     second = await h.archive(sid)
     assert first["archived"] is True
     assert second["archived"] is False
+
+
+# --- inject: send operator text into a running session (P1 write surface) -----
+
+
+@pytest.mark.asyncio
+async def test_inject_sends_send_keys_to_the_window(tmp_path):
+    sid = "lumina-abc12345"
+    sent: list[list[str]] = []
+
+    def runner(argv):
+        if "list-windows" in argv:
+            return "monitor\t1\nlumina-abc12345\t1700000100\n"
+        if "send-keys" in argv:
+            sent.append(list(argv))
+            return ""
+        raise AssertionError(f"unexpected tmux call: {argv}")
+
+    h = ClaudeCodeHarness(runner=runner, sessions_root=tmp_path, host=".158")
+    result = await h.inject(sid, "run the tests")
+
+    assert result == {"sid": sid, "injected": True}
+    # text then a separate Enter keypress, targeting the session's tmux window
+    assert sent == [["tmux", "send-keys", "-t", "skchat-agents:lumina-abc12345",
+                     "run the tests", "Enter"]]
+
+
+@pytest.mark.asyncio
+async def test_inject_unknown_sid_is_a_clean_noop(tmp_path):
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        if "list-windows" in argv:
+            return "monitor\t1\nlumina-abc12345\t1700000100\n"
+        raise AssertionError(f"must not send keys to an unknown sid: {argv}")
+
+    h = ClaudeCodeHarness(runner=runner, sessions_root=tmp_path, host=".158")
+    result = await h.inject("opus-deadbeef", "hi")  # not a live window
+
+    assert result["injected"] is False
+    assert "no live session" in result["reason"]
+    # never sent keys, only ever consulted the live window set
+    assert all("send-keys" not in c for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_inject_invalid_sid_never_touches_tmux(tmp_path):
+    def runner(argv):
+        raise AssertionError(f"invalid sid must not reach tmux: {argv}")
+
+    h = ClaudeCodeHarness(runner=runner, sessions_root=tmp_path, host=".158")
+    result = await h.inject("bad;name$(x)", "hi")
+    assert result["injected"] is False
+    assert "invalid" in result["reason"].lower()

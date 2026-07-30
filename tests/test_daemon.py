@@ -66,23 +66,76 @@ def test_read_routes_require_auth():
     assert c.get("/api/v1/sessions/lumina-abc12345").status_code == 401
 
 
-def test_no_write_surface_except_ratify():
+def test_write_surface_is_ratify_and_inject_only():
     c = _client()
     h = {"authorization": "Bearer good"}
-    # Ratify is the ONE allowed POST (grade-only, never merges). Route EXISTS, so
-    # the method is not rejected: 501 here only because this bare client wires no
-    # resolve_ratify. The key invariant: it is NOT 405 Method Not Allowed.
+    # Ratify is a grade-only POST (never merges). Route EXISTS, so the method is
+    # not rejected: 501 here only because this bare client wires no resolve_ratify.
+    # The key invariant: it is NOT 405 Method Not Allowed.
     r = c.post("/api/v1/sessions/lumina-abc12345/ratify", json={}, headers=h)
     assert r.status_code != 405
     assert r.status_code == 501
-    # Every OTHER write must still be gone (no spawn/inject/kill/dispatch in P0).
+    # inject is now a capauth-gated WRITE surface (P1): the route EXISTS (so it is
+    # NOT 404 and NOT 405) and fails closed without a valid token. Prove existence
+    # + gating via the no-token path, which returns 401 BEFORE harness.inject runs.
+    r = c.post("/api/v1/sessions/lumina-abc12345/inject", json={"text": "hi"})
+    assert r.status_code == 401
+    # Every OTHER write must still be gone (no spawn/kill/dispatch route).
     assert c.post("/api/v1/sessions", json={}, headers=h).status_code == 405
     assert c.delete("/api/v1/sessions/lumina-abc12345", headers=h).status_code == 405
     assert c.put("/api/v1/sessions/lumina-abc12345", json={}, headers=h).status_code == 405
-    assert c.post("/api/v1/sessions/lumina-abc12345/inject", json={},
-                  headers=h).status_code == 404
     assert c.post("/api/v1/dispatch", json={}, headers=h).status_code == 404
     assert c.delete("/api/v1/hosts/self", headers=h).status_code == 405
+
+
+# ---- POST /sessions/{sid}/inject : session-plane write surface, capauth-gated -
+
+class _RecordingInjectHarness(FakeHarness):
+    """FakeHarness plus an inject() that records the call, so the daemon can drive
+    the P1 write surface with no real tmux PTY. Honors the read-only-double
+    invariant: FakeHarness itself still overrides NO write verb; the write path is
+    proven here on a subclass (mirrors _GradingHarness adding grade())."""
+
+    def __init__(self, *, sessions):
+        super().__init__(sessions=sessions, events={})
+        self.injected: list[tuple[str, str]] = []
+
+    async def inject(self, sid, text):
+        self.injected.append((sid, text))
+        return {"sid": sid, "injected": True}
+
+
+def _inject_harness():
+    return _RecordingInjectHarness(sessions=[
+        SessionDescriptor(sid="lumina-abc12345", host=".158", harness="fake"),
+    ])
+
+
+def test_inject_requires_auth_and_never_actuates_under_deny_all():
+    # verify_caller=lambda t: False is the P0 deny-all verifier still in force:
+    # every caller is denied, so the write surface is inert until R2.4.
+    harness = _inject_harness()
+    c = TestClient(build_daemon_app(harness=harness, verify_caller=lambda t: False))
+    # no token -> 401 (before the verifier even runs)
+    assert c.post("/api/v1/sessions/lumina-abc12345/inject",
+                  json={"text": "hi"}).status_code == 401
+    # a bad token -> 403 via the deny-all verifier
+    assert c.post("/api/v1/sessions/lumina-abc12345/inject", json={"text": "hi"},
+                  headers={"authorization": "Bearer bad"}).status_code == 403
+    # nothing actuated: harness.inject was never reached
+    assert harness.injected == []
+
+
+def test_inject_calls_harness_with_body_text_when_authorized():
+    harness = _inject_harness()
+    c = TestClient(build_daemon_app(harness=harness,
+                                    verify_caller=lambda t: t == "good"))
+    r = c.post("/api/v1/sessions/lumina-abc12345/inject",
+               json={"text": "run the tests"},
+               headers={"authorization": "Bearer good"})
+    assert r.status_code == 200
+    assert r.json() == {"sid": "lumina-abc12345", "injected": True}
+    assert harness.injected == [("lumina-abc12345", "run the tests")]
 
 
 def test_ws_stream_delivers_events_with_token():
