@@ -3,8 +3,9 @@ import pytest
 from skharness.serve import DEFAULT_PORT, build_default_verifier, resolve_bind
 
 
-def test_default_port_is_9390():
-    assert DEFAULT_PORT == 9390
+def test_default_port_is_9394():
+    # 9390 belongs to the skcomms broker; hostd takes 9394 (spec R0.4).
+    assert DEFAULT_PORT == 9394
 
 
 def test_resolve_bind_accepts_a_concrete_ip():
