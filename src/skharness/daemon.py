@@ -14,10 +14,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
-from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from skharness.auth import Verifier, check_token, require_bearer
+from skharness.manifest import skcode_module_manifest
 from skharness.autocode import ratify as _ratify
 from skharness.autocode.types import RepoSpec
 from skharness.events import EventType, SessionEvent
@@ -57,6 +58,14 @@ def build_daemon_app(
 
     def _auth(authorization: str | None) -> None:
         require_bearer(authorization, verify_caller)
+
+    @app.get("/.well-known/skworld-module.json")
+    async def module_manifest(request: Request):
+        # Public discovery metadata (NO bearer): the shell reads the manifest to
+        # learn skcode's entry, nav, and required auth audience/scopes BEFORE it
+        # has a token. It carries no secrets. URLs are origin-relative to the
+        # request, so they resolve against wherever this host actually answers.
+        return JSONResponse(skcode_module_manifest(str(request.base_url)))
 
     @app.get("/api/v1/hosts/self")
     async def hosts_self(authorization: str | None = Header(default=None)):
