@@ -251,7 +251,8 @@ def phase1_triage(candidates, harness, *, repo_map, decisions,
 
 
 def phase2_swarm(selected, *, harness, board, caps: Caps, ledger: CapLedger,
-                 decisions, run_id: str, state=None, enabled: bool = True) -> dict:
+                 decisions, run_id: str, state=None, enabled: bool = True,
+                 workers: int | None = None) -> dict:
     """Run each routed item's produce-then-grade loop, write each round's score to
     the coord record, finalize cleared items and escalate non-converging ones.
 
@@ -271,7 +272,14 @@ def phase2_swarm(selected, *, harness, board, caps: Caps, ledger: CapLedger,
     # correctly on a 4-core box and a big laptop -- each scales to itself.
     from .autoscale import describe, resolve
     hard_cap = int(getattr(caps, "max_concurrent", 3) or 3)
-    workers = resolve(getattr(caps, "concurrency", "recommended"), hard_cap=hard_cap)
+    # ``workers`` is an explicit override: it pins the pool size EXACTLY (clamped
+    # only to [1, hard_cap]) and bypasses host resource probing. Production leaves
+    # it None so the autoscaler scales to the actual box; tests and operators can
+    # pin a deterministic value independent of the host's core/RAM/disk capacity.
+    if workers is None:
+        workers = resolve(getattr(caps, "concurrency", "recommended"), hard_cap=hard_cap)
+    else:
+        workers = max(1, min(int(workers), hard_cap))
     if len(selected) > 1:
         health.record("swarm_concurrency", workers=workers,
                       mode=getattr(caps, "concurrency", "recommended"), items=len(selected))

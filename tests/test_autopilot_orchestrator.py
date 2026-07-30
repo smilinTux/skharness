@@ -506,9 +506,14 @@ def test_swarm_runs_items_concurrently_when_max_concurrent_gt_1(clean_execs, fak
     ledger = CapLedger(Caps())
     decisions = []
     t0 = _t.monotonic()
+    # Pin the pool size explicitly so this asserts the CONCURRENCY LOGIC, not the
+    # host's core/RAM/disk capacity (the resource autoscaler would clamp to 1 on a
+    # small box and make this test machine-dependent). Production leaves `workers`
+    # None and still scales to the host.
     state = orch.phase2_swarm(items, harness=SimpleNamespace(name="h"),
                               board=MagicMock(), caps=Caps(max_concurrent=4),
-                              ledger=ledger, decisions=decisions, run_id="rp")
+                              ledger=ledger, decisions=decisions, run_id="rp",
+                              workers=4)
     elapsed = _t.monotonic() - t0
     assert len(state) == 4 and all(v["state"] == "finalized" for v in state.values())
     assert active["max"] >= 2, "no real concurrency observed"
