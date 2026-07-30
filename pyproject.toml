@@ -12,6 +12,11 @@ dependencies = ["fastapi>=0.110", "pydantic>=2.0", "pyyaml>=6.0", "uvicorn>=0.27
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-mock>=3.10", "pytest-asyncio>=0.23", "httpx>=0.27"]
 
+[project.scripts]
+# The skcode-hostd binary Atlas's skcode adapter shells (operator explain|observe|
+# act) and the daemon runner (--host <tailnet-ip>) share one entry point.
+skcode-hostd = "skharness.serve:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
