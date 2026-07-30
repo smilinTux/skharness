@@ -218,8 +218,15 @@ class Harness(ABC):
         raise NotImplementedError(
             f"harness {self.name!r} does not implement the session plane (background_tasks)")
 
-    async def archive(self, sid: str) -> None:
-        """Stop + persist the session (not a destructive kill)."""
+    async def archive(self, sid: str) -> dict:
+        """Stop + persist the session (not a destructive kill).
+
+        Returns a small result dict, e.g. ``{"sid": sid, "archived": True,
+        "transcript_path": ...}`` on success, or ``{"sid": sid, "archived":
+        False, "reason": ...}`` when the session is unknown/already gone (a
+        clean no-op, never a raise). Implementations MUST persist the transcript
+        BEFORE stopping the PTY so a failure never loses the record.
+        """
         raise NotImplementedError(
             f"harness {self.name!r} does not implement the session plane (archive)")
 

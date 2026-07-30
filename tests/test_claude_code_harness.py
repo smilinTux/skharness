@@ -4,6 +4,7 @@ No real tmux, no real claude: the injectable argv runner returns canned output
 and a tmp historical dir stands in for ~/.skcapstone/agents/<agent>/sessions/.
 """
 import json
+from pathlib import Path
 
 import pytest
 
@@ -116,3 +117,129 @@ async def test_stream_rejects_bad_sid_charset(tmp_path):
     assert len(out) == 1
     assert out[0].type == EventType.STATUS
     assert "invalid" in out[0].text.lower()
+
+
+# --- archive: stop + persist (never a destructive kill) ----------------------
+
+
+@pytest.mark.asyncio
+async def test_archive_persists_transcript_before_stopping(tmp_path):
+    root = tmp_path / "agents"
+    sid = "lumina-abc12345"
+    expected = root / "lumina" / "sessions" / f"{sid}.json"
+    verbs: list[tuple[str, bool]] = []
+
+    def runner(argv):
+        if "list-windows" in argv:
+            return "monitor\t1\nlumina-abc12345\t1700000100\n"
+        if "capture-pane" in argv:
+            # full scrollback capture must ask for the top of history
+            assert "-S" in argv and "-" in argv
+            verbs.append(("capture", expected.exists()))
+            return "hello\nworld\n"
+        if "kill-window" in argv:
+            # record whether the transcript was already on disk at STOP time
+            verbs.append(("kill", expected.exists()))
+            return ""
+        raise AssertionError(f"unexpected tmux call: {argv}")
+
+    h = ClaudeCodeHarness(runner=runner, sessions_root=root, host=".158")
+    result = await h.archive(sid)
+
+    assert result["archived"] is True
+    assert Path(result["transcript_path"]) == expected
+    # persist happened, transcript preserved with archived state
+    assert expected.exists()
+    record = json.loads(expected.read_text())
+    assert record["transcript"] == "hello\nworld\n"
+    assert record["state"] == "archived"
+    assert record["sid"] == sid
+    # ordering is load-bearing: capture ran with no file yet, STOP ran AFTER the
+    # transcript was durable on disk.
+    assert verbs == [("capture", False), ("kill", True)]
+
+
+@pytest.mark.asyncio
+async def test_archive_unknown_sid_is_a_clean_noop(tmp_path):
+    root = tmp_path / "agents"
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        if "list-windows" in argv:
+            return "monitor\t1\nlumina-abc12345\t1700000100\n"
+        raise AssertionError(f"must not touch tmux beyond list-windows: {argv}")
+
+    h = ClaudeCodeHarness(runner=runner, sessions_root=root, host=".158")
+    result = await h.archive("opus-deadbeef")  # not a live window
+
+    assert result["archived"] is False
+    assert "no live session" in result["reason"]
+    # never captured, never killed, nothing persisted
+    assert all("kill-window" not in c and "capture-pane" not in c for c in calls)
+    assert not (root / "opus" / "sessions").exists()
+
+
+@pytest.mark.asyncio
+async def test_archive_invalid_sid_never_touches_tmux(tmp_path):
+    def runner(argv):
+        raise AssertionError(f"invalid sid must not reach tmux: {argv}")
+
+    h = ClaudeCodeHarness(runner=runner, sessions_root=tmp_path, host=".158")
+    result = await h.archive("bad;name$(x)")
+    assert result["archived"] is False
+    assert "invalid" in result["reason"].lower()
+
+
+@pytest.mark.asyncio
+async def test_archive_removes_session_from_running_set_and_keeps_record(tmp_path):
+    root = tmp_path / "agents"
+    sid = "lumina-abc12345"
+    state = {"alive": True}
+
+    def runner(argv):
+        if "list-windows" in argv:
+            if state["alive"]:
+                return "monitor\t1\nlumina-abc12345\t1700000100\n"
+            return "monitor\t1\n"
+        if "capture-pane" in argv:
+            return "final transcript\n"
+        if "kill-window" in argv:
+            state["alive"] = False
+            return ""
+        raise AssertionError(f"unexpected tmux call: {argv}")
+
+    h = ClaudeCodeHarness(runner=runner, sessions_root=root, host=".158")
+    await h.archive(sid)
+
+    sessions = await h.list_sessions()
+    running = [s.sid for s in sessions if s.state == "running"]
+    ended = [s.sid for s in sessions if s.state == "ended"]
+    # left the running set, survives as an ended historical record
+    assert sid not in running
+    assert "lumina/lumina-abc12345" in ended
+
+
+@pytest.mark.asyncio
+async def test_archive_is_idempotent(tmp_path):
+    """A second archive of the same sid (now gone) is a clean no-op, not a raise."""
+    root = tmp_path / "agents"
+    sid = "lumina-abc12345"
+    state = {"alive": True}
+
+    def runner(argv):
+        if "list-windows" in argv:
+            return ("monitor\t1\nlumina-abc12345\t1700000100\n"
+                    if state["alive"] else "monitor\t1\n")
+        if "capture-pane" in argv:
+            return "t\n"
+        if "kill-window" in argv:
+            state["alive"] = False
+            return ""
+        raise AssertionError(f"unexpected tmux call: {argv}")
+
+    h = ClaudeCodeHarness(runner=runner, sessions_root=root, host=".158")
+    first = await h.archive(sid)
+    second = await h.archive(sid)
+    assert first["archived"] is True
+    assert second["archived"] is False

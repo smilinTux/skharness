@@ -247,6 +247,40 @@ def test_act_archive_not_implemented_is_a_clear_stub():
     assert "P1" in result["reason"]
 
 
+def test_act_archive_actuates_the_real_claude_code_harness(tmp_path):
+    """End-to-end: the real ClaudeCodeHarness archive body now actuates through
+    operator_act (P1 closes the 'cannot actuate' gap), stopping + persisting the
+    session over a fake tmux runner with no real tmux."""
+    from skharness.harnesses.claude_code import ClaudeCodeHarness
+
+    root = tmp_path / "agents"
+    verbs: list[str] = []
+
+    def runner(argv):
+        if "list-windows" in argv:
+            return "monitor\t1\nlumina-abc12345\t1700000100\n"
+        if "capture-pane" in argv:
+            verbs.append("capture")
+            return "session output\n"
+        if "kill-window" in argv:
+            verbs.append("kill")
+            return ""
+        raise AssertionError(f"unexpected tmux call: {argv}")
+
+    harness = ClaudeCodeHarness(runner=runner, sessions_root=root, host=".158")
+    result = op.operator_act(
+        "archive-stale-session", session="lumina-abc12345", harness=harness
+    )
+    assert result == {
+        "performed": True,
+        "action": "archive-stale-session",
+        "session": "lumina-abc12345",
+    }
+    # stop + persist actually happened, persist before stop
+    assert verbs == ["capture", "kill"]
+    assert (root / "lumina" / "sessions" / "lumina-abc12345.json").exists()
+
+
 # --- act: escalating / not-enabled actions -----------------------------------
 
 

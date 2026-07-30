@@ -13,12 +13,15 @@ directly by the skcode-hostd daemon, not registered in the shared HARNESSES dict
 so the task-plane claude-code adapter there is untouched.
 
 All tmux calls go through an injectable argv `runner` (never shell=True), so unit
-tests use a fake runner and never touch real tmux. Read-only: there is no
-spawn/inject/kill path here.
+tests use a fake runner and never touch real tmux. The read subset is
+list_sessions + stream; the only write verb is `archive` (stop + persist), which
+is NOT a destructive kill: it persists the session's transcript to the historical
+sessions dir FIRST, then stops the tmux window. There is no spawn/inject path here.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import subprocess
 import time
@@ -131,14 +134,74 @@ class ClaudeCodeHarness(Harness):
                 "task_plane": False, "session_plane": True,
                 "headless_api": "pty", "hot_set_model": False}
 
-    async def list_sessions(self) -> list[SessionDescriptor]:
+    def _list_windows(self) -> list[SessionDescriptor]:
         out = self._runner([
             "tmux", "list-windows", "-t", self.tmux_session,
             "-F", "#{window_name}\t#{window_activity}",
         ])
-        live = parse_windows(out, host=self.host)
+        return parse_windows(out, host=self.host)
+
+    async def list_sessions(self) -> list[SessionDescriptor]:
+        live = self._list_windows()
         historical = scan_historical(self.sessions_root, host=self.host)
         return live + historical
+
+    def _persist_transcript(self, sid: str, transcript: str) -> Path:
+        """Write the session's final transcript to the historical sessions dir so
+        `scan_historical` (and thus `list_sessions`) picks it up as an ended row.
+
+        The window name is `<agent>-<short_id>`; the agent is the part up to the
+        last '-'. The record is a JSON file under `<root>/<agent>/sessions/<sid>.json`
+        so the archived session survives with its transcript after the PTY is gone.
+        """
+        agent = sid.rsplit("-", 1)[0] if "-" in sid else sid
+        sdir = self.sessions_root / agent / "sessions"
+        sdir.mkdir(parents=True, exist_ok=True)
+        path = sdir / f"{sid}.json"
+        record = {
+            "sid": sid,
+            "agent": agent,
+            "harness": self.name,
+            "host": self.host,
+            "state": "archived",
+            "archived_at": time.time(),
+            "transcript": transcript,
+        }
+        path.write_text(json.dumps(record, indent=2))
+        return path
+
+    async def archive(self, sid: str) -> dict:
+        """Archive = STOP + PERSIST a session (never a destructive kill).
+
+        Persists the session's full tmux scrollback to the historical sessions dir
+        FIRST, then stops the session's tmux window with `tmux kill-window`. Ordering
+        is load-bearing: the transcript is on disk before the PTY is stopped, so a
+        failure can never leave a stopped session with a lost transcript.
+
+        Idempotent + safe: an invalid sid, or a sid with no live tmux window (already
+        archived / never running), returns a clean ``archived: False`` no-op result
+        rather than raising, and never touches tmux.
+        """
+        if not _SID_RE.match(sid):
+            return {"sid": sid, "archived": False, "reason": "invalid session id"}
+
+        live_ids = {s.sid for s in self._list_windows()}
+        if sid not in live_ids:
+            # Already gone / never running: nothing to stop, no-op (idempotent).
+            return {
+                "sid": sid,
+                "archived": False,
+                "reason": "no live session (already archived or never running)",
+            }
+
+        target = f"{self.tmux_session}:{sid}"
+        # 1. PERSIST first: capture the full scrollback (-S - = from the top).
+        transcript = self._runner(["tmux", "capture-pane", "-p", "-S", "-", "-t", target])
+        path = self._persist_transcript(sid, transcript)
+        # 2. STOP only after the transcript is durable: kill just this window, not
+        #    the whole `skchat-agents` session (least-destructive stop of the PTY).
+        self._runner(["tmux", "kill-window", "-t", target])
+        return {"sid": sid, "archived": True, "transcript_path": str(path)}
 
     async def stream(self, sid: str) -> AsyncIterator[SessionEvent]:
         now = time.time()
