@@ -171,6 +171,36 @@ def test_static_client_served_unauthenticated():
     assert "text/html" in r.headers["content-type"]
 
 
+def test_app_serves_real_client_not_placeholder():
+    # /app must serve the packaged read-only client, never the "not installed"
+    # placeholder that build_daemon_app falls back to when client/index.html is
+    # missing. This is what the SKWorld shell's Code tab embeds over the funnel.
+    c = _client()
+    r = c.get("/app")
+    assert r.status_code == 200
+    assert "text/html" in r.headers["content-type"]
+    html = r.text
+    assert "Read-only client not installed yet" not in html   # not the placeholder
+    assert '<meta name="skcode-client" content="read-only">' in html
+    assert "skcode" in html
+    # It consumes the read routes (sessions list + WS tail).
+    assert "/api/v1/sessions" in html
+    assert "/stream" in html
+
+
+def test_served_client_has_no_write_control_affordances():
+    # The read-only client must expose NO write/dispatch surface: no reference to
+    # any write route and no non-GET HTTP method. It may only GET the read routes
+    # and open the read-only WS tail. This guards the "no RCE surface" invariant
+    # against a future edit that quietly reintroduces a control into the UI.
+    c = _client()
+    html = c.get("/app").text.lower()
+    for token in ("inject", "ratify", "dispatch", "spawn", "kill",
+                  '"post"', "'post'", '"put"', "'put'", '"delete"', "'delete'",
+                  "method: 'post'", 'method: "post"', "onclick="):
+        assert token not in html, f"write-control affordance leaked into client: {token}"
+
+
 def test_module_manifest_served_unauthenticated_with_operator_facet():
     # Public discovery metadata: no bearer required, and it carries both facets.
     c = _client()
