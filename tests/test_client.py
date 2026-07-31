@@ -15,8 +15,11 @@ def test_real_client_page_is_served():
     body = r.text
     # It is the real client, not the placeholder.
     assert "skcode" in body.lower()
+    assert "Read-only client not installed yet" not in body
     assert "/api/v1/sessions" in body
-    assert "/stream?token=" in body
+    # The read-only WS tail route (no manual ?token= paste field: the client
+    # follows the pairing model and shows an honest empty-state on 401).
+    assert "/stream" in body
 
 
 def test_client_page_is_read_only_no_write_verbs():
