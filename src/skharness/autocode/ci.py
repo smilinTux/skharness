@@ -142,7 +142,18 @@ def diff_coverage(repo: RepoSpec, worktree: str, diff: str) -> float | None:
     subprocess.run(cov_cmd, shell=True, cwd=worktree,
                    capture_output=True, text=True)
     changed = _changed_lines(diff)
-    root = ET.parse(str(Path(worktree) / "coverage.xml")).getroot()
+    cov_path = Path(worktree) / "coverage.xml"
+    if not cov_path.exists():
+        # coverage_cmd ran but emitted no coverage.xml (missing pytest-cov, a
+        # wrong --cov target, or the test command itself errored). Degrade to the
+        # "no coverage signal" contract (None) instead of crashing the whole run;
+        # the twin gate already treats None conservatively (no hands-off merge),
+        # so the item surfaces as a review PR rather than killing the pass.
+        return None
+    try:
+        root = ET.parse(str(cov_path)).getroot()
+    except ET.ParseError:
+        return None
     covered = missed = 0
     for cls in root.iter("class"):
         want = changed.get(cls.get("filename"))

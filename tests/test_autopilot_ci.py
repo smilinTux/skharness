@@ -123,6 +123,24 @@ def test_diff_coverage_none_when_no_coverage_cmd(mocker, tmp_path):
     run.assert_not_called()
 
 
+def test_diff_coverage_none_when_coverage_xml_missing(mocker, tmp_path):
+    # coverage_cmd ran but produced no coverage.xml (e.g. pytest-cov absent or
+    # the test cmd errored). Must degrade to None, NOT crash the whole run.
+    mocker.patch("skharness.autocode.ci.subprocess.run",
+                 return_value=subprocess.CompletedProcess(args=[], returncode=1))
+    repo = _cov_repo(tmp_path)  # coverage_cmd set, but no coverage.xml on disk
+    assert not (tmp_path / "coverage.xml").exists()
+    assert ci.diff_coverage(repo, str(tmp_path), _DIFF) is None
+
+
+def test_diff_coverage_none_when_coverage_xml_malformed(mocker, tmp_path):
+    (tmp_path / "coverage.xml").write_text("<not-valid-xml", encoding="utf-8")
+    mocker.patch("skharness.autocode.ci.subprocess.run",
+                 return_value=subprocess.CompletedProcess(args=[], returncode=0))
+    repo = _cov_repo(tmp_path)
+    assert ci.diff_coverage(repo, str(tmp_path), _DIFF) is None
+
+
 # ── changed-scope CI: gate a correct change without being hostage to unrelated
 # pre-existing suite red (the pre-commit Ralph-loop convergence fix) ──────────
 
