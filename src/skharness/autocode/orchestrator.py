@@ -532,7 +532,8 @@ def build_executors(config, board, run_id: str) -> dict:
 def run_once(*, board, harness, config, tasks_dir=None, run_id=None, dry_run=None,
              ledger: CapLedger | None = None, deepdive_proposals=None,
              executors=None, task: str | None = None,
-             tasks=None, tag: str | None = None, placer=None) -> dict:
+             tasks=None, tag: str | None = None, placer=None,
+             triage_only: bool = False) -> dict:
     """Execute one daily cycle: assess -> triage -> swarm -> report. Journals
     per-item state so a re-run resumes (see the resume task). Guardrails (kill
     switch, caps, dry-run) are layered in the following tasks."""
@@ -568,6 +569,19 @@ def run_once(*, board, harness, config, tasks_dir=None, run_id=None, dry_run=Non
         board=board, harness=harness, tasks_dir=tasks_dir or _default_tasks_dir(),
         caps=caps, run_id=run_id, dry_run=dry, deepdive_proposals=deepdive_proposals,
         only=task, only_ids=tasks, only_tag=tag, config=config)
+
+    if triage_only:
+        # Board-hygiene sweep: phase0 already refined/closed/decomposed cards and
+        # queued human decisions. Stop BEFORE selecting anything to build, so a
+        # scheduled `skos autopilot triage` cleans the board ahead of the build run
+        # without ever spending a sandbox. Reports what it did.
+        report = phase3_report(decisions, dry_run=dry)
+        journal.write_run(run_id, {"run_id": run_id, "phase": "triage-only",
+                                   "candidates": len(candidates),
+                                   "decisions": len(decisions), "dry_run": dry})
+        return {"run_id": run_id, "dry_run": dry, "triage_only": True,
+                "candidates": len(candidates), "decisions": len(decisions),
+                "report": report}
 
     if kill_switch_active(config.enabled):
         return _checkpoint("triage")
@@ -631,7 +645,8 @@ def run_once(*, board, harness, config, tasks_dir=None, run_id=None, dry_run=Non
 
 
 def run_cli(*, dry_run: bool = True, canary: bool = False, task=None,
-           harness: str = "stub", tasks=None, tag: str | None = None) -> dict:
+           harness: str = "stub", tasks=None, tag: str | None = None,
+           triage_only: bool = False) -> dict:
     """CLI bridge for `skos autopilot run`. Dry-run (default) runs against the
     StubHarness. Canary/live build the real sandboxed harness, but only when
     harness.live_execution is enabled in config (else a clear disabled message).
@@ -644,6 +659,16 @@ def run_cli(*, dry_run: bool = True, canary: bool = False, task=None,
     from skcapstone.coordination import Board
     from skcapstone.mcp_tools._helpers import _shared_root
     board = Board(_shared_root())
+    # A triage-only sweep needs the REAL harness (it assesses/decomposes with the
+    # model) but never builds -- run_once short-circuits before phase2. It still
+    # requires live_execution because decompose() calls the sandboxed model.
+    if triage_only:
+        if not getattr(config, "live_execution", False):
+            return {"disabled": "triage requires harness.live_execution=true "
+                                "(it assesses/decomposes with the model)."}
+        name = None if harness in ("stub", "", None) else harness
+        return run_once(board=board, harness=build_harness(config, name), config=config,
+                        dry_run=dry_run, task=task, tasks=tasks, tag=tag, triage_only=True)
     if dry_run and not canary:
         from .harness import StubHarness
         return run_once(board=board, harness=StubHarness(), config=config, dry_run=True,

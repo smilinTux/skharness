@@ -174,6 +174,27 @@ def test_phase0_net_new_card_still_builds(tmp_path, mocker):
     harness.decompose.assert_not_called()
 
 
+def test_run_once_triage_only_stops_before_build(tmp_path, mocker):
+    # triage_only assesses/decomposes/closes but NEVER selects anything to build.
+    _write_task(tmp_path, "t-1", tags=["repo:skos"], acceptance_criteria=["w"])
+    board = _board(["t-1"])
+    board.create_task.side_effect = lambda task: None
+    harness = MagicMock()
+    harness.assess.return_value = Verdict(verdict="valid", reason="ok")
+    mocker.patch("skharness.autocode.orchestrator._ground_card",
+                 return_value=_Grounding(grounded=False))
+    swarm = mocker.patch("skharness.autocode.orchestrator.phase2_swarm")
+    mocker.patch("skharness.autocode.orchestrator.phase3_report", return_value={})
+    mocker.patch("skharness.autocode.orchestrator.journal.write_run")
+    cfg = SimpleNamespace(enabled=True, repo_map={}, dry_run=False,
+                          fleet_dispatch=False, caps=Caps())
+    out = orch.run_once(board=board, harness=harness, config=cfg, tasks_dir=tmp_path,
+                        run_id="r", dry_run=False, triage_only=True)
+    assert out["triage_only"] is True
+    assert out["candidates"] == 1                    # it DID assess
+    swarm.assert_not_called()                         # but never built
+
+
 def test_phase0_only_ids_scopes_to_the_batch(tmp_path):
     # A batch (--tasks / only_ids) assesses EXACTLY those ids, in the given order,
     # never the rest of the unblocked board.
