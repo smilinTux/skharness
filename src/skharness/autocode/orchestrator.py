@@ -75,7 +75,7 @@ def _ground_card(task: dict, config):
     concreteness score. Model-free, read-only. Ungrounded (grounded=False) when the
     card has no repo tag or the tree is dirty/unexpected -> caller keeps text-only
     assess. Never raises: any grounding error degrades to ungrounded."""
-    from .grounding import Grounding, ground_card
+    from .grounding import Grounding, ground_card, repo_profile
     name = repo_tag(task)
     spec = config.repo(name) if (name and hasattr(config, "repo")) else None
     if not spec:
@@ -84,8 +84,17 @@ def _ground_card(task: dict, config):
                             description=task.get("description", ""),
                             acceptance=task.get("acceptance_criteria") or [])
     try:
-        return ground_card(brief, getattr(spec, "path", None),
-                           base_branch=getattr(spec, "base_branch", None))
+        gr = ground_card(brief, getattr(spec, "path", None),
+                         base_branch=getattr(spec, "base_branch", None))
+        # Layer 2 (prevent-at-source): prepend the repo language profile so both
+        # assess and decompose conform to the repo's architecture and never emit
+        # foreign-language subtasks (the Go-in-Python failure).
+        prof = repo_profile(getattr(spec, "path", None))
+        if prof and gr.context:
+            gr.context = (f"REPO PROFILE: language={prof['language']} "
+                          f"(write {prof['language']} only, name real "
+                          f"{prof['ext']} files/symbols).\n" + gr.context)
+        return gr
     except Exception:
         return Grounding(grounded=False)
 
@@ -194,7 +203,8 @@ def _create_child(board, *, title: str, description: str, tags: list[str],
 
 
 def _decompose_card(board, harness, task: dict, brief: AssessBrief, *, caps: Caps,
-                    run_id: str, decisions: list, dry_run: bool = False) -> None:
+                    run_id: str, decisions: list, config=None,
+                    dry_run: bool = False) -> None:
     """Split a too-coarse parent into buildable child subtasks, park the parent.
     Guardrails: idempotent (skip if already decomposed), depth-capped (ceiling ->
     needs_decision, no infinite trees), child-count-capped, and empty/over-cap ->
@@ -222,6 +232,25 @@ def _decompose_card(board, harness, task: dict, brief: AssessBrief, *, caps: Cap
             qid=stable_qid(f"decompose-failed {tid}", tid),
             prompt=(f"Task {tid} was flagged too coarse but decompose returned "
                     f"{len(specs)} subtasks (need 1..{max_children}); scope it by hand."),
+            options={"promote": "promote", "skip": "skip"},
+            action_ref=tid, priority=task.get("priority") or "high"))
+        return
+    # COHERENCE GATE (layer 1): if any child is written for the wrong
+    # language/paradigm (e.g. Go structs/`.go` files in a Python repo), the model
+    # misread the repo, so the WHOLE split is untrustworthy. Do NOT create garbage
+    # children -- route the parent to a human, reusing the fail-safe pattern.
+    from .grounding import child_incoherence, repo_profile
+    spec = config.repo(repo_tag(task)) if (config and repo_tag(task)
+                                           and hasattr(config, "repo")) else None
+    profile = repo_profile(getattr(spec, "path", None)) if spec else {}
+    incoherent = next((child_incoherence(s, profile) for s in specs
+                       if child_incoherence(s, profile)), None) if profile else None
+    if incoherent:
+        decisions.append(DecisionItem(
+            qid=stable_qid(f"decompose-incoherent {tid}", tid),
+            prompt=(f"Task {tid} decompose produced a subtask incoherent with the "
+                    f"{profile.get('language')} repo ({incoherent}); the split is "
+                    "unreliable, scope it by hand."),
             options={"promote": "promote", "skip": "skip"},
             action_ref=tid, priority=task.get("priority") or "high"))
         return
@@ -326,7 +355,7 @@ def phase0_assess(*, board, harness, tasks_dir, caps: Caps, run_id: str,
                 board.close_task_obsolete(tid, v.reason, run_id=run_id)
         elif v.verdict == "decompose":
             _decompose_card(board, harness, t, brief, caps=caps, run_id=run_id,
-                            decisions=decisions, dry_run=dry_run)
+                            decisions=decisions, config=config, dry_run=dry_run)
         elif v.verdict == "needs_decision":
             decisions.append(DecisionItem(qid=stable_qid(v.reason or tid, tid),
                                           prompt=v.reason or f"Task {tid} needs a decision.",

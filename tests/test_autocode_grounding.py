@@ -79,3 +79,34 @@ def test_ground_refuses_on_unexpected_branch(repo):
     _git(repo, "checkout", "-q", "-b", "some-feature")
     res = g.ground_card(_brief(title="OpsExecutor"), str(repo), base_branch="main")
     assert res.grounded is False
+
+
+# --- coherence gate (decompose layers 1+2) ---
+
+def test_repo_profile_detects_python(repo):
+    (repo / "pyproject.toml").write_text("[project]\nname='x'\n")
+    p = g.repo_profile(str(repo))
+    assert p["language"] == "python" and p["ext"] == ".py"
+
+
+def test_repo_profile_none_when_undetectable(tmp_path):
+    assert g.repo_profile(str(tmp_path)) == {}
+    assert g.repo_profile(None) == {}
+
+
+def test_child_incoherence_flags_go_in_python():
+    prof = {"language": "python", "ext": ".py", "foreign_ext": [".go"],
+            "foreign_terms": [r"\bstruct\b", r"\.go\b"]}
+    bad = {"title": "Add OpsExecutor struct", "acceptance": ["ops_executor.go exists"]}
+    assert g.child_incoherence(bad, prof) is not None
+
+
+def test_child_incoherence_passes_coherent_python():
+    prof = {"language": "python", "ext": ".py", "foreign_ext": [".go"],
+            "foreign_terms": [r"\bstruct\b", r"\.go\b"]}
+    good = {"title": "Add load_open_incidents()", "acceptance": ["src/skos/itil.py has it, pytest passes"]}
+    assert g.child_incoherence(good, prof) is None
+
+
+def test_child_incoherence_noop_without_profile():
+    assert g.child_incoherence({"title": "anything .go struct"}, {}) is None

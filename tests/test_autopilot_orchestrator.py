@@ -118,6 +118,31 @@ def test_phase0_decompose_verdict_creates_children_and_parks_parent(tmp_path, mo
     board.mark_decomposed.assert_called_once()      # parent parked
 
 
+def test_phase0_decompose_incoherent_children_escalate_not_created(tmp_path, mocker):
+    # COHERENCE GATE: a decompose that emits foreign-language subtasks (Go in a
+    # Python repo) means the model misread the repo -> route to a human, create NO
+    # garbage children.
+    board, created = _decompose_board(tmp_path)
+    harness = MagicMock()
+    harness.assess.return_value = Verdict(verdict="decompose", reason="coarse")
+    harness.decompose.return_value = [
+        {"title": "Add OpsExecutor struct", "acceptance": ["ops_executor.go exists"]},
+        {"title": "fine one", "acceptance": ["src/x.py has f"]},
+    ]
+    mocker.patch("skharness.autocode.orchestrator._ground_card",
+                 return_value=_Grounding(grounded=False))
+    # profile says python -> the .go/struct child is incoherent
+    mocker.patch("skharness.autocode.grounding.repo_profile",
+                 return_value={"language": "python", "ext": ".py",
+                               "foreign_ext": [".go"], "foreign_terms": [r"\bstruct\b"]})
+    cfg = SimpleNamespace(repo=lambda n: SimpleNamespace(path="/x", base_branch="main"))
+    cands, decisions = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                                          caps=Caps(), run_id="r", config=cfg)
+    assert created == []                              # no garbage children created
+    assert len(decisions) == 1                        # escalated to human
+    board.mark_decomposed.assert_not_called()
+
+
 def test_phase0_decompose_empty_escalates_not_drops(tmp_path, mocker):
     board, created = _decompose_board(tmp_path)
     harness = MagicMock()

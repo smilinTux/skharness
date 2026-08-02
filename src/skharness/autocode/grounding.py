@@ -27,6 +27,58 @@ _PATHISH = re.compile(r"\b([\w/]+\.\w{1,4})\b")
 _SNAKE = re.compile(r"\b([a-z][a-z0-9]+(?:_[a-z0-9]+)+)\b")
 _NET_NEW = re.compile(r"\b(create|add|new|implement|introduce|scaffold)\b", re.I)
 
+#: language -> (marker files that identify it, its source extensions, and the
+#: foreign tokens/extensions that signal a subtask was written for the WRONG
+#: language/paradigm). Used by the decompose coherence gate: a child that names
+#: `.go` files or Go-isms in a Python repo is incoherent with the architecture.
+_LANG = {
+    "python": {"markers": ["pyproject.toml", "setup.py", "setup.cfg"], "ext": ".py",
+               "foreign_ext": [".go", ".rs", ".ts", ".js", ".java", ".rb"],
+               "foreign_terms": [r"\bstruct\b", r"\binterface\b", r"\bfunc\b",
+                                 r"\bgoroutine\b", r"\.go\b", r"\bpackage main\b"]},
+    "go": {"markers": ["go.mod"], "ext": ".go",
+           "foreign_ext": [".py", ".rs", ".java"],
+           "foreign_terms": [r"\bdef \b", r"\.py\b", r"\bpytest\b", r"\b__init__\b"]},
+    "dart": {"markers": ["pubspec.yaml"], "ext": ".dart",
+             "foreign_ext": [".py", ".go"], "foreign_terms": [r"\.py\b", r"\.go\b"]},
+    "node": {"markers": ["package.json"], "ext": ".ts",
+             "foreign_ext": [".py", ".go"], "foreign_terms": [r"\.py\b", r"\bpytest\b"]},
+}
+
+
+def repo_profile(repo_path: str | None) -> dict:
+    """Detect a repo's language/conventions so the decompose step can be told what
+    to conform to (layer 2) and the coherence gate can reject foreign-language
+    children (layer 1). Returns {} when undetectable (gate then no-ops)."""
+    if not repo_path:
+        return {}
+    import os
+    for lang, spec in _LANG.items():
+        if any(os.path.exists(os.path.join(repo_path, m)) for m in spec["markers"]):
+            return {"language": lang, "ext": spec["ext"],
+                    "foreign_ext": spec["foreign_ext"],
+                    "foreign_terms": spec["foreign_terms"]}
+    return {}
+
+
+def child_incoherence(spec: dict, profile: dict) -> str | None:
+    """Reason a decompose child is INCOHERENT with the repo's architecture, or None
+    when it fits. Pure, deterministic. Catches the observed failure: a subtask
+    written for the wrong language/paradigm (e.g. `.go`/struct/interface in a
+    Python repo). Conservative: only flags a clear foreign-language signal."""
+    if not profile:
+        return None
+    text = " ".join([spec.get("title", ""), spec.get("description", ""),
+                     " ".join(spec.get("acceptance") or [])])
+    low = text.lower()
+    for fe in profile.get("foreign_ext", []):
+        if fe in low and profile.get("ext", "") not in low:
+            return f"names a {fe} file in a {profile['language']} repo"
+    for term in profile.get("foreign_terms", []):
+        if re.search(term, low):
+            return f"uses {profile['language']}-foreign construct ({term}) "
+    return None
+
 
 @dataclass
 class Grounding:
