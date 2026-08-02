@@ -44,10 +44,24 @@ def test_gha_unknown_conclusion_never_green(mocker):
     assert ci.external_ci_verdict(_gha_repo(), "b", "abc123") == "red"
 
 
-def test_gha_poll_timeout_is_red_not_green(mocker):
+def test_gha_no_run_ever_appears_returns_pending_not_deadlock(mocker):
+    # THE FINALIZE-STALL FIX: pre-push, the branch has NO runs, so polling the full
+    # ci_poll_timeout was a pure deadlock (0 CPU for the whole build round). With no
+    # run appearing within the first-appearance grace, return `pending` fast.
     mocker.patch("skharness.autocode.ci.time.sleep")
-    # sha never appears -> stays pending; monotonic jumps past the deadline
     mocker.patch("skharness.autocode.ci.subprocess.run", return_value=_runs_json())
+    # monotonic: deadline base, grace base, then a value past the grace window
+    mocker.patch("skharness.autocode.ci.time.monotonic", side_effect=[0.0, 0.0, 100.0])
+    assert ci.external_ci_verdict(_gha_repo(ci_poll_timeout=1200), "b", "abc123") == "pending"
+
+
+def test_gha_run_exists_but_never_completes_is_red(mocker):
+    # A run DID appear for the branch (seen_run=True) but never completes -> the
+    # fail-safe still applies: timeout is red, never green, and it does NOT return
+    # the fast `pending` (that path is only for a branch with zero runs).
+    mocker.patch("skharness.autocode.ci.time.sleep")
+    mocker.patch("skharness.autocode.ci.subprocess.run", return_value=_runs_json(
+        {"headSha": "abc123", "status": "in_progress", "conclusion": None}))
     mocker.patch("skharness.autocode.ci.time.monotonic", side_effect=[0.0, 0.0, 9999.0])
     assert ci.external_ci_verdict(_gha_repo(ci_poll_timeout=1), "b", "abc123") == "red"
 

@@ -16,6 +16,11 @@ _POLL_INTERVAL = 5  # seconds between gh polls; patched to a no-op sleep in test
 #: Hard ceiling for a local: CI command. A hung test must never hang finalize
 #: (which runs this AFTER the branch is pushed); a timeout is treated as red.
 _LOCAL_CI_TIMEOUT = 900
+#: How long to wait for a github-actions run to FIRST APPEAR before concluding
+#: the branch is unpushed (the pre-commit gate) and returning `pending` instead of
+#: polling the full ci_poll_timeout. A run only exists after the branch is pushed,
+#: so with zero runs the poll would otherwise deadlock the whole build round.
+_CI_FIRST_APPEARANCE_GRACE = 45
 
 _RED_CONCLUSIONS = {"failure", "cancelled", "timed_out",
                     "action_required", "startup_failure"}
@@ -82,17 +87,30 @@ def external_ci_verdict(repo: RepoSpec, pr_branch: str, head_sha: str,
         return "none"
     if repo.ci == "github-actions":
         deadline = time.monotonic() + repo.ci_poll_timeout
+        first_appear_deadline = time.monotonic() + _CI_FIRST_APPEARANCE_GRACE
+        seen_run = False
         while True:
             proc = subprocess.run(
                 ["gh", "run", "list", "--branch", pr_branch,
                  "--json", "headSha,databaseId,status,conclusion"],
                 cwd=repo.path, capture_output=True, text=True)
             runs = json.loads(proc.stdout or "[]")
+            if runs:
+                seen_run = True
             match = next((r for r in runs if r.get("headSha") == head_sha), None)
             if match is not None and match.get("status") == "completed":
                 return "green" if match.get("conclusion") == "success" else "red"
-            if time.monotonic() >= deadline:
-                return "red"
+            now = time.monotonic()
+            # No run has EVER appeared for this branch within the grace window: the
+            # branch is unpushed (this is the pre-commit gate), so a run will never
+            # appear and polling the full ci_poll_timeout is a pure deadlock. Return
+            # `pending` (honest: CI hasn't started) so the twin gate falls through to
+            # its local/coverage signals instead of hanging the whole build round.
+            # NB: a repo that expects to CONVERGE pre-push must use a `local:` ci.
+            if not seen_run and now >= first_appear_deadline:
+                return "pending"
+            if now >= deadline:
+                return "red"        # a run existed but never completed: fail-safe
             time.sleep(_POLL_INTERVAL)
     if repo.ci.startswith("local:"):
         cmd = _scoped_cmd(repo.ci[len("local:"):], repo, worktree, diff)
