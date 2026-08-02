@@ -28,6 +28,7 @@ class HarnessAdapter(Protocol):
 
     def capabilities(self) -> ProviderCapabilities: ...
     def assess(self, brief: AssessBrief) -> Verdict: ...
+    def decompose(self, brief: AssessBrief) -> list[dict]: ...
     def run_task(self, brief: TaskBrief) -> HarnessResult: ...
     def grade(self, brief: GradeBrief) -> GateResult: ...
 
@@ -44,6 +45,9 @@ class StubHarness:
 
     def assess(self, brief: AssessBrief) -> Verdict:
         return Verdict(verdict="valid", reason="stub")
+
+    def decompose(self, brief: AssessBrief) -> list[dict]:
+        return []
 
     def run_task(self, brief: TaskBrief) -> HarnessResult:
         raise RuntimeError("StubHarness cannot execute; live harness is disabled in v1 (posture C)")

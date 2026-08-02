@@ -12,8 +12,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
-from .types import (WorkItem, AssessBrief, DecisionItem, QualityMode,
+from .types import (WorkItem, AssessBrief, DecisionItem, QualityMode, Verdict,
                     QUALITY_RANK, coerce_quality, ClaimRaced)
 from .executor import EXECUTORS
 from .config import Caps, Config
@@ -67,6 +68,26 @@ def repo_tag(task: dict) -> str | None:
     """The single ``repo:<name>`` tag, or None when absent/ambiguous."""
     repos = [t.split(":", 1)[1] for t in (task.get("tags") or []) if t.startswith("repo:")]
     return repos[0] if len(repos) == 1 else None
+
+
+def _ground_card(task: dict, config):
+    """Host-side repo grounding for a card: fills codebase_context with facts and a
+    concreteness score. Model-free, read-only. Ungrounded (grounded=False) when the
+    card has no repo tag or the tree is dirty/unexpected -> caller keeps text-only
+    assess. Never raises: any grounding error degrades to ungrounded."""
+    from .grounding import Grounding, ground_card
+    name = repo_tag(task)
+    spec = config.repo(name) if (name and hasattr(config, "repo")) else None
+    if not spec:
+        return Grounding(grounded=False)
+    brief = SimpleNamespace(title=task.get("title", ""),
+                            description=task.get("description", ""),
+                            acceptance=task.get("acceptance_criteria") or [])
+    try:
+        return ground_card(brief, getattr(spec, "path", None),
+                           base_branch=getattr(spec, "base_branch", None))
+    except Exception:
+        return Grounding(grounded=False)
 
 
 def _quality_from_tags(task: dict) -> QualityMode | None:
@@ -142,10 +163,85 @@ def deepdive_spawn(board, proposals, *, caps: Caps, run_id: str,
         if dry_run:
             made.append("(dry-run)")
             continue
-        made.append(board.create_task(title=spec.get("title", ""),
-                                      description=spec.get("description", ""),
-                                      tags=["autopilot", "autopilot-untriaged"]))
+        # Board.create_task takes a Task object (not kwargs) and returns a Path;
+        # build the Task, create it, and record its id. (Previously called with
+        # kwargs, which only "worked" against a mock and raised on a real Board.)
+        made.append(_create_child(board, title=spec.get("title", ""),
+                                  description=spec.get("description", ""),
+                                  tags=["autopilot", "autopilot-untriaged"]))
     return made
+
+
+def _create_child(board, *, title: str, description: str, tags: list[str],
+                  acceptance_criteria: list[str] | None = None,
+                  dependencies: list[str] | None = None, meta: dict | None = None,
+                  task_id: str | None = None) -> str:
+    """Create a coord child task via the real Board.create_task(Task) contract and
+    return its id. skcapstone is an optional sibling, so Task is imported lazily
+    (mirrors the other lazy skcapstone imports in this module)."""
+    from skcapstone.coordination import Task
+
+    kw = dict(title=title, description=description, tags=tags,
+              acceptance_criteria=acceptance_criteria or [],
+              dependencies=dependencies or [], created_by="autopilot")
+    if meta is not None:
+        kw["meta"] = meta
+    if task_id is not None:
+        kw["id"] = task_id
+    task = Task(**kw)
+    board.create_task(task)
+    return task.id
+
+
+def _decompose_card(board, harness, task: dict, brief: AssessBrief, *, caps: Caps,
+                    run_id: str, decisions: list, dry_run: bool = False) -> None:
+    """Split a too-coarse parent into buildable child subtasks, park the parent.
+    Guardrails: idempotent (skip if already decomposed), depth-capped (ceiling ->
+    needs_decision, no infinite trees), child-count-capped, and empty/over-cap ->
+    needs_decision (never a silent drop). Children are born ``autopilot-untriaged``
+    so a human releases them before they build (unless decompose_autobuild)."""
+    tid = task.get("id")
+    ap = (task.get("meta") or {}).get("autopilot") or {}
+    if ap.get("decomposed"):                       # idempotency: already split
+        return
+    depth = int(ap.get("decomp_depth", 0) or 0)
+    if depth >= getattr(caps, "max_decompose_depth", 2):
+        decisions.append(DecisionItem(
+            qid=stable_qid(f"decompose-depth {tid}", tid),
+            prompt=f"Task {tid} is still too coarse at max decompose depth "
+                   f"({depth}); a human should scope it.",
+            options={"promote": "promote", "skip": "skip"},
+            action_ref=tid, priority=task.get("priority") or "high"))
+        return
+    specs = harness.decompose(brief)
+    max_children = getattr(caps, "max_subtasks_per_card", 8)
+    if not specs or len(specs) > max_children:
+        # empty (inconclusive) OR wants more than the cap (it's an epic): a human
+        # scopes it -- never silently drop the parent, never over-split.
+        decisions.append(DecisionItem(
+            qid=stable_qid(f"decompose-failed {tid}", tid),
+            prompt=(f"Task {tid} was flagged too coarse but decompose returned "
+                    f"{len(specs)} subtasks (need 1..{max_children}); scope it by hand."),
+            options={"promote": "promote", "skip": "skip"},
+            action_ref=tid, priority=task.get("priority") or "high"))
+        return
+    if dry_run:
+        return
+    parent_tags = [t for t in (task.get("tags") or [])
+                   if t.startswith(("repo:", "quality:"))]
+    autobuild = bool(getattr(_decompose_card, "_autobuild", False))
+    child_ids: list[str] = []
+    for i, s in enumerate(specs[:max_children]):
+        tags = list(parent_tags) + ["autopilot", f"parent:{tid}"]
+        if not autobuild:
+            tags.append("autopilot-untriaged")     # human-release gate (default)
+        child_id = stable_qid(f"{tid}:{s.get('title', i)}", tid)[:8]
+        _create_child(board, title=s.get("title", ""), description=s.get("description", ""),
+                      tags=tags, acceptance_criteria=s.get("acceptance") or [],
+                      meta={"autopilot": {"parent": tid, "decomp_depth": depth + 1}},
+                      task_id=child_id)
+        child_ids.append(child_id)
+    board.mark_decomposed(tid, child_ids, run_id=run_id)
 
 
 def phase0_assess(*, board, harness, tasks_dir, caps: Caps, run_id: str,
@@ -191,14 +287,33 @@ def phase0_assess(*, board, harness, tasks_dir, caps: Caps, run_id: str,
         # field). Without this check the marker is cosmetic: the card returns
         # through unblocked_task_ids and is re-assessed every run, so neither the
         # engine's own obsolete closures nor a manual stale-sweep ever stick.
-        if ((t.get("meta") or {}).get("autopilot") or {}).get("obsolete"):
+        ap_meta = (t.get("meta") or {}).get("autopilot") or {}
+        if ap_meta.get("obsolete"):
             continue
+        # A decomposed parent is parked (mark_decomposed); its children carry the
+        # work. Skip it symmetric with the obsolete marker so it is not re-split.
+        if ap_meta.get("decomposed"):
+            continue
+        gr = _ground_card(t, config)
         brief = AssessBrief(task_id=tid, title=t.get("title", ""),
                             description=t.get("description", ""),
                             acceptance=t.get("acceptance_criteria") or [],
                             tags=t.get("tags") or [], repo=repo_tag(t),
-                            codebase_context=codebase_context)
+                            codebase_context=gr.context or codebase_context)
         v = harness.assess(brief)
+        # Concreteness gate: a repo-tagged card that assess called `valid` but whose
+        # acceptance resolves NOTHING in the repo facts (and is not greenfield) is,
+        # by construction, too vague to build in one diff -> downgrade to decompose
+        # instead of sending it to a doomed build. Ungrounded/inconclusive cards are
+        # untouched (they still fail open to the twin gate).
+        if (v.verdict == "valid" and gr.grounded and gr.concreteness is not None
+                and gr.concreteness < getattr(caps, "concreteness_floor", 0.34)
+                and not gr.net_new):
+            v = Verdict(verdict="decompose",
+                        reason=f"repo card resolves no named artifact "
+                               f"(concreteness={gr.concreteness:.2f}); split into "
+                               f"buildable subtasks",
+                        concreteness=gr.concreteness)
         if v.verdict == "valid":
             candidates.append(_to_workitem(t, verdict="valid", config=config))
         elif v.verdict == "stale":
@@ -209,6 +324,9 @@ def phase0_assess(*, board, harness, tasks_dir, caps: Caps, run_id: str,
         elif v.verdict == "obsolete":
             if not dry_run:
                 board.close_task_obsolete(tid, v.reason, run_id=run_id)
+        elif v.verdict == "decompose":
+            _decompose_card(board, harness, t, brief, caps=caps, run_id=run_id,
+                            decisions=decisions, dry_run=dry_run)
         elif v.verdict == "needs_decision":
             decisions.append(DecisionItem(qid=stable_qid(v.reason or tid, tid),
                                           prompt=v.reason or f"Task {tid} needs a decision.",
@@ -414,7 +532,8 @@ def build_executors(config, board, run_id: str) -> dict:
 def run_once(*, board, harness, config, tasks_dir=None, run_id=None, dry_run=None,
              ledger: CapLedger | None = None, deepdive_proposals=None,
              executors=None, task: str | None = None,
-             tasks=None, tag: str | None = None, placer=None) -> dict:
+             tasks=None, tag: str | None = None, placer=None,
+             triage_only: bool = False) -> dict:
     """Execute one daily cycle: assess -> triage -> swarm -> report. Journals
     per-item state so a re-run resumes (see the resume task). Guardrails (kill
     switch, caps, dry-run) are layered in the following tasks."""
@@ -450,6 +569,19 @@ def run_once(*, board, harness, config, tasks_dir=None, run_id=None, dry_run=Non
         board=board, harness=harness, tasks_dir=tasks_dir or _default_tasks_dir(),
         caps=caps, run_id=run_id, dry_run=dry, deepdive_proposals=deepdive_proposals,
         only=task, only_ids=tasks, only_tag=tag, config=config)
+
+    if triage_only:
+        # Board-hygiene sweep: phase0 already refined/closed/decomposed cards and
+        # queued human decisions. Stop BEFORE selecting anything to build, so a
+        # scheduled `skos autopilot triage` cleans the board ahead of the build run
+        # without ever spending a sandbox. Reports what it did.
+        report = phase3_report(decisions, dry_run=dry)
+        journal.write_run(run_id, {"run_id": run_id, "phase": "triage-only",
+                                   "candidates": len(candidates),
+                                   "decisions": len(decisions), "dry_run": dry})
+        return {"run_id": run_id, "dry_run": dry, "triage_only": True,
+                "candidates": len(candidates), "decisions": len(decisions),
+                "report": report}
 
     if kill_switch_active(config.enabled):
         return _checkpoint("triage")
@@ -513,7 +645,8 @@ def run_once(*, board, harness, config, tasks_dir=None, run_id=None, dry_run=Non
 
 
 def run_cli(*, dry_run: bool = True, canary: bool = False, task=None,
-           harness: str = "stub", tasks=None, tag: str | None = None) -> dict:
+           harness: str = "stub", tasks=None, tag: str | None = None,
+           triage_only: bool = False) -> dict:
     """CLI bridge for `skos autopilot run`. Dry-run (default) runs against the
     StubHarness. Canary/live build the real sandboxed harness, but only when
     harness.live_execution is enabled in config (else a clear disabled message).
@@ -526,6 +659,16 @@ def run_cli(*, dry_run: bool = True, canary: bool = False, task=None,
     from skcapstone.coordination import Board
     from skcapstone.mcp_tools._helpers import _shared_root
     board = Board(_shared_root())
+    # A triage-only sweep needs the REAL harness (it assesses/decomposes with the
+    # model) but never builds -- run_once short-circuits before phase2. It still
+    # requires live_execution because decompose() calls the sandboxed model.
+    if triage_only:
+        if not getattr(config, "live_execution", False):
+            return {"disabled": "triage requires harness.live_execution=true "
+                                "(it assesses/decomposes with the model)."}
+        name = None if harness in ("stub", "", None) else harness
+        return run_once(board=board, harness=build_harness(config, name), config=config,
+                        dry_run=dry_run, task=task, tasks=tasks, tag=tag, triage_only=True)
     if dry_run and not canary:
         from .harness import StubHarness
         return run_once(board=board, harness=StubHarness(), config=config, dry_run=True,

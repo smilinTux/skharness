@@ -127,10 +127,12 @@ class GateResult:
 
 @dataclass
 class Verdict:                        # Phase 0 assess output
-    verdict: str                      # valid | stale | obsolete | needs_decision
+    verdict: str                      # valid | stale | obsolete | needs_decision | decompose
     reason: str
     updated_description: str | None = None
     updated_acceptance: list[str] | None = None
+    subtasks: list[dict] | None = None      # decompose payload: [{title, description, acceptance}]
+    concreteness: float | None = None       # grounding score that drove the gate (audit)
 
 
 @dataclass
