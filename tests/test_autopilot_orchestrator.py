@@ -71,6 +71,22 @@ def test_phase0_reclaims_then_computes_unblocked(tmp_path):
     assert decisions == []
 
 
+def test_phase0_skips_obsolete_marked_cards(tmp_path):
+    # A card closed via close_task_obsolete carries meta.autopilot.obsolete (task
+    # files have no status field). phase0 must skip it, so neither a stale-sweep
+    # nor the engine's own obsolete closures get re-assessed every run.
+    _write_task(tmp_path, "t-live", tags=["repo:skos"], acceptance_criteria=["w"])
+    _write_task(tmp_path, "t-dead", tags=["repo:skos"], acceptance_criteria=["w"],
+                meta={"autopilot": {"obsolete": {"reason": "already on main", "ts": "x"}}})
+    board = _board(["t-live", "t-dead"])
+    harness = MagicMock()
+    harness.assess.return_value = Verdict(verdict="valid", reason="")
+    cands, _ = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                                  caps=Caps(), run_id="r")
+    assert [c.ref for c in cands] == ["t-live"]       # obsolete card skipped
+    assert harness.assess.call_count == 1             # t-dead never even assessed
+
+
 def test_phase0_only_ids_scopes_to_the_batch(tmp_path):
     # A batch (--tasks / only_ids) assesses EXACTLY those ids, in the given order,
     # never the rest of the unblocked board.

@@ -186,6 +186,13 @@ def phase0_assess(*, board, harness, tasks_dir, caps: Caps, run_id: str,
         t = by_id.get(tid)
         if not t or t.get("status") in ("completed", "closed", "obsolete"):
             continue
+        # An obsolete card is marked on the task file at meta.autopilot.obsolete
+        # (close_task_obsolete writes there, since task files carry no status
+        # field). Without this check the marker is cosmetic: the card returns
+        # through unblocked_task_ids and is re-assessed every run, so neither the
+        # engine's own obsolete closures nor a manual stale-sweep ever stick.
+        if ((t.get("meta") or {}).get("autopilot") or {}).get("obsolete"):
+            continue
         brief = AssessBrief(task_id=tid, title=t.get("title", ""),
                             description=t.get("description", ""),
                             acceptance=t.get("acceptance_criteria") or [],
