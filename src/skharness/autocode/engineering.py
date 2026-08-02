@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -432,6 +433,18 @@ class EngineeringExecutor:
                 "(toggle spec G1/G2/G4).")
         repo = self.resolve_repo(item)
         wt = self.journal.worktree_for(item.ref)
+        # The worktree can be missing (None) or already pruned off disk if a
+        # self-heal cleaned it, the journal drifted, or the run_id changed between
+        # build and finalize. Without it there is nothing to commit/push, and the
+        # raw path would otherwise blow up as a cryptic `TypeError: expected str,
+        # bytes or os.PathLike object, not NoneType` deep inside subprocess. Fail
+        # fast with an actionable message; the orchestrator escalates it as a
+        # high-priority "finalize failed" decision (retry rebuilds the worktree).
+        if not wt or not os.path.isdir(wt):
+            raise RuntimeError(
+                f"finalize: worktree for {item.ref} is missing "
+                f"({wt!r}); it was pruned or the journal lost it. The gate passed "
+                "but the built diff is not on disk to commit. Retry to rebuild.")
         pr_branch = f"autopilot/{item.ref}"
         self._commit_and_push(repo, wt, pr_branch, item)   # harness edits are uncommitted
         if result.passed:

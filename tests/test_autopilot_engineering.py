@@ -310,6 +310,10 @@ def _final_ex(mocker, cfg, repo_name, ci_status="green"):
     ex = EngineeringExecutor(cfg, board=mocker.Mock(), journal=mocker.Mock(),
                              digest=mocker.Mock(), agent_name="autopilot")
     ex.journal.worktree_for.return_value = "/wt/t1"
+    # the finalize guard checks the worktree still exists on disk; these tests
+    # use a fake path, so treat it as present (the missing-worktree case has its
+    # own test, test_finalize_escalates_when_worktree_missing).
+    mocker.patch("skharness.autocode.engineering.os.path.isdir", return_value=True)
     mocker.patch.object(ex, "_head_sha", return_value="sha1")
     mocker.patch.object(ex, "_commit_and_push")     # git commit+push of harness edits
     mocker.patch.object(ex, "prune_worktree")
@@ -319,6 +323,20 @@ def _final_ex(mocker, cfg, repo_name, ci_status="green"):
     item = WorkItem(kind="engineering", ref="t1", source="coord", repo=None,
                     payload={"tags": [f"repo:{repo_name}"], "title": "t"})
     return ex, item
+
+
+def test_finalize_escalates_when_worktree_missing(mocker):
+    # A gate-passed item whose worktree was pruned/lost must raise a clear,
+    # actionable RuntimeError (the orchestrator escalates it), NOT a cryptic
+    # `TypeError: expected str... not NoneType` from a None path in subprocess.
+    spec = _spec("skrender")
+    cfg = _t.SimpleNamespace(repo_map={"skrender": spec}, automerge_repos=[])
+    ex, item = _final_ex(mocker, cfg, "skrender")
+    ex.journal.worktree_for.return_value = None      # worktree lost
+    commit = mocker.patch.object(ex, "_commit_and_push")
+    with pytest.raises(RuntimeError, match="worktree.*missing"):
+        ex.finalize(item, GateResult(score=5, passed=True, notes="", artifact="pr"))
+    commit.assert_not_called()                       # never reaches the None-path subprocess
 
 
 def test_finalize_automerges_when_whitelisted_and_green(mocker):
