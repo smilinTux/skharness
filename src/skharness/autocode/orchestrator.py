@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from .types import (WorkItem, AssessBrief, DecisionItem, QualityMode,
                     QUALITY_RANK, coerce_quality, ClaimRaced)
@@ -67,6 +68,26 @@ def repo_tag(task: dict) -> str | None:
     """The single ``repo:<name>`` tag, or None when absent/ambiguous."""
     repos = [t.split(":", 1)[1] for t in (task.get("tags") or []) if t.startswith("repo:")]
     return repos[0] if len(repos) == 1 else None
+
+
+def _ground_card(task: dict, config):
+    """Host-side repo grounding for a card: fills codebase_context with facts and a
+    concreteness score. Model-free, read-only. Ungrounded (grounded=False) when the
+    card has no repo tag or the tree is dirty/unexpected -> caller keeps text-only
+    assess. Never raises: any grounding error degrades to ungrounded."""
+    from .grounding import Grounding, ground_card
+    name = repo_tag(task)
+    spec = config.repo(name) if (name and hasattr(config, "repo")) else None
+    if not spec:
+        return Grounding(grounded=False)
+    brief = SimpleNamespace(title=task.get("title", ""),
+                            description=task.get("description", ""),
+                            acceptance=task.get("acceptance_criteria") or [])
+    try:
+        return ground_card(brief, getattr(spec, "path", None),
+                           base_branch=getattr(spec, "base_branch", None))
+    except Exception:
+        return Grounding(grounded=False)
 
 
 def _quality_from_tags(task: dict) -> QualityMode | None:
@@ -142,10 +163,34 @@ def deepdive_spawn(board, proposals, *, caps: Caps, run_id: str,
         if dry_run:
             made.append("(dry-run)")
             continue
-        made.append(board.create_task(title=spec.get("title", ""),
-                                      description=spec.get("description", ""),
-                                      tags=["autopilot", "autopilot-untriaged"]))
+        # Board.create_task takes a Task object (not kwargs) and returns a Path;
+        # build the Task, create it, and record its id. (Previously called with
+        # kwargs, which only "worked" against a mock and raised on a real Board.)
+        made.append(_create_child(board, title=spec.get("title", ""),
+                                  description=spec.get("description", ""),
+                                  tags=["autopilot", "autopilot-untriaged"]))
     return made
+
+
+def _create_child(board, *, title: str, description: str, tags: list[str],
+                  acceptance_criteria: list[str] | None = None,
+                  dependencies: list[str] | None = None, meta: dict | None = None,
+                  task_id: str | None = None) -> str:
+    """Create a coord child task via the real Board.create_task(Task) contract and
+    return its id. skcapstone is an optional sibling, so Task is imported lazily
+    (mirrors the other lazy skcapstone imports in this module)."""
+    from skcapstone.coordination import Task
+
+    kw = dict(title=title, description=description, tags=tags,
+              acceptance_criteria=acceptance_criteria or [],
+              dependencies=dependencies or [], created_by="autopilot")
+    if meta is not None:
+        kw["meta"] = meta
+    if task_id is not None:
+        kw["id"] = task_id
+    task = Task(**kw)
+    board.create_task(task)
+    return task.id
 
 
 def phase0_assess(*, board, harness, tasks_dir, caps: Caps, run_id: str,
@@ -191,13 +236,19 @@ def phase0_assess(*, board, harness, tasks_dir, caps: Caps, run_id: str,
         # field). Without this check the marker is cosmetic: the card returns
         # through unblocked_task_ids and is re-assessed every run, so neither the
         # engine's own obsolete closures nor a manual stale-sweep ever stick.
-        if ((t.get("meta") or {}).get("autopilot") or {}).get("obsolete"):
+        ap_meta = (t.get("meta") or {}).get("autopilot") or {}
+        if ap_meta.get("obsolete"):
             continue
+        # A decomposed parent is parked (mark_decomposed); its children carry the
+        # work. Skip it symmetric with the obsolete marker so it is not re-split.
+        if ap_meta.get("decomposed"):
+            continue
+        gr = _ground_card(t, config)
         brief = AssessBrief(task_id=tid, title=t.get("title", ""),
                             description=t.get("description", ""),
                             acceptance=t.get("acceptance_criteria") or [],
                             tags=t.get("tags") or [], repo=repo_tag(t),
-                            codebase_context=codebase_context)
+                            codebase_context=gr.context or codebase_context)
         v = harness.assess(brief)
         if v.verdict == "valid":
             candidates.append(_to_workitem(t, verdict="valid", config=config))
