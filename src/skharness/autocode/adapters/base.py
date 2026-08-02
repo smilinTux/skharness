@@ -16,7 +16,7 @@ from ..types import (AssessBrief, GateResult, GradeBrief, HarnessResult,
                      TaskBrief, Verdict)
 
 #: The verdicts assess may legitimately return; anything else is "inconclusive".
-_ASSESS_VERDICTS = ("valid", "stale", "obsolete", "needs_decision")
+_ASSESS_VERDICTS = ("valid", "stale", "obsolete", "needs_decision", "decompose")
 
 
 def _record_assess_inconclusive(brief: AssessBrief, out: dict) -> None:
@@ -229,9 +229,14 @@ class BaseCliAdapter(Harness):
             "files. verdict=valid if it is coherent, actionable work; stale if the "
             "description is outdated but you can rewrite it (give updated_description "
             "and updated_acceptance); obsolete if clearly no longer needed; "
-            "needs_decision ONLY if the task itself is ambiguous or self-contradictory. "
-            "Reply strictly as JSON: {\"verdict\":\"valid|stale|obsolete|"
-            "needs_decision\",\"reason\":\"...\"}.")
+            "decompose if it is coherent and wanted but too COARSE to implement as one "
+            "diff (it names several distinct artifacts, or the acceptance is "
+            "skeleton/scaffold/framework/epic-shaped); needs_decision ONLY if the task "
+            "itself is ambiguous or self-contradictory. When REPO FACTS are provided, "
+            "treat them as authoritative: prefer decompose over valid when the "
+            "acceptance names nothing that resolves in the facts and is not clearly "
+            "greenfield. Reply strictly as JSON: {\"verdict\":\"valid|stale|obsolete|"
+            "needs_decision|decompose\",\"reason\":\"...\"}.")
         data = json.dumps({"task_id": brief.task_id, "title": brief.title,
                            "description": brief.description,
                            "acceptance": brief.acceptance, "tags": brief.tags,
@@ -278,6 +283,40 @@ class BaseCliAdapter(Harness):
                        reason=out.get("reason", ""),
                        updated_description=out.get("updated_description"),
                        updated_acceptance=out.get("updated_acceptance"))
+
+    def decompose(self, brief: AssessBrief) -> list[dict]:
+        """Split a too-coarse card into 2-8 independently buildable subtasks. Each
+        subtask's acceptance must NAME real files/functions from the REPO FACTS in
+        codebase_context. Cheap single-turn call reusing _run. Returns a list of
+        {title, description, acceptance} dicts (empty on an inconclusive reply --
+        the caller then queues a human decision, never a silent drop)."""
+        instruction = (
+            "This coord task is coherent and wanted but too coarse to build as one "
+            "diff. Using the REPO FACTS in codebase_context as ground truth, split it "
+            "into 2 to 8 INDEPENDENTLY buildable subtasks. Each subtask must be a small "
+            "single-diff unit whose acceptance NAMES concrete files/functions (prefer "
+            "ones from the facts). Do NOT restate the parent; produce real sub-steps. "
+            "Reply strictly as JSON: {\"subtasks\":[{\"title\":\"...\",\"description\":"
+            "\"...\",\"acceptance\":[\"...\"]}, ...]}.")
+        data = json.dumps({"task_id": brief.task_id, "title": brief.title,
+                           "description": brief.description,
+                           "acceptance": brief.acceptance, "tags": brief.tags,
+                           "codebase_context": brief.codebase_context})
+        out = self._run(instruction, data, worktree=os.getcwd(), repo=None, light=True)
+        subs = out.get("subtasks") if isinstance(out, dict) else None
+        if not isinstance(subs, list):
+            health.record("decompose_inconclusive", task=getattr(brief, "task_id", None))
+            return []
+        clean: list[dict] = []
+        for s in subs:
+            if isinstance(s, dict) and s.get("title"):
+                acc = s.get("acceptance")
+                clean.append({"title": str(s["title"]),
+                              "description": str(s.get("description", "")),
+                              "acceptance": acc if isinstance(acc, list) else (
+                                  [str(acc)] if acc else [])})
+        health.record("decompose_ok", n=len(clean), task=getattr(brief, "task_id", None))
+        return clean
 
     def run_task(self, brief: TaskBrief) -> HarnessResult:
         instruction = (

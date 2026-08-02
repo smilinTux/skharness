@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
-from .types import (WorkItem, AssessBrief, DecisionItem, QualityMode,
+from .types import (WorkItem, AssessBrief, DecisionItem, QualityMode, Verdict,
                     QUALITY_RANK, coerce_quality, ClaimRaced)
 from .executor import EXECUTORS
 from .config import Caps, Config
@@ -193,6 +193,57 @@ def _create_child(board, *, title: str, description: str, tags: list[str],
     return task.id
 
 
+def _decompose_card(board, harness, task: dict, brief: AssessBrief, *, caps: Caps,
+                    run_id: str, decisions: list, dry_run: bool = False) -> None:
+    """Split a too-coarse parent into buildable child subtasks, park the parent.
+    Guardrails: idempotent (skip if already decomposed), depth-capped (ceiling ->
+    needs_decision, no infinite trees), child-count-capped, and empty/over-cap ->
+    needs_decision (never a silent drop). Children are born ``autopilot-untriaged``
+    so a human releases them before they build (unless decompose_autobuild)."""
+    tid = task.get("id")
+    ap = (task.get("meta") or {}).get("autopilot") or {}
+    if ap.get("decomposed"):                       # idempotency: already split
+        return
+    depth = int(ap.get("decomp_depth", 0) or 0)
+    if depth >= getattr(caps, "max_decompose_depth", 2):
+        decisions.append(DecisionItem(
+            qid=stable_qid(f"decompose-depth {tid}", tid),
+            prompt=f"Task {tid} is still too coarse at max decompose depth "
+                   f"({depth}); a human should scope it.",
+            options={"promote": "promote", "skip": "skip"},
+            action_ref=tid, priority=task.get("priority") or "high"))
+        return
+    specs = harness.decompose(brief)
+    max_children = getattr(caps, "max_subtasks_per_card", 8)
+    if not specs or len(specs) > max_children:
+        # empty (inconclusive) OR wants more than the cap (it's an epic): a human
+        # scopes it -- never silently drop the parent, never over-split.
+        decisions.append(DecisionItem(
+            qid=stable_qid(f"decompose-failed {tid}", tid),
+            prompt=(f"Task {tid} was flagged too coarse but decompose returned "
+                    f"{len(specs)} subtasks (need 1..{max_children}); scope it by hand."),
+            options={"promote": "promote", "skip": "skip"},
+            action_ref=tid, priority=task.get("priority") or "high"))
+        return
+    if dry_run:
+        return
+    parent_tags = [t for t in (task.get("tags") or [])
+                   if t.startswith(("repo:", "quality:"))]
+    autobuild = bool(getattr(_decompose_card, "_autobuild", False))
+    child_ids: list[str] = []
+    for i, s in enumerate(specs[:max_children]):
+        tags = list(parent_tags) + ["autopilot", f"parent:{tid}"]
+        if not autobuild:
+            tags.append("autopilot-untriaged")     # human-release gate (default)
+        child_id = stable_qid(f"{tid}:{s.get('title', i)}", tid)[:8]
+        _create_child(board, title=s.get("title", ""), description=s.get("description", ""),
+                      tags=tags, acceptance_criteria=s.get("acceptance") or [],
+                      meta={"autopilot": {"parent": tid, "decomp_depth": depth + 1}},
+                      task_id=child_id)
+        child_ids.append(child_id)
+    board.mark_decomposed(tid, child_ids, run_id=run_id)
+
+
 def phase0_assess(*, board, harness, tasks_dir, caps: Caps, run_id: str,
                   dry_run: bool = False, codebase_context: str = "",
                   deepdive_proposals=None, only: str | None = None,
@@ -250,6 +301,19 @@ def phase0_assess(*, board, harness, tasks_dir, caps: Caps, run_id: str,
                             tags=t.get("tags") or [], repo=repo_tag(t),
                             codebase_context=gr.context or codebase_context)
         v = harness.assess(brief)
+        # Concreteness gate: a repo-tagged card that assess called `valid` but whose
+        # acceptance resolves NOTHING in the repo facts (and is not greenfield) is,
+        # by construction, too vague to build in one diff -> downgrade to decompose
+        # instead of sending it to a doomed build. Ungrounded/inconclusive cards are
+        # untouched (they still fail open to the twin gate).
+        if (v.verdict == "valid" and gr.grounded and gr.concreteness is not None
+                and gr.concreteness < getattr(caps, "concreteness_floor", 0.34)
+                and not gr.net_new):
+            v = Verdict(verdict="decompose",
+                        reason=f"repo card resolves no named artifact "
+                               f"(concreteness={gr.concreteness:.2f}); split into "
+                               f"buildable subtasks",
+                        concreteness=gr.concreteness)
         if v.verdict == "valid":
             candidates.append(_to_workitem(t, verdict="valid", config=config))
         elif v.verdict == "stale":
@@ -260,6 +324,9 @@ def phase0_assess(*, board, harness, tasks_dir, caps: Caps, run_id: str,
         elif v.verdict == "obsolete":
             if not dry_run:
                 board.close_task_obsolete(tid, v.reason, run_id=run_id)
+        elif v.verdict == "decompose":
+            _decompose_card(board, harness, t, brief, caps=caps, run_id=run_id,
+                            decisions=decisions, dry_run=dry_run)
         elif v.verdict == "needs_decision":
             decisions.append(DecisionItem(qid=stable_qid(v.reason or tid, tid),
                                           prompt=v.reason or f"Task {tid} needs a decision.",

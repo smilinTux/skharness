@@ -9,6 +9,7 @@ from skharness.autocode import orchestrator as orch
 from skharness.autocode.executor import EXECUTORS
 from skharness.autocode.orchestrator import Caps, CapLedger, kill_switch_active, stable_qid
 from skharness.autocode.types import Verdict, WorkItem, GateResult, DecisionItem
+from skharness.autocode.grounding import Grounding as _Grounding
 
 
 def test_kill_switch_env(monkeypatch):
@@ -85,6 +86,92 @@ def test_phase0_skips_obsolete_marked_cards(tmp_path):
                                   caps=Caps(), run_id="r")
     assert [c.ref for c in cands] == ["t-live"]       # obsolete card skipped
     assert harness.assess.call_count == 1             # t-dead never even assessed
+
+
+def _decompose_board(tmp_path, tid="t-vague", **taskkw):
+    _write_task(tmp_path, tid, tags=["repo:skos"], acceptance_criteria=["do the thing"],
+                **taskkw)
+    board = _board([tid])
+    created = []
+    board.create_task.side_effect = lambda task: created.append(task)
+    return board, created
+
+
+def test_phase0_decompose_verdict_creates_children_and_parks_parent(tmp_path, mocker):
+    board, created = _decompose_board(tmp_path)
+    harness = MagicMock()
+    harness.assess.return_value = Verdict(verdict="decompose", reason="too coarse")
+    harness.decompose.return_value = [
+        {"title": "sub A", "description": "", "acceptance": ["a.py has f"]},
+        {"title": "sub B", "description": "", "acceptance": ["b.py has g"]},
+    ]
+    # avoid real git grounding: force ungrounded so the model verdict stands
+    mocker.patch("skharness.autocode.orchestrator._ground_card",
+                 return_value=_Grounding(grounded=False))
+    cands, decisions = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                                          caps=Caps(), run_id="r")
+    assert [c.ref for c in cands] == []            # parent is NOT built
+    assert len(created) == 2                        # two children created
+    for child in created:
+        assert "autopilot-untriaged" in child.tags  # human-release gate
+        assert "parent:t-vague" in child.tags
+    board.mark_decomposed.assert_called_once()      # parent parked
+
+
+def test_phase0_decompose_empty_escalates_not_drops(tmp_path, mocker):
+    board, created = _decompose_board(tmp_path)
+    harness = MagicMock()
+    harness.assess.return_value = Verdict(verdict="decompose", reason="too coarse")
+    harness.decompose.return_value = []             # inconclusive
+    mocker.patch("skharness.autocode.orchestrator._ground_card",
+                 return_value=_Grounding(grounded=False))
+    cands, decisions = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                                          caps=Caps(), run_id="r")
+    assert created == []
+    assert len(decisions) == 1                       # escalated to human, not dropped
+    board.mark_decomposed.assert_not_called()
+
+
+def test_phase0_decompose_depth_ceiling_escalates(tmp_path, mocker):
+    board, created = _decompose_board(
+        tmp_path, meta={"autopilot": {"decomp_depth": 2}})
+    harness = MagicMock()
+    harness.assess.return_value = Verdict(verdict="decompose", reason="too coarse")
+    mocker.patch("skharness.autocode.orchestrator._ground_card",
+                 return_value=_Grounding(grounded=False))
+    _cands, decisions = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                                           caps=Caps(max_decompose_depth=2), run_id="r")
+    harness.decompose.assert_not_called()            # at ceiling: never split again
+    assert len(decisions) == 1
+
+
+def test_phase0_concreteness_gate_downgrades_valid_to_decompose(tmp_path, mocker):
+    board, created = _decompose_board(tmp_path)
+    harness = MagicMock()
+    harness.assess.return_value = Verdict(verdict="valid", reason="looks fine")  # model says valid
+    harness.decompose.return_value = [{"title": "sub", "acceptance": ["x.py"]}]
+    # grounded, low concreteness, not net_new -> the gate must downgrade valid->decompose
+    mocker.patch("skharness.autocode.orchestrator._ground_card",
+                 return_value=_Grounding(grounded=True, concreteness=0.0, net_new=False,
+                                         context="REPO FACTS"))
+    cands, _ = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                                  caps=Caps(), run_id="r")
+    assert [c.ref for c in cands] == []             # NOT built as valid
+    harness.decompose.assert_called_once()           # routed to decompose instead
+    board.mark_decomposed.assert_called_once()
+
+
+def test_phase0_net_new_card_still_builds(tmp_path, mocker):
+    board, created = _decompose_board(tmp_path)
+    harness = MagicMock()
+    harness.assess.return_value = Verdict(verdict="valid", reason="greenfield")
+    mocker.patch("skharness.autocode.orchestrator._ground_card",
+                 return_value=_Grounding(grounded=True, concreteness=0.0, net_new=True,
+                                         context="REPO FACTS"))
+    cands, _ = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                                  caps=Caps(), run_id="r")
+    assert [c.ref for c in cands] == ["t-vague"]     # net_new is concrete-by-intent -> builds
+    harness.decompose.assert_not_called()
 
 
 def test_phase0_only_ids_scopes_to_the_batch(tmp_path):
