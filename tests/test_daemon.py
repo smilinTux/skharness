@@ -194,19 +194,21 @@ def test_app_serves_real_client_not_placeholder():
 
 
 def test_served_client_has_no_write_control_affordances():
-    # The client exposes exactly ONE write affordance: the gated New-session
-    # POST /api/v1/dispatch. Every VIEW path stays GET / read-only WS. This guards
-    # the "no OTHER RCE surface" invariant against a future edit that quietly
-    # reintroduces an inject/ratify/kill control, a second POST, or a PUT/DELETE.
+    # The client exposes exactly TWO gated write affordances: the New-session
+    # POST /api/v1/dispatch and the follow-up POST /api/v1/sessions/<sid>/inject.
+    # Every VIEW path stays GET / read-only WS. This guards the "no OTHER RCE
+    # surface" invariant against a future edit that quietly reintroduces a
+    # ratify/kill/spawn control, a third POST, or a PUT/DELETE.
     c = _client()
     html = c.get("/app").text.lower()
-    for token in ("inject", "ratify", "spawn", "kill",
+    for token in ("ratify", "spawn", "kill",
                   "'post'", '"put"', "'put'", '"delete"', "'delete'",
                   "method: 'post'", "onclick="):
         assert token not in html, f"write-control affordance leaked into client: {token}"
-    # The single permitted write is the dispatch call, and it is the ONLY POST.
-    assert html.count('method: "post"') == 1
+    # Exactly two permitted writes (dispatch + inject); no third POST.
+    assert html.count('method: "post"') == 2
     assert "/api/v1/dispatch" in html
+    assert "/inject" in html
 
 
 def test_module_manifest_served_unauthenticated_with_operator_facet():

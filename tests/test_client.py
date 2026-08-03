@@ -24,15 +24,17 @@ def test_real_client_page_is_served():
 
 def test_client_view_paths_stay_read_only():
     body = _client().get("/").text.lower()
-    # The compose panel adds exactly ONE write affordance: the gated POST
-    # /api/v1/dispatch. No other mutation surface exists (no inject / ratify /
-    # kill), and the ONLY POST in the whole page is that single dispatch call.
-    assert "/inject" not in body
+    # The client has exactly TWO gated write affordances: the New-session dispatch
+    # (POST /api/v1/dispatch) and the follow-up inject into the active session
+    # (POST /api/v1/sessions/<sid>/inject). Both are skcode-scoped writes. NO
+    # destructive control exists (no ratify / kill / spawn), and there are exactly
+    # two POSTs in the whole page (those two writes).
     assert "/ratify" not in body
     assert "/kill" not in body
     assert "method: 'post'" not in body
-    assert body.count('method: "post"') == 1
+    assert body.count('method: "post"') == 2
     assert "/api/v1/dispatch" in body
+    assert "/inject" in body
 
 
 def test_client_page_has_gated_dispatch_compose():
@@ -66,9 +68,8 @@ def test_client_reads_wire_token_from_url_and_injects_it():
 
 
 def test_token_seam_stays_read_only():
-    # The wire token rides the GET read routes, the read-only WS tail, and the
-    # single gated dispatch write. It must NOT enable any other mutation verb.
+    # The wire token rides the GET read routes, the read-only WS tail, and the two
+    # gated writes (dispatch + inject). It must NOT enable any DESTRUCTIVE verb.
     body = _client().get("/").text.lower()
-    assert "/inject" not in body
     assert "/ratify" not in body
     assert "/kill" not in body
