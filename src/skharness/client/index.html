@@ -233,6 +233,10 @@ function addEvent(ev) {
 }
 
 function openStream(sid) {
+  // Never activate (and never enable the follow-up inject) on an empty sid:
+  // that produced POST /api/v1/sessions//inject -> 404. Defense in depth on top
+  // of the injectSubmit guard.
+  if (!sid) { return; }
   if (ws) { try { ws.close(); } catch (e) {} ws = null; }
   activeSid = sid;
   // A session is selected: enable the follow-up input (gated inject write).
