@@ -42,15 +42,84 @@
   .ev.needs_input { color: var(--warn); }
   .ev.tool_call, .ev.tool_result { color: var(--tool); }
   .ev.diff { color: var(--diff); }
+  /* Compose (New session) panel. This holds the ONLY write affordance in the
+     whole client: the gated POST /api/v1/dispatch. Everything else stays GET /
+     read-only WS. Hidden by default; toggled from the header and remembered. */
+  #compose { display: none; padding: 12px; background: var(--panel);
+             border-bottom: 1px solid var(--line); }
+  #compose.open { display: block; }
+  #compose h2 { margin: 0 0 10px; font-size: 14px; color: var(--fg); }
+  #compose .grid { display: flex; flex-wrap: wrap; gap: 12px; }
+  #compose .field { display: flex; flex-direction: column; gap: 4px; }
+  #compose label { color: var(--muted); font-size: 12px; }
+  #compose .hint { color: var(--muted); font-size: 11px; }
+  #compose select, #compose input, #compose textarea {
+    background: #151515; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 4px; padding: 6px 8px; font: inherit; }
+  #compose textarea { width: 100%; min-height: 70px; resize: vertical; }
+  #compose .prompt-field { margin-top: 10px; }
+  #compose .actions { margin-top: 10px; display: flex; gap: 10px; align-items: center; }
+  #compose .msg { font-size: 12px; }
+  #compose .msg.err { color: var(--warn); }
+  #compose .msg.ok { color: var(--good); }
+  #compose button:disabled { opacity: 0.5; cursor: default; }
 </style>
 </head>
 <body>
 <header>
   <strong>skcode</strong>
   <span class="tag">read-only</span>
+  <button id="compose-toggle" type="button">New session</button>
   <button id="refresh" type="button">Refresh</button>
   <span class="host" id="host"></span>
 </header>
+<section id="compose" aria-label="New session">
+  <h2>New session</h2>
+  <div class="grid">
+    <div class="field">
+      <label for="repo">repo</label>
+      <select id="repo"></select>
+      <input id="repo-text" type="text" placeholder="owner/repo" style="display:none">
+      <div class="hint" id="repo-hint"></div>
+    </div>
+    <div class="field">
+      <label for="branch">base branch</label>
+      <input id="branch" type="text" value="main">
+      <div class="hint">base only; the host cuts a fresh skcode/&lt;id&gt; branch off it</div>
+    </div>
+    <div class="field">
+      <label for="profile">profile</label>
+      <select id="profile">
+        <option value="sandbox">sandbox</option>
+        <option value="full">full</option>
+      </select>
+      <div class="hint">sandbox = no operator identity/memory, full = wired</div>
+    </div>
+    <div class="field">
+      <label for="harness">harness</label>
+      <select id="harness"></select>
+      <div class="hint">claude-code is the only wired harness today</div>
+    </div>
+    <div class="field">
+      <label for="model">model</label>
+      <select id="model">
+        <option value="sk-default">sk-default</option>
+        <option value="claude-sonnet-5">claude-sonnet-5</option>
+        <option value="claude-opus-4-8">claude-opus-4-8</option>
+        <option value="ornith-big">ornith-big</option>
+      </select>
+      <div class="hint">richer model routing arrives with the skgateway update</div>
+    </div>
+  </div>
+  <div class="field prompt-field">
+    <label for="prompt">prompt</label>
+    <textarea id="prompt" placeholder="What should this session do?"></textarea>
+  </div>
+  <div class="actions">
+    <button id="dispatch-btn" type="button">Start session</button>
+    <span class="msg" id="compose-msg"></span>
+  </div>
+</section>
 <main>
   <div id="list"></div>
   <div id="transcript"><div class="placeholder">Select a session to tail its output.</div></div>
@@ -239,8 +308,149 @@ function refresh() {
 }
 
 document.getElementById("refresh").addEventListener("click", refresh);
+
+// --- New session (compose) --------------------------------------------------
+// The ONLY write this client issues is the gated POST /api/v1/dispatch below.
+// Every VIEW path stays exactly as it was (GET read routes + read-only WS tail).
+// GET /api/v1/dispatch/targets is advisory: it just narrows the offered repos /
+// harnesses / profiles so the UI never proposes a forbidden target. The server
+// re-derives and re-enforces everything on dispatch and never trusts our choice.
+var composeEl = document.getElementById("compose");
+var composeToggle = document.getElementById("compose-toggle");
+var repoSel = document.getElementById("repo");
+var repoText = document.getElementById("repo-text");
+var repoHint = document.getElementById("repo-hint");
+var branchEl = document.getElementById("branch");
+var profileEl = document.getElementById("profile");
+var harnessEl = document.getElementById("harness");
+var modelEl = document.getElementById("model");
+var promptEl = document.getElementById("prompt");
+var dispatchBtn = document.getElementById("dispatch-btn");
+var composeMsg = document.getElementById("compose-msg");
+var repoUsesText = false;
+
+// Panel show/hide, remembered in localStorage. This is the lightweight operator
+// toggle; it does NOT enable/disable dispatch server-side (that gate lives in hostd).
+var COMPOSE_KEY = "skcode.compose.open";
+function setComposeOpen(open) {
+  if (open) { composeEl.classList.add("open"); } else { composeEl.classList.remove("open"); }
+  try { localStorage.setItem(COMPOSE_KEY, open ? "1" : "0"); } catch (e) {}
+}
+composeToggle.addEventListener("click", function () {
+  setComposeOpen(!composeEl.classList.contains("open"));
+});
+try { setComposeOpen(localStorage.getItem(COMPOSE_KEY) === "1"); } catch (e) {}
+
+function setComposeMsg(text, isErr) {
+  composeMsg.textContent = text || "";
+  composeMsg.className = "msg" + (text ? (isErr ? " err" : " ok") : "");
+}
+
+function fillSelect(sel, values) {
+  sel.textContent = "";
+  values.forEach(function (v) {
+    var o = document.createElement("option");
+    o.value = v; o.textContent = v;
+    sel.appendChild(o);
+  });
+}
+
+function useRepoText(note) {
+  repoUsesText = true;
+  repoSel.style.display = "none";
+  repoText.style.display = "";
+  repoHint.textContent = note || "";
+}
+
+// Seed a sane harness default up front so the panel is usable before (or without)
+// a targets response. claude-code is the only wired harness today.
+fillSelect(harnessEl, ["claude-code"]);
+
+// Advisory allowlist. This route is gated on the dispatch scope, so a view-only
+// token gets 403 here: we fall back to a free-text repo field and say so.
+function loadTargets() {
+  fetch(apiUrl("/api/v1/dispatch/targets"), { headers: authHeaders({ "Accept": "application/json" }) })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (j) {
+      if (!j) { useRepoText("Repo list unavailable; enter a repo the host allows."); return; }
+      var harnesses = j.harnesses || [];
+      if (harnesses.indexOf("claude-code") < 0) { harnesses = ["claude-code"].concat(harnesses); }
+      fillSelect(harnessEl, harnesses);
+      fillSelect(profileEl, j.profiles || ["sandbox", "full"]);
+      var repos = j.repos || [];
+      if (repos.length) {
+        repoUsesText = false;
+        repoSel.style.display = "";
+        repoText.style.display = "none";
+        fillSelect(repoSel, repos);
+        repoHint.textContent = "";
+      } else {
+        useRepoText("No advisory repo list; enter a repo the host allows.");
+      }
+    })
+    .catch(function () { useRepoText("Repo list unavailable; enter a repo the host allows."); });
+}
+
+function currentRepo() {
+  return repoUsesText ? repoText.value.trim() : (repoSel.value || "");
+}
+
+function dispatchSubmit() {
+  var prompt = promptEl.value.trim();
+  if (!prompt) { setComposeMsg("Prompt is required.", true); return; }
+  var repo = currentRepo();
+  if (!repo) { setComposeMsg("Repo is required.", true); return; }
+  var payload = {
+    harness: harnessEl.value || "claude-code",
+    model: modelEl.value || "sk-default",
+    repo: repo,
+    branch: branchEl.value.trim() || "main",
+    profile: profileEl.value || "sandbox",
+    permission_mode: "manual",
+    prompt: prompt
+  };
+  dispatchBtn.disabled = true;
+  setComposeMsg("Starting session...", false);
+  fetch(apiUrl("/api/v1/dispatch"), {
+    method: "POST",
+    headers: authHeaders({ "Content-Type": "application/json", "Accept": "application/json" }),
+    body: JSON.stringify(payload)
+  })
+    .then(function (r) {
+      return r.text().then(function (t) {
+        var j = {};
+        try { j = t ? JSON.parse(t) : {}; } catch (e) {}
+        return { ok: r.ok, status: r.status, body: j };
+      });
+    })
+    .then(function (res) {
+      dispatchBtn.disabled = false;
+      if (!res.ok) {
+        var detail = (res.body && res.body.detail) || ("dispatch failed (" + res.status + ")");
+        setComposeMsg(String(detail), true);
+        return;
+      }
+      var sid = res.body.sid || "";
+      setComposeMsg("Started " + sid + (res.body.branch ? " on " + res.body.branch : "") + ".", false);
+      promptEl.value = "";
+      if (sid) {
+        activeSid = sid;
+        refresh();
+        openStream(sid);
+      } else {
+        refresh();
+      }
+    })
+    .catch(function () {
+      dispatchBtn.disabled = false;
+      setComposeMsg("Could not reach the code host (network error).", true);
+    });
+}
+dispatchBtn.addEventListener("click", dispatchSubmit);
+
 loadHost();
 refresh();
+loadTargets();
 </script>
 </body>
 </html>

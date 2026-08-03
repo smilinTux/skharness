@@ -22,13 +22,28 @@ def test_real_client_page_is_served():
     assert "/stream" in body
 
 
-def test_client_page_is_read_only_no_write_verbs():
+def test_client_view_paths_stay_read_only():
     body = _client().get("/").text.lower()
-    # No injection / mutation surface in the read-only MVP client.
-    assert "method: 'post'" not in body
-    assert 'method: "post"' not in body
+    # The compose panel adds exactly ONE write affordance: the gated POST
+    # /api/v1/dispatch. No other mutation surface exists (no inject / ratify /
+    # kill), and the ONLY POST in the whole page is that single dispatch call.
     assert "/inject" not in body
-    assert "/dispatch" not in body
+    assert "/ratify" not in body
+    assert "/kill" not in body
+    assert "method: 'post'" not in body
+    assert body.count('method: "post"') == 1
+    assert "/api/v1/dispatch" in body
+
+
+def test_client_page_has_gated_dispatch_compose():
+    # The New-session compose panel dispatches via the gated POST and reads its
+    # advisory allowlist from the targets route, both reusing the same wire token.
+    body = _client().get("/").text
+    assert "/api/v1/dispatch/targets" in body
+    assert 'method: "POST"' in body
+    assert "authHeaders" in body
+    # The compose panel exists in the markup.
+    assert 'id="compose"' in body
 
 
 def test_client_page_has_no_external_asset_fetch():
@@ -51,10 +66,9 @@ def test_client_reads_wire_token_from_url_and_injects_it():
 
 
 def test_token_seam_stays_read_only():
-    # Injecting a token must NOT add any write verb: the token only rides the
-    # existing GET read routes and the read-only WS tail.
+    # The wire token rides the GET read routes, the read-only WS tail, and the
+    # single gated dispatch write. It must NOT enable any other mutation verb.
     body = _client().get("/").text.lower()
-    assert "method: 'post'" not in body
-    assert 'method: "post"' not in body
     assert "/inject" not in body
     assert "/ratify" not in body
+    assert "/kill" not in body
