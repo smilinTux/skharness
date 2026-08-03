@@ -313,3 +313,103 @@ def test_ratify_unknown_session_404(mocker):
     r = c.post("/api/v1/sessions/nope/ratify", json={},
                headers={"authorization": "Bearer good"})
     assert r.status_code == 404
+
+
+# ---- read/write SCOPE SPLIT (R2.4): view needs skcode.stream, actuate needs --
+# ---- skcode.inject. Enabling the verifier with a read-only token grants view --
+# ---- WITHOUT arming keystroke-inject. Driven with a scope-carrying AuthContext,
+# ---- exactly what the real capauth verifier returns. --------------------------
+
+from skharness.auth import AuthContext
+
+_H = {"authorization": "Bearer tok"}
+
+
+def _ctx_verifier(*scopes):
+    """A real (scope-carrying) verifier: any token yields the given scopes.
+
+    Mirrors build_capauth_verifier's return type (AuthContext), so the daemon's
+    read/write scope split is exercised end-to-end at the gate."""
+    ctx = AuthContext(scopes=frozenset(scopes))
+    return lambda token: ctx
+
+
+def test_scope_split_read_only_token_reads_but_cannot_inject():
+    # A token that carries ONLY skcode.stream: full read view, zero write.
+    read_only = _ctx_verifier("skcode.stream")
+
+    reads = TestClient(build_daemon_app(harness=_harness(), verify_caller=read_only))
+    assert reads.get("/api/v1/hosts/self", headers=_H).status_code == 200
+    assert reads.get("/api/v1/sessions", headers=_H).status_code == 200
+    assert reads.get("/api/v1/sessions/lumina-abc12345", headers=_H).status_code == 200
+
+    # inject is 403 (insufficient scope) and NOTHING actuates.
+    harness = _inject_harness()
+    wc = TestClient(build_daemon_app(harness=harness, verify_caller=read_only))
+    r = wc.post("/api/v1/sessions/lumina-abc12345/inject", json={"text": "hi"},
+                headers=_H)
+    assert r.status_code == 403
+    assert harness.injected == []
+
+
+def test_scope_split_read_only_token_streams_but_not_inject_ws():
+    # WS stream is a READ route: a stream-scoped token opens it (delivers events),
+    # while it still cannot ratify (a write-class action). Auth 403s BEFORE _ratify
+    # runs, so the resolver/grade path is never reached (no subprocess to mock).
+    read_only = _ctx_verifier("skcode.stream")
+    c = TestClient(build_daemon_app(harness=_harness(), verify_caller=read_only))
+    with c.websocket_connect(
+        "/api/v1/sessions/lumina-abc12345/stream?token=tok"
+    ) as ws:
+        assert ws.receive_json()["type"] == "status"
+        assert ws.receive_json()["type"] == "assistant_text"
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_json()
+
+    sessions = [SessionDescriptor(sid="lumina-abc12345", host=".158",
+                                  harness="fake", repo="skharness", branch="wt/x")]
+    app = build_daemon_app(
+        harness=_GradingHarness(sessions=sessions, grade_result=_five_complete()),
+        verify_caller=read_only,
+        resolve_ratify=lambda s: (None, "", []))
+    r = TestClient(app).post("/api/v1/sessions/lumina-abc12345/ratify", json={},
+                             headers=_H)
+    assert r.status_code == 403
+
+
+def test_scope_split_write_token_injects_and_reads():
+    # An operator token carries BOTH scopes (skcode.stream + skcode.inject), the
+    # way a full skcode grant is minted: it can inject AND read.
+    write = _ctx_verifier("skcode.stream", "skcode.inject")
+
+    harness = _inject_harness()
+    wc = TestClient(build_daemon_app(harness=harness, verify_caller=write))
+    r = wc.post("/api/v1/sessions/lumina-abc12345/inject",
+                json={"text": "run the tests"}, headers=_H)
+    assert r.status_code == 200
+    assert r.json() == {"sid": "lumina-abc12345", "injected": True}
+    assert harness.injected == [("lumina-abc12345", "run the tests")]
+
+    reads = TestClient(build_daemon_app(harness=_harness(), verify_caller=write))
+    assert reads.get("/api/v1/sessions", headers=_H).status_code == 200
+    assert reads.get("/api/v1/hosts/self", headers=_H).status_code == 200
+
+
+def test_scope_split_deny_all_denies_read_and_write():
+    # Flag off == deny-all verifier: it carries no scopes and returns False, so
+    # EVERY route is 403 regardless of the scope the route asks for.
+    deny_all = lambda token: False
+
+    harness = _inject_harness()
+    c = TestClient(build_daemon_app(harness=harness, verify_caller=deny_all))
+    assert c.get("/api/v1/sessions", headers=_H).status_code == 403
+    assert c.get("/api/v1/hosts/self", headers=_H).status_code == 403
+    assert c.post("/api/v1/sessions/lumina-abc12345/inject", json={"text": "x"},
+                  headers=_H).status_code == 403
+    assert harness.injected == []
+    # WS with a token but deny-all: closed (WebSocketDisconnect on connect).
+    with pytest.raises(WebSocketDisconnect):
+        with c.websocket_connect(
+            "/api/v1/sessions/lumina-abc12345/stream?token=tok"
+        ):
+            pass

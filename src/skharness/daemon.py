@@ -32,6 +32,14 @@ from skharness.harness import Harness, SessionDescriptor
 # daemon stays free of any repo-map/worktree convention of its own.
 RatifyResolver = Callable[[SessionDescriptor], "tuple[RepoSpec, str, list[str]] | None"]
 
+# Scope split on the remote-control surface (R2.4): a verified skcode token must
+# carry SCOPE_READ to view (list/get/stream), and SCOPE_WRITE to actuate
+# (inject/ratify). Enabling the verifier with a read-only token grants view
+# WITHOUT arming keystroke-inject. The deny-all default carries no scopes and so
+# denies both regardless.
+SCOPE_READ = "skcode.stream"
+SCOPE_WRITE = "skcode.inject"
+
 _CLIENT_DIR = Path(__file__).parent / "client"
 _PLACEHOLDER = (
     "<!doctype html><meta charset=utf-8><title>skcode-hostd</title>"
@@ -59,8 +67,8 @@ def build_daemon_app(
 ) -> FastAPI:
     app = FastAPI(title="skcode-hostd")
 
-    def _auth(authorization: str | None) -> None:
-        require_bearer(authorization, verify_caller)
+    def _auth(authorization: str | None, required_scope: str | None = None) -> None:
+        require_bearer(authorization, verify_caller, required_scope)
 
     @app.get("/.well-known/skworld-module.json")
     async def module_manifest(request: Request):
@@ -72,18 +80,18 @@ def build_daemon_app(
 
     @app.get("/api/v1/hosts/self")
     async def hosts_self(authorization: str | None = Header(default=None)):
-        _auth(authorization)
+        _auth(authorization, SCOPE_READ)
         return JSONResponse({"host": host_id, "harness": harness.name, "ok": True})
 
     @app.get("/api/v1/sessions")
     async def list_sessions(authorization: str | None = Header(default=None)):
-        _auth(authorization)
+        _auth(authorization, SCOPE_READ)
         rows = await harness.list_sessions()
         return JSONResponse({"sessions": [s.to_dict() for s in rows]})
 
     @app.get("/api/v1/sessions/{sid}")
     async def get_session(sid: str, authorization: str | None = Header(default=None)):
-        _auth(authorization)
+        _auth(authorization, SCOPE_READ)
         for s in await harness.list_sessions():
             if s.sid == sid:
                 return JSONResponse(s.to_dict())
@@ -93,8 +101,10 @@ def build_daemon_app(
     async def ratify_session(sid: str, authorization: str | None = Header(default=None)):
         # The ONE write-ish route: grade-only. It runs the autocode twin gate over
         # the session's EXISTING worktree diff. It never merges/commits/pushes (see
-        # skharness.autocode.ratify), so it does not modify the repo.
-        _auth(authorization)
+        # skharness.autocode.ratify), so it does not modify the repo. It is still
+        # a WRITE-class action (it actuates a grade over the session), so it needs
+        # SCOPE_WRITE: a read-only token cannot trigger it.
+        _auth(authorization, SCOPE_WRITE)
         session = next((s for s in await harness.list_sessions() if s.sid == sid), None)
         if session is None:
             raise HTTPException(404, "session not found")
@@ -128,7 +138,9 @@ def build_daemon_app(
         # as keystrokes. Gated exactly like the other bearer routes and fails
         # closed BEFORE any actuation: with the P0 deny-all verifier a request
         # with no/invalid token is 401/403 and harness.inject is never reached.
-        _auth(authorization)
+        # A read-only (skcode.stream) token is 403 here too: inject needs
+        # SCOPE_WRITE, so enabling view never arms keystroke-inject.
+        _auth(authorization, SCOPE_WRITE)
         try:
             body = await request.json()
         except Exception:
@@ -144,7 +156,7 @@ def build_daemon_app(
         # Browsers cannot set headers on a WebSocket, so the token rides the query
         # string. Fail closed (close 1008) BEFORE accept on a bad/missing token.
         token = websocket.query_params.get("token")
-        if not check_token(token, verify_caller):
+        if not check_token(token, verify_caller, SCOPE_READ):
             await websocket.close(code=1008)
             return
         await websocket.accept()

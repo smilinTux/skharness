@@ -12,7 +12,7 @@ import os
 import sys
 from pathlib import Path
 
-from skharness.auth import Verifier
+from skharness.auth import AuthContext, Verifier
 from skharness.daemon import build_daemon_app
 from skharness.harnesses.claude_code import ClaudeCodeHarness
 
@@ -48,13 +48,21 @@ def build_default_verifier() -> Verifier:
 
 
 def build_capauth_verifier(home: Path | None = None) -> Verifier:
-    """A real capauth verifier for skcode-hostd (R2.4).
+    """A real capauth verifier for skcode-hostd (R2.4), scope-carrying.
 
     Accepts a caller ONLY when the bearer is a valid capauth SKCODE-audience
     token: the wire form is base64url of ``export_token(...)``, so the verifier
     base64url-decodes it, ``import_token``s the JSON, then requires
     ``verify_audience_token(t, "skcode")`` (signature + time validity + audience
     match). It is capauth-only and self-contained.
+
+    On success it returns an :class:`AuthContext` carrying the token's granted
+    scopes (its ``capabilities``), NOT a bare ``True``. That is what lets the
+    daemon split read from write on one valid token: read routes require
+    ``skcode.stream`` and write routes require ``skcode.inject``, both checked
+    against this context via ``has_scope``. The audience/signature/time gate is
+    unchanged; scopes are only READ off the already-verified token, never used to
+    widen the accept decision.
 
     It fails CLOSED on any parse/verify error: a non-base64 string, non-token
     JSON, an expired/garbage/unsigned token, a wrong-audience token, or an
@@ -65,7 +73,7 @@ def build_capauth_verifier(home: Path | None = None) -> Verifier:
     # time (the deny-all default path stays capauth-free).
     from capauth import import_token, verify_audience_token
 
-    def _verify(token: str) -> bool:
+    def _verify(token: str):
         try:
             token = (token or "").strip()
             if not token:
@@ -74,7 +82,11 @@ def build_capauth_verifier(home: Path | None = None) -> Verifier:
             padded = token + "=" * (-len(token) % 4)
             token_json = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
             signed = import_token(token_json)
-            return bool(verify_audience_token(signed, SKCODE_AUDIENCE, home=home))
+            if not verify_audience_token(signed, SKCODE_AUDIENCE, home=home):
+                return False
+            # Verified: expose the token's granted scopes so routes can split
+            # read (skcode.stream) from write (skcode.inject).
+            return AuthContext(scopes=frozenset(signed.payload.capabilities or ()))
         except Exception:
             # Fail closed on ANY error: bad base64, bad JSON, bad token, keyring
             # miss, etc. Never let a caller through on an exception.

@@ -123,7 +123,30 @@ class TestCapauthVerifier:
         monkeypatch.setattr("capauth.tokens.verify_token", lambda t, h=None: True)
         wire = _wire(_skcode_token(agent_home))
         verifier = build_capauth_verifier(home=agent_home)
-        assert verifier(wire) is True
+        # The verifier now returns a scope-carrying AuthContext (truthy), NOT a
+        # bare True, so routes can split read from write. _skcode_token grants
+        # both scopes, so both are present.
+        result = verifier(wire)
+        assert result                                   # truthy -> caller accepted
+        assert result.has_scope("skcode.stream") is True
+        assert result.has_scope("skcode.inject") is True
+
+    def test_verified_context_carries_only_granted_scopes(self, agent_home, monkeypatch):
+        # A read-only token: verified (accepted) but WITHOUT the write scope, so
+        # enabling the verifier grants view without arming keystroke-inject.
+        monkeypatch.setattr("capauth.tokens.verify_token", lambda t, h=None: True)
+        token = mint_audience_token(
+            home=agent_home,
+            subject="chef-session",
+            audience="skcode",
+            scopes=["skcode.stream"],   # read only
+            sign=False,
+        )
+        verifier = build_capauth_verifier(home=agent_home)
+        result = verifier(_wire(token))
+        assert result
+        assert result.has_scope("skcode.stream") is True
+        assert result.has_scope("skcode.inject") is False
 
     def test_rejects_wrong_audience(self, agent_home, monkeypatch):
         monkeypatch.setattr("capauth.tokens.verify_token", lambda t, h=None: True)
