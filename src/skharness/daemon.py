@@ -243,6 +243,12 @@ def build_daemon_app(
         branch = str(body.get("branch", "") or "")
         profile = str(body.get("profile", "sandbox") or "sandbox")
         permission_mode = str(body.get("permission_mode", "manual") or "manual")
+        # Session mode: "direct" (print/one-shot) or "interactive" (stays open).
+        # Validate here (400) so a bad mode never reaches spawn; this is input
+        # validation only and does NOT change any auth/authz/scope gate above.
+        mode = str(body.get("mode", "direct") or "direct")
+        if mode not in ("direct", "interactive"):
+            raise HTTPException(400, f"invalid mode {mode!r} (want 'direct' or 'interactive')")
         prompt = str(body.get("prompt", "") or "")
         subject = _subject(auth)
         resource = {"host": host_id, "repo": repo, "branch": branch, "profile": profile}
@@ -256,7 +262,7 @@ def build_daemon_app(
             "decision": "allow" if allow else "deny",
             "request": {"harness": str(body.get("harness", "") or ""), "host": host_id,
                         "repo": repo, "branch": branch, "profile": profile,
-                        "permission_mode": permission_mode,
+                        "permission_mode": permission_mode, "mode": mode,
                         "model": str(body.get("model", "") or ""),
                         "prompt_len": len(prompt)},
             "reason": getattr(decision, "reason", ""),
@@ -269,7 +275,7 @@ def build_daemon_app(
         desc = SessionDescriptor(
             host=host_id, harness=str(body.get("harness", "") or harness.name),
             repo=repo, branch=branch, model=str(body.get("model", "") or ""),
-            quality=profile, permission_mode=permission_mode)
+            quality=profile, permission_mode=permission_mode, mode=mode)
         try:
             session = await harness.spawn(desc, prompt=prompt)
         except SpawnRejected as exc:
@@ -279,7 +285,7 @@ def build_daemon_app(
         _emit_audit({"event": "skcode.dispatch.spawned", "subject": subject,
                      "sid": session.sid, "resource": resource})
         return JSONResponse({"sid": session.sid, "status": session.status,
-                             "branch": session.branch, "profile": profile})
+                             "branch": session.branch, "profile": profile, "mode": mode})
 
     @app.websocket("/api/v1/sessions/{sid}/stream")
     async def stream(websocket: WebSocket, sid: str):

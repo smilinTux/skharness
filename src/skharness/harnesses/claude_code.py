@@ -62,6 +62,35 @@ _DEFAULT_CHILD_PATH = (
 )
 
 
+#: The onboarding version stamped into the seeded ~/.claude.json for interactive
+#: sessions. It only needs to be a version claude accepts as "already onboarded"
+#: so the first-run wizard is skipped; the exact value is not load-bearing.
+_SEED_ONBOARDING_VERSION = "2.1.119"
+
+#: Map the compose-form model ids onto the values `claude --model` accepts today.
+#: claude speaks the Anthropic API, and skgateway is not yet an Anthropic-compat
+#: endpoint, so the non-Anthropic ids (sk-default / ornith-big) fall back to
+#: "sonnet" for now. Real routing (setting ANTHROPIC_BASE_URL at the gateway)
+#: lands with the skgateway update; until then every id resolves to a concrete
+#: Anthropic model and --model is ALWAYS passed.
+_MODEL_MAP = {
+    "claude-sonnet-5": "sonnet",
+    "claude-opus-4-8": "opus",
+    "sk-default": "sonnet",   # default tier for now (skgateway routing is a follow-on)
+    "ornith-big": "sonnet",   # non-Anthropic id: falls back to sonnet until skgateway is Anthropic-compat
+}
+
+
+def map_model(model: str | None) -> str:
+    """Resolve a compose-form model id to a concrete ``claude --model`` value.
+
+    Unknown / empty ids fall back to ``"sonnet"`` (never left blank), so spawn can
+    always pass ``--model``. See :data:`_MODEL_MAP` for the routing note.
+    """
+    key = (model or "").strip()
+    return _MODEL_MAP.get(key, "sonnet")
+
+
 def _default_runner(argv: list[str]) -> str:
     proc = subprocess.run(argv, capture_output=True, text=True, check=False)
     return proc.stdout
@@ -359,23 +388,72 @@ class ClaudeCodeHarness(Harness):
             env["HOME"] = str(worktree)
         return env
 
-    def _claude_argv(self, profile: str, prompt: str) -> list[str]:
-        """Build the ``claude`` launch argv. The prompt is a distinct argv element
-        (DATA), never interpolated into a shell string. The sk* MCP config is added
-        ONLY for the full profile; the sandbox profile never references it.
+    def _claude_argv(self, profile: str, prompt: str, mode: str, model: str) -> list[str]:
+        """Build the ``claude`` launch argv for a session ``mode``.
+
+        The prompt is a distinct argv element (DATA), never interpolated into a
+        shell string. The sk* MCP config is added ONLY for the full profile; the
+        sandbox profile never references it. ``--model`` is ALWAYS passed, mapped
+        via :func:`map_model`.
+
+        DIRECT mode (default): ``claude -p --dangerously-skip-permissions ... --model <m> <prompt>``.
+        Print mode (-p) runs the prompt non-interactively and produces output,
+        skipping the first-run onboarding wizard that would otherwise block a
+        fresh-HOME sandbox forever. --dangerously-skip-permissions lets the
+        session act without per-action approval; it is confined to the sandbox
+        worktree / scratch dir and the no-operator-context env.
+
+        INTERACTIVE mode: ``claude ... --model <m> <prompt>`` (NO -p, NO
+        --dangerously-skip-permissions). The prompt runs, then the TUI STAYS OPEN
+        in manual mode ready for injected follow-ups (the inject path). Interactive
+        runs WITHOUT --dangerously-skip-permissions on purpose: claude asks
+        per-action permission (safer, not less safe). The first-run dialogs are
+        skipped instead by the seeded ~/.claude.json spawn writes into the worktree
+        HOME (see :meth:`_write_interactive_seed`).
         """
-        # Print mode (-p) runs the prompt non-interactively and produces output,
-        # skipping the first-run onboarding wizard that would otherwise block a
-        # fresh-HOME sandbox forever. --dangerously-skip-permissions lets the
-        # session act without per-action approval; it is confined to the sandbox
-        # worktree / scratch dir and the no-operator-context env.
-        argv = [self.claude_bin, "-p", "--dangerously-skip-permissions", *self.claude_base_args]
+        if mode == "interactive":
+            argv = [self.claude_bin, *self.claude_base_args]
+        else:
+            argv = [self.claude_bin, "-p", "--dangerously-skip-permissions", *self.claude_base_args]
         if profile == "full" and self.mcp_config:
             argv += ["--mcp-config", str(self.mcp_config)]
+        argv += ["--model", map_model(model)]
         # Prompt LAST, as its own argv value. tmux new-window '--' execs the argv
         # directly (verified: no sh -c), so the prompt is never shell-parsed.
         argv += [str(prompt or "")]
         return argv
+
+    def _write_interactive_seed(self, worktree: Path) -> Path:
+        """Seed ``<worktree>/.claude.json`` so an interactive session skips ALL
+        first-run dialogs (onboarding, trust-folder, bypass-warning).
+
+        The child's HOME is the worktree (``env -i`` scopes it there), so claude
+        reads this file as ``~/.claude.json``. The ``projects`` key MUST be keyed
+        by the absolute worktree path (the child's HOME + cwd) for the trust dialog
+        to be pre-accepted. Interactive mode has no ``-p`` to auto-skip the wizard,
+        so this seed is what lets a fresh HOME launch straight into the session.
+        """
+        wt = str(worktree)
+        seed = {
+            "hasCompletedOnboarding": True,
+            "lastOnboardingVersion": _SEED_ONBOARDING_VERSION,
+            "theme": "dark",
+            "numStartups": 5,
+            "bypassPermissionsModeAccepted": True,
+            "projects": {
+                wt: {
+                    "hasTrustDialogAccepted": True,
+                    "hasCompletedProjectOnboarding": True,
+                    "allowedTools": [],
+                }
+            },
+        }
+        # The worktree dir already exists after `git worktree add` / the scratch
+        # mkdir; ensure it anyway so seeding never races the dir into existence.
+        worktree.mkdir(parents=True, exist_ok=True)
+        path = worktree / ".claude.json"
+        path.write_text(json.dumps(seed, indent=2))
+        return path
 
     async def spawn(self, desc: SessionDescriptor, *, prompt: str) -> HarnessSession:
         """Start a NEW claude-code session in an isolated worktree + tmux window.
@@ -399,6 +477,12 @@ class ClaudeCodeHarness(Harness):
         profile = (desc.quality or "sandbox").strip().lower()
         if profile not in ("sandbox", "full"):
             raise SpawnRejected(f"invalid profile {profile!r} (want 'sandbox' or 'full')")
+
+        # Session mode: "direct" (print/one-shot) or "interactive" (stays open for
+        # injected follow-ups). Fail closed on an unknown mode (never proceed).
+        mode = (desc.mode or "direct").strip().lower()
+        if mode not in ("direct", "interactive"):
+            raise SpawnRejected(f"invalid mode {mode!r} (want 'direct' or 'interactive')")
 
         # 2. repo is OPTIONAL. WITH a repo: it must be on the allowlist and the
         #    session runs in an isolated worktree off the validated base branch.
@@ -457,8 +541,14 @@ class ClaudeCodeHarness(Harness):
             except OSError as exc:
                 raise SpawnRejected(f"scratch dir create failed: {exc}")
 
+        # Interactive mode has no -p to auto-skip the first-run wizard, so seed a
+        # ~/.claude.json (keyed by the worktree = the child's HOME) that pre-accepts
+        # every first-run dialog. Direct mode's -p already skips onboarding, so no
+        # seed is written there.
+        if mode == "interactive":
+            self._write_interactive_seed(worktree)
         env = self._build_env(profile, agent, worktree)
-        launch = self._claude_argv(profile, prompt)
+        launch = self._claude_argv(profile, prompt, mode, desc.model)
         env_argv = ["env", "-i", *[f"{k}={v}" for k, v in env.items()]]
         # Ensure the target tmux session exists (a fresh host has no tmux server,
         # so `new-window -t skchat-agents` would silently fail and the session
@@ -486,7 +576,7 @@ class ClaudeCodeHarness(Harness):
             descriptor=SessionDescriptor(
                 sid=sid, host=self.host, harness=self.name, repo=repo_real,
                 branch=branch, model=desc.model, state="running", quality=profile,
-                permission_mode=desc.permission_mode,
+                permission_mode=desc.permission_mode, mode=mode,
             ),
             status="running",
             branch=branch,

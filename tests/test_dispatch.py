@@ -153,6 +153,33 @@ def test_dispatch_scope_and_authz_allow_spawns_and_audits():
     # audited: the allow obligation + the spawned summary
     blob = " ".join(audits)
     assert "allow" in blob and "spawned" in blob
+    # mode defaults to "direct" when the body omits it, and reaches the descriptor
+    assert desc.mode == "direct"
+
+
+def test_dispatch_passes_interactive_mode_to_the_descriptor():
+    harness = _SpawningHarness()
+    audits = []
+    c = TestClient(_app(harness=harness, authorize=_allow_authorizer(),
+                        audit=audits.append))
+    body = dict(_BODY, mode="interactive")
+    r = c.post("/api/v1/dispatch", json=body, headers={"authorization": "Bearer t"})
+    assert r.status_code == 200
+    assert r.json()["mode"] == "interactive"
+    desc, _ = harness.spawned[0]
+    assert desc.mode == "interactive"
+
+
+def test_dispatch_rejects_invalid_mode_with_400():
+    harness = _SpawningHarness()
+    c = TestClient(_app(harness=harness, authorize=_allow_authorizer(),
+                        audit=lambda s: None))
+    body = dict(_BODY, mode="root")
+    r = c.post("/api/v1/dispatch", json=body, headers={"authorization": "Bearer t"})
+    assert r.status_code == 400
+    assert "invalid mode" in r.json()["detail"]
+    # a bad mode never reaches spawn
+    assert harness.spawned == []
 
 
 def test_dispatch_paused_is_503_regardless_of_auth():

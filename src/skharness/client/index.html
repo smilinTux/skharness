@@ -110,6 +110,14 @@
       </select>
       <div class="hint">richer model routing arrives with the skgateway update</div>
     </div>
+    <div class="field">
+      <label for="mode">mode</label>
+      <select id="mode">
+        <option value="direct">direct (fast, one-shot)</option>
+        <option value="interactive">interactive (stays open, chat-like)</option>
+      </select>
+      <div class="hint">direct = one-shot print; interactive = stays open for follow-ups</div>
+    </div>
   </div>
   <div class="field prompt-field">
     <label for="prompt">prompt</label>
@@ -324,6 +332,7 @@ var branchEl = document.getElementById("branch");
 var profileEl = document.getElementById("profile");
 var harnessEl = document.getElementById("harness");
 var modelEl = document.getElementById("model");
+var modeEl = document.getElementById("mode");
 var promptEl = document.getElementById("prompt");
 var dispatchBtn = document.getElementById("dispatch-btn");
 var composeMsg = document.getElementById("compose-msg");
@@ -412,6 +421,7 @@ function dispatchSubmit() {
     branch: repo ? (branchEl.value.trim() || "main") : "",
     profile: profileEl.value || "sandbox",
     permission_mode: "manual",
+    mode: modeEl.value || "direct",
     prompt: prompt
   };
   dispatchBtn.disabled = true;

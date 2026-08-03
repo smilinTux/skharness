@@ -13,6 +13,7 @@ from skharness.events import EventType
 from skharness.harness import Harness, HarnessSession, SessionDescriptor, SpawnRejected
 from skharness.harnesses.claude_code import (
     ClaudeCodeHarness,
+    map_model,
     new_lines,
     parse_repo_allowlist,
     parse_windows,
@@ -564,3 +565,114 @@ async def test_spawn_worktree_add_failure_is_rejected_no_window(tmp_path):
                       prompt="p")
     # worktree add failed => NO tmux window opened
     assert tcalls == []
+
+
+# --- interactive mode + model wiring (skcode interactive-mode) ----------------
+
+
+def _launch_argv(new_window_argv):
+    """The `claude ...` launch argv the child runs: everything from the `claude`
+    binary token onward inside the new-window call (after `env -i ...`)."""
+    i = new_window_argv.index("claude")
+    return new_window_argv[i:]
+
+
+@pytest.mark.asyncio
+async def test_direct_mode_is_default_and_keeps_print_flags(tmp_path):
+    repo = tmp_path / "skharness"
+    repo.mkdir()
+    runner, tcalls = _tmux_recorder()
+    git, _ = _git_ok()
+    h = _spawn_harness(repo, runner=runner, git_runner=git)
+
+    # mode unset => "direct" by default
+    desc = SessionDescriptor(repo=str(repo), branch="x", quality="sandbox",
+                             model="claude-sonnet-5")
+    session = await h.spawn(desc, prompt="do it")
+    assert session.descriptor.mode == "direct"
+
+    launch = _launch_argv(_new_window_argv(tcalls))
+    # direct keeps -p AND --dangerously-skip-permissions, always passes --model
+    assert "-p" in launch
+    assert "--dangerously-skip-permissions" in launch
+    assert launch[launch.index("--model") + 1] == "sonnet"
+    # NO seed file is written for direct (no worktree/.claude.json)
+    assert not (repo.parent / "wt" / session.sid / ".claude.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_interactive_mode_omits_print_flags_and_seeds_claude_json(tmp_path):
+    repo = tmp_path / "skharness"
+    repo.mkdir()
+    runner, tcalls = _tmux_recorder()
+    git, _ = _git_ok()
+    h = _spawn_harness(repo, runner=runner, git_runner=git)
+
+    desc = SessionDescriptor(repo=str(repo), branch="x", quality="sandbox",
+                             model="claude-opus-4-8", mode="interactive")
+    session = await h.spawn(desc, prompt="stay open")
+    assert session.descriptor.mode == "interactive"
+
+    launch = _launch_argv(_new_window_argv(tcalls))
+    # interactive drops BOTH -p and --dangerously-skip-permissions (per-action perms)
+    assert "-p" not in launch
+    assert "--dangerously-skip-permissions" not in launch
+    # still always passes --model (opus here)
+    assert launch[launch.index("--model") + 1] == "opus"
+    # prompt is still the LAST argv element (data)
+    assert launch[-1] == "stay open"
+
+    # the seed ~/.claude.json is written into the worktree (the child's HOME) and
+    # pre-accepts every first-run dialog, keyed by the ABSOLUTE worktree path
+    worktree = repo.parent / "wt" / session.sid
+    seed_path = worktree / ".claude.json"
+    assert seed_path.exists()
+    seed = json.loads(seed_path.read_text())
+    assert seed["hasCompletedOnboarding"] is True
+    assert seed["bypassPermissionsModeAccepted"] is True
+    assert str(worktree) in seed["projects"]
+    proj = seed["projects"][str(worktree)]
+    assert proj["hasTrustDialogAccepted"] is True
+    assert proj["hasCompletedProjectOnboarding"] is True
+
+
+@pytest.mark.asyncio
+async def test_spawn_rejects_invalid_mode(tmp_path):
+    repo = tmp_path / "skharness"
+    repo.mkdir()
+    runner, tcalls = _tmux_recorder()
+    git, gcalls = _git_ok()
+    h = _spawn_harness(repo, runner=runner, git_runner=git)
+    with pytest.raises(SpawnRejected, match="mode"):
+        await h.spawn(SessionDescriptor(repo=str(repo), branch="x", quality="sandbox",
+                                        mode="root"), prompt="p")
+    # rejected before touching the machine
+    assert gcalls == [] and tcalls == []
+
+
+def test_map_model_maps_the_four_compose_ids():
+    # the compose form's four ids map onto concrete `claude --model` values
+    assert map_model("claude-sonnet-5") == "sonnet"
+    assert map_model("claude-opus-4-8") == "opus"
+    assert map_model("sk-default") == "sonnet"      # default tier for now
+    assert map_model("ornith-big") == "sonnet"      # non-Anthropic => sonnet fallback
+    # unknown / empty never left blank (spawn always passes --model)
+    assert map_model("") == "sonnet"
+    assert map_model(None) == "sonnet"
+    assert map_model("whatever") == "sonnet"
+
+
+@pytest.mark.asyncio
+async def test_model_is_always_passed_even_when_unset(tmp_path):
+    repo = tmp_path / "skharness"
+    repo.mkdir()
+    runner, tcalls = _tmux_recorder()
+    git, _ = _git_ok()
+    h = _spawn_harness(repo, runner=runner, git_runner=git)
+
+    # model left blank still resolves to a concrete --model value
+    desc = SessionDescriptor(repo=str(repo), branch="x", quality="sandbox")
+    await h.spawn(desc, prompt="p")
+    launch = _launch_argv(_new_window_argv(tcalls))
+    assert "--model" in launch
+    assert launch[launch.index("--model") + 1] == "sonnet"

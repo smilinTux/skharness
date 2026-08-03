@@ -117,6 +117,7 @@ class SessionDescriptor:
     last_message: str = ""           # last assistant line (for the list preview)
     quality: str = "sandbox"         # profile / quality tier: "full" | "sandbox"
     permission_mode: str = "manual"  # per-action approval posture: "manual" | "auto"
+    mode: str = "direct"             # session mode: "direct" (print/one-shot) | "interactive" (stays open)
 
     def to_dict(self) -> dict:
         return asdict(self)
