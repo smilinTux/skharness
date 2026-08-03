@@ -364,7 +364,12 @@ class ClaudeCodeHarness(Harness):
         (DATA), never interpolated into a shell string. The sk* MCP config is added
         ONLY for the full profile; the sandbox profile never references it.
         """
-        argv = [self.claude_bin, *self.claude_base_args]
+        # Print mode (-p) runs the prompt non-interactively and produces output,
+        # skipping the first-run onboarding wizard that would otherwise block a
+        # fresh-HOME sandbox forever. --dangerously-skip-permissions lets the
+        # session act without per-action approval; it is confined to the sandbox
+        # worktree / scratch dir and the no-operator-context env.
+        argv = [self.claude_bin, "-p", "--dangerously-skip-permissions", *self.claude_base_args]
         if profile == "full" and self.mcp_config:
             argv += ["--mcp-config", str(self.mcp_config)]
         # Prompt LAST, as its own argv value. tmux new-window '--' execs the argv
@@ -395,20 +400,26 @@ class ClaudeCodeHarness(Harness):
         if profile not in ("sandbox", "full"):
             raise SpawnRejected(f"invalid profile {profile!r} (want 'sandbox' or 'full')")
 
-        # 2. repo allowlist (fail closed on an empty allowlist).
-        if not self.dispatch_repos:
-            raise SpawnRejected("repo allowlist is empty (SKCODE_DISPATCH_REPOS unset): deny all")
+        # 2. repo is OPTIONAL. WITH a repo: it must be on the allowlist and the
+        #    session runs in an isolated worktree off the validated base branch.
+        #    WITHOUT a repo: a repo-less scratch session (fast/direct model work)
+        #    in an isolated empty scratch dir with no repo access, so the repo
+        #    allowlist gate does not apply. The auth + authz + sandbox gates still
+        #    apply in BOTH cases (this never widens who may dispatch).
         repo = (desc.repo or "").strip()
-        if not repo:
-            raise SpawnRejected("missing repo")
-        repo_real = os.path.realpath(os.path.expanduser(repo))
-        if repo_real not in self.dispatch_repos:
-            raise SpawnRejected(f"repo {repo!r} is not on the dispatch allowlist")
-
-        # 3. branch via git's own validator.
-        branch = (desc.branch or "").strip()
-        if not self._branch_ok(branch):
-            raise SpawnRejected(f"branch {branch!r} failed git check-ref-format")
+        repo_real = ""
+        branch = ""
+        if repo:
+            if not self.dispatch_repos:
+                raise SpawnRejected(
+                    "repo allowlist is empty (SKCODE_DISPATCH_REPOS unset): deny all")
+            repo_real = os.path.realpath(os.path.expanduser(repo))
+            if repo_real not in self.dispatch_repos:
+                raise SpawnRejected(f"repo {repo!r} is not on the dispatch allowlist")
+            # 3. branch via git's own validator (only meaningful with a repo).
+            branch = (desc.branch or "main").strip()
+            if not self._branch_ok(branch):
+                raise SpawnRejected(f"branch {branch!r} failed git check-ref-format")
 
         # 4. name charset. The agent prefix is the real identity for FULL and a
         #    fixed 'sandbox' for SANDBOX (never the real identity), plus a random id.
@@ -425,19 +436,26 @@ class ClaudeCodeHarness(Harness):
             self.worktree_root.mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
-        # Each session gets its OWN fresh branch off the requested base branch, via
-        # `worktree add -b`. This is the "start a new session" semantics: dispatching
-        # onto `main` (already checked out in the primary repo) does not conflict, and
-        # each session stays isolated on its own branch (the autocode-worktree pattern).
-        # The base branch is validated above (check-ref-format); the new branch name is
-        # charset-safe by construction (`skcode/<sid>`, sid is [A-Za-z0-9_-]+).
-        session_branch = f"skcode/{sid}"
-        wt = self._git(
-            ["git", "-C", repo_real, "worktree", "add", "-b", session_branch, str(worktree), branch]
-        )
-        if getattr(wt, "returncode", 1) != 0:
-            raise SpawnRejected(
-                f"git worktree add failed: {getattr(wt, 'stderr', '') or 'unknown error'}")
+        if repo_real:
+            # Each repo session gets its OWN fresh branch off the requested base via
+            # `worktree add -b`: dispatching onto `main` (already checked out in the
+            # primary repo) does not conflict, and each session stays isolated on its
+            # own branch (the autocode-worktree pattern). Base branch validated above;
+            # the new branch name is charset-safe by construction (`skcode/<sid>`).
+            session_branch = f"skcode/{sid}"
+            wt = self._git(
+                ["git", "-C", repo_real, "worktree", "add", "-b", session_branch, str(worktree), branch]
+            )
+            if getattr(wt, "returncode", 1) != 0:
+                raise SpawnRejected(
+                    f"git worktree add failed: {getattr(wt, 'stderr', '') or 'unknown error'}")
+        else:
+            # Repo-less scratch session (fast/direct model work): an isolated empty
+            # dir, no repo access. HOME points here (env -i), so nothing leaks.
+            try:
+                worktree.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise SpawnRejected(f"scratch dir create failed: {exc}")
 
         env = self._build_env(profile, agent, worktree)
         launch = self._claude_argv(profile, prompt)
@@ -454,6 +472,13 @@ class ClaudeCodeHarness(Harness):
         self._runner([
             "tmux", "new-window", "-t", self.tmux_session, "-n", sid,
             "-c", str(worktree), "--", *env_argv, *launch,
+        ])
+        # Keep the pane after the print-mode command exits so its output stays
+        # viewable + listable instead of the window vanishing the instant claude
+        # finishes. Set immediately (well within the multi-second model call).
+        self._runner([
+            "tmux", "set-window-option", "-t", f"{self.tmux_session}:{sid}",
+            "remain-on-exit", "on",
         ])
 
         return HarnessSession(
