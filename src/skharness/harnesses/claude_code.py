@@ -413,7 +413,16 @@ class ClaudeCodeHarness(Harness):
             self.worktree_root.mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
-        wt = self._git(["git", "-C", repo_real, "worktree", "add", str(worktree), branch])
+        # Each session gets its OWN fresh branch off the requested base branch, via
+        # `worktree add -b`. This is the "start a new session" semantics: dispatching
+        # onto `main` (already checked out in the primary repo) does not conflict, and
+        # each session stays isolated on its own branch (the autocode-worktree pattern).
+        # The base branch is validated above (check-ref-format); the new branch name is
+        # charset-safe by construction (`skcode/<sid>`, sid is [A-Za-z0-9_-]+).
+        session_branch = f"skcode/{sid}"
+        wt = self._git(
+            ["git", "-C", repo_real, "worktree", "add", "-b", session_branch, str(worktree), branch]
+        )
         if getattr(wt, "returncode", 1) != 0:
             raise SpawnRejected(
                 f"git worktree add failed: {getattr(wt, 'stderr', '') or 'unknown error'}")
