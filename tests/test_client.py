@@ -35,3 +35,26 @@ def test_client_page_has_no_external_asset_fetch():
     body = _client().get("/").text.lower()
     assert "http://" not in body
     assert "https://" not in body
+
+
+def test_client_reads_wire_token_from_url_and_injects_it():
+    # The parent shell hands a capauth audience=skcode wire token to this client
+    # via the iframe URL as ?token=<wire>. The client must read it and attach it
+    # as an Authorization: Bearer header on the HTTP read routes and as ?token=
+    # on the WS tail (a browser cannot set headers on a WebSocket).
+    body = _client().get("/").text
+    assert 'URLSearchParams(location.search).get("token")' in body
+    assert 'Authorization" ' in body or '"Authorization"' in body
+    assert "Bearer " in body
+    # The WS URL carries the token as a query param.
+    assert '"token="' in body
+
+
+def test_token_seam_stays_read_only():
+    # Injecting a token must NOT add any write verb: the token only rides the
+    # existing GET read routes and the read-only WS tail.
+    body = _client().get("/").text.lower()
+    assert "method: 'post'" not in body
+    assert 'method: "post"' not in body
+    assert "/inject" not in body
+    assert "/ratify" not in body

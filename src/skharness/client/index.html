@@ -69,6 +69,31 @@ var hostEl = document.getElementById("host");
 var ws = null;
 var activeSid = null;
 
+// The parent shell (skchat) mints a capauth wire token scoped to audience
+// "skcode" and hands it to this read-only client through the iframe URL as
+// "?token=<wire>". hostd wants it as an "Authorization: Bearer" header on the
+// HTTP read routes, and as "?token=" on the WS tail (a browser cannot set
+// headers on a WebSocket). This client stays strictly read-only: the token is
+// only ever attached to the GET read routes and the WS tail, never to a write.
+// When no token is present every call goes out exactly as before and hostd's
+// verifier returns its gated empty state, so an unpaired/tokenless load is
+// unchanged.
+function wireToken() {
+  try {
+    return new URLSearchParams(location.search).get("token") || "";
+  } catch (e) {
+    return "";
+  }
+}
+var TOKEN = wireToken();
+
+// Merge the bearer into a fetch headers object when a token is present.
+function authHeaders(extra) {
+  var h = extra || {};
+  if (TOKEN) { h["Authorization"] = "Bearer " + TOKEN; }
+  return h;
+}
+
 // Origin-relative + proxy-aware. The page is served at ".../app": at the daemon
 // root that is "/app", behind the 443 funnel it is "/skcode/app". Stripping the
 // trailing "app" leaf yields the mount prefix ("" or "/skcode") so every API and
@@ -80,7 +105,11 @@ function mountPrefix() {
 function apiUrl(path) { return location.origin + mountPrefix() + path; }
 function wsUrl(path) {
   var scheme = (location.protocol === "https:") ? "wss:" : "ws:";
-  return scheme + "//" + location.host + mountPrefix() + path;
+  var base = scheme + "//" + location.host + mountPrefix() + path;
+  if (TOKEN) {
+    base += (path.indexOf("?") >= 0 ? "&" : "?") + "token=" + encodeURIComponent(TOKEN);
+  }
+  return base;
 }
 
 function clearTranscript(msg) {
@@ -192,14 +221,14 @@ function renderList(rows) {
 }
 
 function loadHost() {
-  fetch(apiUrl("/api/v1/hosts/self"), { headers: { "Accept": "application/json" } })
+  fetch(apiUrl("/api/v1/hosts/self"), { headers: authHeaders({ "Accept": "application/json" }) })
     .then(function (r) { return r.ok ? r.json() : null; })
     .then(function (j) { if (j && j.host) { hostEl.textContent = "host: " + j.host; } })
     .catch(function () {});
 }
 
 function refresh() {
-  fetch(apiUrl("/api/v1/sessions"), { headers: { "Accept": "application/json" } })
+  fetch(apiUrl("/api/v1/sessions"), { headers: authHeaders({ "Accept": "application/json" }) })
     .then(function (r) {
       if (r.status === 401 || r.status === 403) { pairingEmptyState(); return null; }
       if (!r.ok) { errorState("Could not load sessions (" + r.status + ")."); return null; }
