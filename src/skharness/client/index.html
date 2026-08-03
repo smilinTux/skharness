@@ -76,6 +76,28 @@
   #compose .msg.err { color: var(--warn); }
   #compose .msg.ok { color: var(--good); }
   #compose button:disabled { opacity: 0.5; cursor: default; }
+  /* Phone: shrink fonts + the session list so the transcript is not squeezed to
+     half the screen, and tighten the chrome. Layout is unchanged on desktop. */
+  @media (max-width: 640px) {
+    body { font-size: 12px; }
+    header { padding: 6px 8px; gap: 6px; }
+    header .tag, header .host { display: none; }
+    button { padding: 5px 9px; }
+    main { height: calc(100vh - 40px); }
+    #list { width: 40%; min-width: 118px; }
+    .row { padding: 6px 8px; }
+    .row .name { font-size: 12px; }
+    .row .meta { font-size: 10px; margin-top: 2px; }
+    #transcript { padding: 8px; font-size: 12px; }
+    #compose { padding: 8px; }
+    #compose .grid { gap: 8px; }
+    #compose h2 { font-size: 13px; margin-bottom: 6px; }
+    #compose label { font-size: 11px; }
+    #compose select, #compose input, #compose textarea { padding: 4px 6px; font-size: 12px; }
+    #compose textarea { min-height: 54px; }
+    #inject-bar { padding: 6px 8px; gap: 6px; }
+    #inject-bar input { padding: 5px 7px; font-size: 12px; }
+  }
 </style>
 </head>
 <body>
@@ -206,6 +228,7 @@ function wsUrl(path) {
 
 function clearTranscript(msg) {
   if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+  _lastRenderedText = "";
   transcriptEl.textContent = "";
   var d = document.createElement("div");
   d.className = "placeholder";
@@ -213,13 +236,47 @@ function clearTranscript(msg) {
   transcriptEl.appendChild(d);
 }
 
+// The stream is a raw capture of claude's full-screen TUI, so it carries terminal
+// FURNITURE we do not want in a chat view. Drop ONLY unambiguous chrome so no real
+// content is ever lost: full-width box-drawing separators, the status bar, and the
+// "thinking" spinner line. The prompt (U+276F) and answer bullet (U+25CF) lines,
+// and any normal text, always pass through.
+function isChromeLine(text) {
+  var t = (text || "").trim();
+  if (!t) { return false; }               // blanks handled by the dedupe below
+  // Full-width separator: every non-space glyph is a box-drawing char (U+2500..U+257F).
+  var boxOnly = true;
+  for (var i = 0; i < t.length; i++) {
+    var c = t.charCodeAt(i);
+    if (c === 0x20) { continue; }
+    if (c < 0x2500 || c > 0x257F) { boxOnly = false; break; }
+  }
+  if (boxOnly && t.length >= 8) { return true; }
+  // The persistent status bar.
+  if (t.indexOf("manual mode on") >= 0 || t.indexOf("for shortcuts") >= 0
+      || t.indexOf("for agents") >= 0) { return true; }
+  // The thinking spinner line, always begins with the U+273B glyph.
+  if (t.charCodeAt(0) === 0x273B) { return true; }
+  return false;
+}
+
+var _lastRenderedText = "";
+
 function addEvent(ev) {
+  var text = ev.text || "";
+  if (isChromeLine(text)) { return; }
+  // Collapse TUI redraws: skip a line identical to the one just rendered, and
+  // skip a blank line following a blank line (the TUI pads with many blanks).
+  var isBlank = !text.trim();
+  if (text === _lastRenderedText) { return; }
+  if (isBlank && !_lastRenderedText.trim()) { return; }
+  _lastRenderedText = text;
   if (transcriptEl.firstChild && transcriptEl.firstChild.className === "placeholder") {
     transcriptEl.textContent = "";
   }
   var div = document.createElement("div");
   div.className = "ev " + (ev.type || "");
-  div.textContent = ev.text || JSON.stringify(ev.data || {});
+  div.textContent = text || JSON.stringify(ev.data || {});
   transcriptEl.appendChild(div);
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
@@ -235,6 +292,7 @@ function openStream(sid) {
   if (injectText) { injectText.disabled = false; }
   if (injectBtn) { injectBtn.disabled = false; }
   if (injectMsg) { injectMsg.textContent = ""; }
+  _lastRenderedText = "";
   transcriptEl.textContent = "";
   var url = wsUrl("/api/v1/sessions/" + encodeURIComponent(sid) + "/stream");
   try {
