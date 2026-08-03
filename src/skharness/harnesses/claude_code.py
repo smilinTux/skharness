@@ -55,7 +55,11 @@ _DEFAULT_SESSIONS_ROOT = Path.home() / ".skcapstone" / "agents"
 _DEFAULT_WORKTREE_ROOT = Path.home() / ".skcapstone" / "skcode" / "worktrees"
 #: A minimal PATH handed to a spawned child (env -i wipes the environment, so a
 #: child needs an explicit PATH to resolve `claude`, `git`, etc.).
-_DEFAULT_CHILD_PATH = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
+_DEFAULT_CHILD_PATH = (
+    os.path.expanduser("~/.local/bin")
+    + ":"
+    + os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
+)
 
 
 def _default_runner(argv: list[str]) -> str:
@@ -337,6 +341,14 @@ class ClaudeCodeHarness(Harness):
             "TERM": "xterm-256color",
             "LANG": os.environ.get("LANG", "C.UTF-8"),
         }
+        # Model ACCESS (not operator identity): a spawned claude session needs a
+        # credential to reach the model. CLAUDE_CODE_OAUTH_TOKEN is subscription
+        # model-access only, NOT SKAGENT / memory / MCP, so it is compatible with
+        # the sandbox's no-operator-context rule and is required for the session to
+        # actually run. Passed to both profiles when present in the host env.
+        _oauth = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+        if _oauth:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = _oauth
         if profile == "full":
             # Trusted interactive session: real operator identity + home wired.
             env["HOME"] = str(self.full_home)
@@ -430,6 +442,12 @@ class ClaudeCodeHarness(Harness):
         env = self._build_env(profile, agent, worktree)
         launch = self._claude_argv(profile, prompt)
         env_argv = ["env", "-i", *[f"{k}={v}" for k, v in env.items()]]
+        # Ensure the target tmux session exists (a fresh host has no tmux server,
+        # so `new-window -t skchat-agents` would silently fail and the session
+        # would never appear in list_sessions). `new-session -d` creates it if
+        # absent; if it already exists tmux errors harmlessly and we ignore it.
+        # argv-only.
+        self._runner(["tmux", "new-session", "-d", "-s", self.tmux_session])
         # tmux new-window with the command AFTER '--' as separate argv elements is
         # exec'd DIRECTLY by tmux (no sh -c), so neither the env pairs nor the
         # prompt are ever shell-interpreted. The sid is charset-validated above.
