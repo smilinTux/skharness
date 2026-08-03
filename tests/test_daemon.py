@@ -8,10 +8,10 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from skharness.autocode.types import GateResult, RepoSpec
 from skharness.daemon import build_daemon_app
 from skharness.events import EventType, SessionEvent
 from skharness.harness import FakeHarness, SessionDescriptor
-from skharness.autocode.types import GateResult, RepoSpec
 
 
 def _harness():
@@ -80,11 +80,16 @@ def test_write_surface_is_ratify_and_inject_only():
     # + gating via the no-token path, which returns 401 BEFORE harness.inject runs.
     r = c.post("/api/v1/sessions/lumina-abc12345/inject", json={"text": "hi"})
     assert r.status_code == 401
-    # Every OTHER write must still be gone (no spawn/kill/dispatch route).
+    # No implicit session-collection write, no kill (DELETE), no replace (PUT).
     assert c.post("/api/v1/sessions", json={}, headers=h).status_code == 405
     assert c.delete("/api/v1/sessions/lumina-abc12345", headers=h).status_code == 405
     assert c.put("/api/v1/sessions/lumina-abc12345", json={}, headers=h).status_code == 405
-    assert c.post("/api/v1/dispatch", json={}, headers=h).status_code == 404
+    # Dispatch (P2 RCE surface) EXISTS now, but this bare client wires NO authz PDP
+    # and NO audit sink, so it fails CLOSED (501, not 404/405): dispatch can never
+    # actuate without both configured. The dedicated gate matrix is in test_dispatch.
+    r = c.post("/api/v1/dispatch", json={}, headers=h)
+    assert r.status_code not in (404, 405)
+    assert r.status_code == 501
     assert c.delete("/api/v1/hosts/self", headers=h).status_code == 405
 
 

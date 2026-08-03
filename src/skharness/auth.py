@@ -29,14 +29,18 @@ Verifier = Callable[[str], Any]
 
 @dataclass(frozen=True)
 class AuthContext:
-    """A verified caller's granted scopes.
+    """A verified caller's granted scopes (and, when known, its subject identity).
 
     Truthy (a frozen object), so it passes the allow gate; ``has_scope`` drives
     the read/write scope split. Honours the ``*`` wildcard, matching capauth's
-    own ``TokenPayload.has_scope``.
+    own ``TokenPayload.has_scope``. ``subject`` is the authenticated caller's fqid
+    (the token payload's subject), carried so the dispatch route can pass it to the
+    authz PDP; it defaults to ``None`` for the bool/fake verifiers that carry no
+    identity, and is NEVER read by the allow/scope gate (only by the PDP call site).
     """
 
     scopes: frozenset[str]
+    subject: str | None = None
 
     def has_scope(self, scope: str) -> bool:
         return "*" in self.scopes or scope in self.scopes

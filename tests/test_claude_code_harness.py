@@ -4,15 +4,17 @@ No real tmux, no real claude: the injectable argv runner returns canned output
 and a tmp historical dir stands in for ~/.skcapstone/agents/<agent>/sessions/.
 """
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from skharness.events import EventType
-from skharness.harness import Harness, SessionDescriptor
+from skharness.harness import Harness, HarnessSession, SessionDescriptor, SpawnRejected
 from skharness.harnesses.claude_code import (
     ClaudeCodeHarness,
     new_lines,
+    parse_repo_allowlist,
     parse_windows,
     scan_historical,
 )
@@ -298,3 +300,267 @@ async def test_inject_invalid_sid_never_touches_tmux(tmp_path):
     result = await h.inject("bad;name$(x)", "hi")
     assert result["injected"] is False
     assert "invalid" in result["reason"].lower()
+
+
+# --- parse_repo_allowlist ----------------------------------------------------
+
+
+def test_parse_repo_allowlist_empty_is_deny_all():
+    assert parse_repo_allowlist("") == []
+    assert parse_repo_allowlist(None) == []
+    assert parse_repo_allowlist("  ,  ") == []
+
+
+def test_parse_repo_allowlist_realpaths_entries(tmp_path):
+    a = tmp_path / "a"
+    a.mkdir()
+    got = parse_repo_allowlist(f"{a}, , {a}/../a")
+    # both entries canonicalize to the same realpath
+    assert got == [str(a.resolve()), str(a.resolve())]
+
+
+# --- spawn: the Dispatch unlock (RCE guards + profile-by-construction) --------
+
+
+def _tmux_recorder():
+    """A str tmux runner that records argv and returns '' (tmux new-window prints
+    nothing). Never a real tmux."""
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        return ""
+
+    return runner, calls
+
+
+def _git_ok():
+    """A git runner where check-ref-format and worktree add both succeed."""
+    calls: list[list[str]] = []
+
+    def git(argv):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    return git, calls
+
+
+def _spawn_harness(repo_root: Path, *, runner, git_runner, profile_full_cfg=False):
+    kw = dict(
+        host=".158",
+        runner=runner,
+        git_runner=git_runner,
+        dispatch_repos=[str(repo_root)],
+        worktree_root=repo_root.parent / "wt",
+        claude_bin="claude",
+        child_path="/usr/bin:/bin",
+    )
+    if profile_full_cfg:
+        kw.update(full_agent="lumina", full_home=repo_root.parent / "home",
+                  mcp_config=str(repo_root.parent / "mcp.full.json"))
+    return ClaudeCodeHarness(**kw)
+
+
+def _new_window_argv(calls):
+    for c in calls:
+        if "new-window" in c:
+            return c
+    raise AssertionError(f"no tmux new-window call recorded: {calls}")
+
+
+def _env_pairs(new_window_argv):
+    """Extract the KEY=VAL env pairs the child is handed (between 'env -i' and the
+    claude binary)."""
+    i = new_window_argv.index("env")
+    assert new_window_argv[i + 1] == "-i"
+    pairs = {}
+    for tok in new_window_argv[i + 2:]:
+        if tok == "claude":
+            break
+        k, _, v = tok.partition("=")
+        pairs[k] = v
+    return pairs
+
+
+@pytest.mark.asyncio
+async def test_spawn_sandbox_creates_worktree_named_window_and_scoped_env(tmp_path):
+    repo = tmp_path / "skharness"
+    repo.mkdir()
+    runner, tcalls = _tmux_recorder()
+    git, gcalls = _git_ok()
+    h = _spawn_harness(repo, runner=runner, git_runner=git)
+
+    desc = SessionDescriptor(repo=str(repo), branch="feat/x", model="ornith-tiny",
+                             quality="sandbox")
+    session = await h.spawn(desc, prompt="do the thing")
+
+    assert isinstance(session, HarnessSession)
+    assert session.sid.startswith("sandbox-")   # sandbox NEVER uses the real agent
+    assert session.status == "running"
+    # git worktree add ran on the allowlisted repo, on the requested branch
+    assert any(c[:4] == ["git", "-C", str(repo.resolve()), "worktree"] for c in gcalls)
+    add = next(c for c in gcalls if "worktree" in c and "add" in c)
+    assert add[-1] == "feat/x"
+    # a tmux window named exactly the sid, cwd scoped to the worktree
+    nw = _new_window_argv(tcalls)
+    assert nw[:3] == ["tmux", "new-window", "-t"]
+    assert "-n" in nw and nw[nw.index("-n") + 1] == session.sid
+    worktree = str((repo.parent / "wt" / session.sid))
+    assert nw[nw.index("-c") + 1] == worktree
+    # the command is exec'd directly (there is a '--' separator, no sh -c)
+    assert "--" in nw
+    # SANDBOX env: NO SKAGENT, HOME scoped to the worktree, no --mcp-config anywhere
+    env = _env_pairs(nw)
+    assert "SKAGENT" not in env
+    assert env["HOME"] == worktree
+    assert "--mcp-config" not in nw
+    # and nothing sk* leaked into the child env
+    assert not any(k.startswith("SK") for k in env)
+
+
+@pytest.mark.asyncio
+async def test_spawn_full_profile_wires_skagent_and_mcp(tmp_path):
+    repo = tmp_path / "skharness"
+    repo.mkdir()
+    runner, tcalls = _tmux_recorder()
+    git, _ = _git_ok()
+    h = _spawn_harness(repo, runner=runner, git_runner=git, profile_full_cfg=True)
+
+    desc = SessionDescriptor(repo=str(repo), branch="main", quality="full")
+    session = await h.spawn(desc, prompt="orchestrate")
+
+    assert session.sid.startswith("lumina-")   # full uses the real operator agent
+    nw = _new_window_argv(tcalls)
+    env = _env_pairs(nw)
+    # FULL env: SKAGENT wired, HOME is the real agent home (NOT the worktree)
+    assert env["SKAGENT"] == "lumina"
+    assert env["HOME"] == str(repo.parent / "home")
+    # sk* MCP config wired for full only
+    assert "--mcp-config" in nw
+    assert nw[nw.index("--mcp-config") + 1] == str(repo.parent / "mcp.full.json")
+
+
+@pytest.mark.asyncio
+async def test_spawn_prompt_is_data_never_shell(tmp_path):
+    repo = tmp_path / "skharness"
+    repo.mkdir()
+    runner, tcalls = _tmux_recorder()
+    git, _ = _git_ok()
+    h = _spawn_harness(repo, runner=runner, git_runner=git)
+
+    evil = "rm -rf / ; $(whoami) `id` && echo pwned"
+    await h.spawn(SessionDescriptor(repo=str(repo), branch="x", quality="sandbox"),
+                  prompt=evil)
+    nw = _new_window_argv(tcalls)
+    # the prompt survives verbatim as ONE argv element (data), never split/expanded
+    assert evil in nw
+    assert nw.count(evil) == 1
+    # no shell was ever invoked
+    joined = " ".join(nw)
+    assert "sh -c" not in joined and "/bin/sh" not in joined and "bash" not in joined
+
+
+@pytest.mark.asyncio
+async def test_spawn_rejects_repo_not_in_allowlist(tmp_path):
+    repo = tmp_path / "allowed"
+    repo.mkdir()
+    other = tmp_path / "evil"
+    other.mkdir()
+    runner, tcalls = _tmux_recorder()
+    git, gcalls = _git_ok()
+    h = _spawn_harness(repo, runner=runner, git_runner=git)
+
+    with pytest.raises(SpawnRejected, match="allowlist"):
+        await h.spawn(SessionDescriptor(repo=str(other), branch="x", quality="sandbox"),
+                      prompt="p")
+    # nothing touched: no git, no tmux
+    assert gcalls == []
+    assert tcalls == []
+
+
+@pytest.mark.asyncio
+async def test_spawn_empty_allowlist_is_deny_all(tmp_path):
+    repo = tmp_path / "skharness"
+    repo.mkdir()
+    runner, tcalls = _tmux_recorder()
+    git, gcalls = _git_ok()
+    h = ClaudeCodeHarness(host=".158", runner=runner, git_runner=git,
+                          dispatch_repos=[], worktree_root=tmp_path / "wt")
+    with pytest.raises(SpawnRejected, match="deny all"):
+        await h.spawn(SessionDescriptor(repo=str(repo), branch="x", quality="sandbox"),
+                      prompt="p")
+    assert gcalls == [] and tcalls == []
+
+
+@pytest.mark.asyncio
+async def test_spawn_rejects_bad_branch_via_check_ref_format(tmp_path):
+    repo = tmp_path / "skharness"
+    repo.mkdir()
+    runner, tcalls = _tmux_recorder()
+    gcalls: list[list[str]] = []
+
+    def git(argv):
+        gcalls.append(list(argv))
+        # check-ref-format fails; worktree add must never be reached
+        if "check-ref-format" in argv:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="bad ref")
+        raise AssertionError(f"worktree add must not run on a bad branch: {argv}")
+
+    h = _spawn_harness(repo, runner=runner, git_runner=git)
+    with pytest.raises(SpawnRejected, match="check-ref-format"):
+        await h.spawn(SessionDescriptor(repo=str(repo), branch="--evil", quality="sandbox"),
+                      prompt="p")
+    # validated the branch, never added a worktree, never opened a window
+    assert any("check-ref-format" in c for c in gcalls)
+    assert all("worktree" not in c for c in gcalls)
+    assert tcalls == []
+
+
+@pytest.mark.asyncio
+async def test_spawn_rejects_bad_charset_agent_name(tmp_path):
+    repo = tmp_path / "skharness"
+    repo.mkdir()
+    runner, tcalls = _tmux_recorder()
+    git, gcalls = _git_ok()
+    # a full-profile agent name with shell/charset-breaking chars
+    h = ClaudeCodeHarness(host=".158", runner=runner, git_runner=git,
+                          dispatch_repos=[str(repo)], worktree_root=tmp_path / "wt",
+                          full_agent="bad;name$(x)")
+    with pytest.raises(SpawnRejected, match="charset"):
+        await h.spawn(SessionDescriptor(repo=str(repo), branch="main", quality="full"),
+                      prompt="p")
+    assert tcalls == []
+
+
+@pytest.mark.asyncio
+async def test_spawn_rejects_invalid_profile(tmp_path):
+    repo = tmp_path / "skharness"
+    repo.mkdir()
+    runner, tcalls = _tmux_recorder()
+    git, gcalls = _git_ok()
+    h = _spawn_harness(repo, runner=runner, git_runner=git)
+    with pytest.raises(SpawnRejected, match="profile"):
+        await h.spawn(SessionDescriptor(repo=str(repo), branch="x", quality="root"),
+                      prompt="p")
+    assert gcalls == [] and tcalls == []
+
+
+@pytest.mark.asyncio
+async def test_spawn_worktree_add_failure_is_rejected_no_window(tmp_path):
+    repo = tmp_path / "skharness"
+    repo.mkdir()
+    runner, tcalls = _tmux_recorder()
+
+    def git(argv):
+        if "check-ref-format" in argv:
+            return subprocess.CompletedProcess(argv, 0)
+        if "worktree" in argv:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="fatal: exists")
+        return subprocess.CompletedProcess(argv, 0)
+
+    h = _spawn_harness(repo, runner=runner, git_runner=git)
+    with pytest.raises(SpawnRejected, match="worktree add failed"):
+        await h.spawn(SessionDescriptor(repo=str(repo), branch="x", quality="sandbox"),
+                      prompt="p")
+    # worktree add failed => NO tmux window opened
+    assert tcalls == []

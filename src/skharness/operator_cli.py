@@ -32,7 +32,8 @@ Actions:
   - kill-runaway-session (NOT standard, reversible false): escalates as MAJOR by
     the irreversibility rule, so the CLI refuses to act and reports the escalation.
   - pause-dispatch (not standard, reversible, low): the emergency brake on the RCE
-    surface once dispatch (P2) exists; not enabled here.
+    surface (dispatch P2). Flips a persisted flag; while set, POST /dispatch returns
+    503 regardless of auth. --resume clears it.
 
 Every probe fails SAFE (reports healthy) when hostd is unreachable, mirroring the
 adapter's ``_probe_hostd``. The observe probe and the act runner/harness are all
@@ -47,6 +48,8 @@ import json
 import os
 import subprocess
 import sys
+import time
+from pathlib import Path
 from typing import Callable
 
 # --- contract constants (mirror operator_seat/skcode_adapter.py) --------------
@@ -103,6 +106,45 @@ _ACTION_NAMES = {a["name"] for a in _ACTIONS}
 def _b(value: bool) -> str:
     """Render a bool as the contract's string status ('True' | 'False')."""
     return "True" if value else "False"
+
+
+# --- dispatch emergency brake: a simple persisted flag hostd reads -----------
+
+
+def dispatch_pause_path() -> Path:
+    """The persisted dispatch-pause flag file.
+
+    Rooted at ``SKCODE_STATE_DIR`` when set (tests point it at a tmp dir), else
+    ``~/.skcapstone/skcode``. The flag is presence-based: the file EXISTS iff
+    dispatch is paused. The daemon reads it via :func:`dispatch_is_paused` and,
+    while it exists, POST /api/v1/dispatch returns 503 regardless of auth.
+    """
+    root = os.environ.get("SKCODE_STATE_DIR")
+    base = Path(root) if root else Path.home() / ".skcapstone" / "skcode"
+    return base / "dispatch.paused"
+
+
+def dispatch_is_paused() -> bool:
+    """True iff the dispatch-pause flag file exists (the emergency brake is on)."""
+    return dispatch_pause_path().exists()
+
+
+def set_dispatch_paused(paused: bool) -> Path:
+    """Flip the persisted dispatch-pause flag on (create) or off (remove).
+
+    Reversible by construction: pausing writes the flag file, resuming removes it.
+    Returns the flag path either way.
+    """
+    p = dispatch_pause_path()
+    if paused:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"paused_at": time.time()}), encoding="utf-8")
+    else:
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+    return p
 
 
 # --- pure probe logic (unit-tested directly, mirrors the adapter) ------------
@@ -234,6 +276,7 @@ def operator_act(
     *,
     runner: Callable[[list[str]], object] | None = None,
     harness=None,
+    resume: bool = False,
 ) -> dict:
     """Perform a reversible standard skcode action; report the outcome as a dict.
 
@@ -246,7 +289,9 @@ def operator_act(
       rather than doing anything destructive.
     - ``kill-runaway-session`` is NOT standard and irreversible: it escalates as
       MAJOR by construction, so the CLI refuses to act and returns the escalation.
-    - ``pause-dispatch`` waits on the dispatch (P2) surface: not enabled here.
+    - ``pause-dispatch`` flips the persisted dispatch-pause flag on (the RCE
+      emergency brake); ``resume=True`` clears it. While set, the daemon returns
+      503 for every POST /dispatch regardless of auth.
 
     Raises ``ValueError`` on an unknown action (the caller refuses cleanly).
     """
@@ -297,13 +342,21 @@ def operator_act(
             ),
         }
 
-    # pause-dispatch
+    # pause-dispatch: the emergency brake on the RCE surface (spec 7.5). Flips the
+    # persisted flag ON so the daemon returns 503 for every POST /dispatch,
+    # regardless of auth. Reversible: pass resume=True (the CLI --resume flag) to
+    # remove the flag and re-arm dispatch.
+    paused = not resume
+    path = set_dispatch_paused(paused)
     return {
-        "performed": False,
+        "performed": True,
         "action": action,
-        "enabled": False,
+        "paused": paused,
+        "flag": str(path),
         "reason": (
-            "pause-dispatch waits on the dispatch (P2) surface and is not enabled"
+            "dispatch paused: POST /api/v1/dispatch now returns 503 regardless of auth"
+            if paused else
+            "dispatch resumed: the pause flag was cleared"
         ),
     }
 
@@ -322,6 +375,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_act = sub.add_parser("act", help="perform a reversible standard action")
     p_act.add_argument("action", help="one of: " + ", ".join(sorted(_ACTION_NAMES)))
     p_act.add_argument("--session", default=None, help="session id (for archive/kill)")
+    p_act.add_argument("--resume", action="store_true",
+                       help="for pause-dispatch: clear the pause flag (re-arm dispatch)")
     return parser
 
 
@@ -345,7 +400,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # act
     try:
-        result = operator_act(args.action, session=args.session)
+        result = operator_act(args.action, session=args.session, resume=args.resume)
     except ValueError as e:
         print(str(e), file=sys.stderr)
         return 2

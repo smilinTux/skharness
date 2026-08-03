@@ -8,13 +8,15 @@ from __future__ import annotations
 
 import argparse
 import base64
+import json
 import os
 import sys
+import time
 from pathlib import Path
 
 from skharness.auth import AuthContext, Verifier
 from skharness.daemon import build_daemon_app
-from skharness.harnesses.claude_code import ClaudeCodeHarness
+from skharness.harnesses.claude_code import ClaudeCodeHarness, parse_repo_allowlist
 
 DEFAULT_PORT = 9394
 
@@ -22,6 +24,9 @@ _WILDCARD = {"0.0.0.0", "::"}
 
 # The audience a wire token must be scoped to for skcode-hostd (spec R4.2).
 SKCODE_AUDIENCE = "skcode"
+
+# The capability the dispatch PDP decides on (spec 7.4).
+DISPATCH_CAPABILITY = "skcode.dispatch"
 
 # Env flag that opts INTO the real capauth verifier. Unset/off keeps the P0
 # deny-all placeholder, so the RCE surface stays gated by default (R2.4).
@@ -85,14 +90,96 @@ def build_capauth_verifier(home: Path | None = None) -> Verifier:
             if not verify_audience_token(signed, SKCODE_AUDIENCE, home=home):
                 return False
             # Verified: expose the token's granted scopes so routes can split
-            # read (skcode.stream) from write (skcode.inject).
-            return AuthContext(scopes=frozenset(signed.payload.capabilities or ()))
+            # read (skcode.stream) from write (skcode.inject), plus the subject
+            # fqid so the dispatch route can pass it to the authz PDP.
+            return AuthContext(
+                scopes=frozenset(signed.payload.capabilities or ()),
+                subject=getattr(signed.payload, "subject", None),
+            )
         except Exception:
             # Fail closed on ANY error: bad base64, bad JSON, bad token, keyring
             # miss, etc. Never let a caller through on an exception.
             return False
 
     return _verify
+
+
+def skcode_state_dir() -> Path:
+    """The per-host skcode state dir (pause flag, audit log, worktrees live here).
+
+    Rooted at ``SKCODE_STATE_DIR`` when set (tests point it at a tmp dir),
+    otherwise ``~/.skcapstone/skcode``.
+    """
+    root = os.environ.get("SKCODE_STATE_DIR")
+    return Path(root) if root else Path.home() / ".skcapstone" / "skcode"
+
+
+def build_audit_log():
+    """A structured audit sink for the dispatch surface (spec 7.4).
+
+    Appends one JSON line per event to ``<state>/audit.log``. The dispatch route
+    REQUIRES an audit sink to be configured (fails closed to 501 without one), so
+    every allow/deny/spawn/reject is recorded. Best-effort on I/O errors: an audit
+    write failure must never crash the daemon, but the sink is always present.
+    """
+    path = skcode_state_dir() / "audit.log"
+
+    def _audit(line: str) -> None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"ts": time.time(), "record": line}) + "\n")
+        except OSError:
+            pass
+
+    return _audit
+
+
+def build_dispatch_authorizer(home: Path | None = None):
+    """Wire the real capauth authz PDP for the dispatch capability (spec 7.4).
+
+    Returns a callable ``(subject, resource, context) -> Decision`` that delegates
+    to ``capauth.authz.decide`` with a rule table that ADDS a ``skcode.dispatch``
+    rule (VERIFIED enrollment, RCE being the most sensitive capability) on top of
+    capauth's seeded defaults. This adds no policy engine of its own: the daemon is
+    the PEP, capauth is the PDP. The decision carries the mandatory audit
+    obligation the daemon then writes.
+
+    Fails closed: if capauth cannot be imported, returns None so the daemon denies
+    dispatch (501 authz-not-configured) rather than allowing it unauthenticated.
+    """
+    try:
+        from capauth.authz import DEFAULT_RULES, CapabilityRule, decide
+        from capauth.pairing import EnrollmentMode
+    except Exception:
+        return None
+
+    rules = dict(DEFAULT_RULES)
+    rules[DISPATCH_CAPABILITY] = CapabilityRule(
+        capability=DISPATCH_CAPABILITY,
+        required_capability=DISPATCH_CAPABILITY,
+        minimum_mode=EnrollmentMode.VERIFIED,
+        description="Spawn a NEW agent session (RCE): most sensitive, verified only.",
+    )
+
+    def _authorize(subject: str, resource: dict, context: dict):
+        return decide(subject, DISPATCH_CAPABILITY, resource, context,
+                      base_dir=home, rules=rules)
+
+    return _authorize
+
+
+def build_dispatch_targets():
+    """Advisory targets provider: the repos on this host's dispatch allowlist.
+
+    Truthful to the server-side allowlist (SKCODE_DISPATCH_REPOS), so the UI only
+    offers repos the daemon would actually accept. Advisory only; /dispatch
+    re-enforces the allowlist in the harness spawn guard.
+    """
+    def _targets() -> dict:
+        return {"repos": parse_repo_allowlist(os.environ.get("SKCODE_DISPATCH_REPOS", ""))}
+
+    return _targets
 
 
 def select_verifier() -> Verifier:
@@ -137,10 +224,21 @@ def _serve(argv: list[str]) -> None:
     args = parser.parse_args(argv)
 
     host = resolve_bind(args.host)
-    harness = ClaudeCodeHarness(host=args.host_id)
+    # The harness reads its dispatch allowlist from SKCODE_DISPATCH_REPOS by default
+    # (empty => deny all) and scopes worktrees under the skcode state dir.
+    harness = ClaudeCodeHarness(
+        host=args.host_id,
+        worktree_root=skcode_state_dir() / "worktrees",
+    )
+    from skharness.operator_cli import dispatch_is_paused
+
     app = build_daemon_app(
         harness=harness,
         verify_caller=select_verifier(),
         host_id=args.host_id,
+        audit_log=build_audit_log(),
+        authorize_dispatch=build_dispatch_authorizer(),
+        dispatch_targets=build_dispatch_targets(),
+        dispatch_paused=dispatch_is_paused,
     )
     uvicorn.run(app, host=host, port=args.port)

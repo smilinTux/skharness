@@ -25,26 +25,68 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import secrets
 import subprocess
 import time
 from pathlib import Path
 from typing import AsyncIterator, Callable
 
 from skharness.events import EventType, SessionEvent
-from skharness.harness import Harness, HarnessCapabilities, SessionDescriptor
+from skharness.harness import (
+    Harness,
+    HarnessCapabilities,
+    HarnessSession,
+    SessionDescriptor,
+    SpawnRejected,
+)
 
 Runner = Callable[[list[str]], str]
+#: A git runner returns a CompletedProcess so spawn can read the RETURNCODE (a
+#: bad branch / a failed worktree add must be observable), unlike the str tmux
+#: runner. Injectable so tests never touch a real repo.
+GitRunner = Callable[[list[str]], "subprocess.CompletedProcess"]
 
 _SID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _HARNESS = "claude-code"
 _MONITOR_WINDOW = "monitor"
 _DEFAULT_SESSIONS_ROOT = Path.home() / ".skcapstone" / "agents"
+_DEFAULT_WORKTREE_ROOT = Path.home() / ".skcapstone" / "skcode" / "worktrees"
+#: A minimal PATH handed to a spawned child (env -i wipes the environment, so a
+#: child needs an explicit PATH to resolve `claude`, `git`, etc.).
+_DEFAULT_CHILD_PATH = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
 
 
 def _default_runner(argv: list[str]) -> str:
     proc = subprocess.run(argv, capture_output=True, text=True, check=False)
     return proc.stdout
+
+
+def _default_git_runner(argv: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(argv, capture_output=True, text=True, check=False)
+
+
+def parse_repo_allowlist(value) -> list[str]:
+    """Parse the SKCODE_DISPATCH_REPOS allowlist into realpath'd repo roots.
+
+    ``value`` is either a comma-separated string (the env form) or a list. Blank
+    entries are dropped and every entry is normalized with ``os.path.realpath`` so
+    the membership check in :meth:`ClaudeCodeHarness.spawn` compares canonical
+    paths (defeats ``..`` / symlink games). An empty / unset allowlist yields ``[]``,
+    which spawn treats as DENY ALL (fail closed): no repo can be dispatched until
+    the operator explicitly lists one.
+    """
+    if not value:
+        return []
+    items = value.split(",") if isinstance(value, str) else list(value)
+    out: list[str] = []
+    for raw in items:
+        entry = (raw or "").strip()
+        if not entry:
+            continue
+        out.append(os.path.realpath(os.path.expanduser(entry)))
+    return out
 
 
 def parse_windows(out: str, *, host: str) -> list[SessionDescriptor]:
@@ -122,6 +164,16 @@ class ClaudeCodeHarness(Harness):
         runner: Runner | None = None,
         poll_interval: float = 1.0,
         max_polls: int | None = None,
+        # --- dispatch (spawn) config (skcode P2) ---
+        dispatch_repos=None,
+        worktree_root: Path | None = None,
+        git_runner: GitRunner | None = None,
+        claude_bin: str = "claude",
+        claude_base_args: list[str] | None = None,
+        full_agent: str | None = None,
+        full_home: Path | None = None,
+        mcp_config: str | None = None,
+        child_path: str | None = None,
     ) -> None:
         self.host = host
         self.tmux_session = tmux_session
@@ -129,9 +181,24 @@ class ClaudeCodeHarness(Harness):
         self._runner = runner or _default_runner
         self.poll_interval = poll_interval
         self.max_polls = max_polls
+        # Dispatch config. The allowlist defaults to the SKCODE_DISPATCH_REPOS env
+        # (comma list); unset => empty => DENY ALL. Never falls open.
+        raw_allow = dispatch_repos if dispatch_repos is not None else os.environ.get(
+            "SKCODE_DISPATCH_REPOS", "")
+        self.dispatch_repos = parse_repo_allowlist(raw_allow)
+        self.worktree_root = Path(worktree_root) if worktree_root else _DEFAULT_WORKTREE_ROOT
+        self._git = git_runner or _default_git_runner
+        self.claude_bin = claude_bin
+        self.claude_base_args = list(claude_base_args) if claude_base_args else []
+        # For the FULL profile only: the real operator identity + home. For SANDBOX
+        # these are never wired (enforced by absence, not by a flag), see _build_env.
+        self.full_agent = (full_agent or os.environ.get("SKAGENT") or "lumina").strip()
+        self.full_home = Path(full_home) if full_home else Path.home()
+        self.mcp_config = mcp_config
+        self.child_path = child_path or _DEFAULT_CHILD_PATH
 
     def capabilities(self) -> HarnessCapabilities:
-        # Read-only session plane over a PTY (tmux). No task plane, no writes.
+        # Session plane over a PTY (tmux): reads + P1 inject/archive + P2 spawn.
         return {"session_resume": True, "structured_output": "none",
                 "sandbox": False, "tool_restrictions": False,
                 "task_plane": False, "session_plane": True,
@@ -235,6 +302,143 @@ class ClaudeCodeHarness(Harness):
         # charset-validated above, so nothing here is shell-interpolated.
         self._runner(["tmux", "send-keys", "-t", target, text, "Enter"])
         return {"sid": sid, "injected": True}
+
+    # --- spawn: start a NEW session (the Dispatch unlock, skcode P2) -----------
+
+    def _branch_ok(self, branch: str) -> bool:
+        """Validate a branch name via ``git check-ref-format --branch`` (argv).
+
+        This is git's own ref-name validator, so it rejects everything git would
+        (leading '-', '..', control chars, trailing '.lock', etc.). Runs through the
+        injectable git runner (never a shell), and returns True only on rc == 0.
+        """
+        if not branch or not isinstance(branch, str):
+            return False
+        try:
+            r = self._git(["git", "check-ref-format", "--branch", branch])
+        except Exception:
+            return False
+        return getattr(r, "returncode", 1) == 0
+
+    def _build_env(self, profile: str, agent: str, worktree: Path) -> dict[str, str]:
+        """Construct the child's ENTIRE environment for a profile (spec 6.2).
+
+        Enforcement is by CONSTRUCTION, not by a flag: the returned dict is the
+        complete environment the child gets (it is handed to ``env -i`` so nothing
+        is inherited). The SANDBOX profile therefore has NO ``SKAGENT`` and no sk*
+        wiring at all, and its ``HOME`` points at the worktree so ``~/.skcapstone``
+        resolves into the (empty) worktree rather than the real agent home. The FULL
+        profile wires ``SKAGENT`` and the real ``HOME``. A bug that flipped a flag
+        could never leak Lumina's identity/memory into a sandbox, because the
+        sandbox env simply does not contain it.
+        """
+        env = {
+            "PATH": self.child_path,
+            "TERM": "xterm-256color",
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+        }
+        if profile == "full":
+            # Trusted interactive session: real operator identity + home wired.
+            env["HOME"] = str(self.full_home)
+            env["SKAGENT"] = agent
+        else:
+            # SANDBOX: no SKAGENT, no sk* MCP, HOME scoped to the worktree so no
+            # home-dir sk* path (~/.skcapstone/...) is reachable.
+            env["HOME"] = str(worktree)
+        return env
+
+    def _claude_argv(self, profile: str, prompt: str) -> list[str]:
+        """Build the ``claude`` launch argv. The prompt is a distinct argv element
+        (DATA), never interpolated into a shell string. The sk* MCP config is added
+        ONLY for the full profile; the sandbox profile never references it.
+        """
+        argv = [self.claude_bin, *self.claude_base_args]
+        if profile == "full" and self.mcp_config:
+            argv += ["--mcp-config", str(self.mcp_config)]
+        # Prompt LAST, as its own argv value. tmux new-window '--' execs the argv
+        # directly (verified: no sh -c), so the prompt is never shell-parsed.
+        argv += [str(prompt or "")]
+        return argv
+
+    async def spawn(self, desc: SessionDescriptor, *, prompt: str) -> HarnessSession:
+        """Start a NEW claude-code session in an isolated worktree + tmux window.
+
+        Every RCE input guard (spec 7.3) runs BEFORE any subprocess, and each fails
+        CLOSED with :class:`SpawnRejected` (never a silent proceed):
+
+        1. profile is one of {sandbox, full};
+        2. repo is on the per-host allowlist (canonical-path match; empty allowlist
+           denies all);
+        3. branch passes ``git check-ref-format --branch``;
+        4. the composed ``<agent>-<id>`` name matches ``[A-Za-z0-9_-]+``.
+
+        Only then does it ``git worktree add`` the repo+branch under the scoped
+        worktree root and open a tmux window running ``claude`` with a
+        construction-enforced profile environment (``env -i`` + the exact env from
+        :meth:`_build_env`). All subprocess calls are argv lists (never shell). The
+        returned :class:`HarnessSession` carries the sid = the tmux window name, so
+        the new session shows up in :meth:`list_sessions`.
+        """
+        profile = (desc.quality or "sandbox").strip().lower()
+        if profile not in ("sandbox", "full"):
+            raise SpawnRejected(f"invalid profile {profile!r} (want 'sandbox' or 'full')")
+
+        # 2. repo allowlist (fail closed on an empty allowlist).
+        if not self.dispatch_repos:
+            raise SpawnRejected("repo allowlist is empty (SKCODE_DISPATCH_REPOS unset): deny all")
+        repo = (desc.repo or "").strip()
+        if not repo:
+            raise SpawnRejected("missing repo")
+        repo_real = os.path.realpath(os.path.expanduser(repo))
+        if repo_real not in self.dispatch_repos:
+            raise SpawnRejected(f"repo {repo!r} is not on the dispatch allowlist")
+
+        # 3. branch via git's own validator.
+        branch = (desc.branch or "").strip()
+        if not self._branch_ok(branch):
+            raise SpawnRejected(f"branch {branch!r} failed git check-ref-format")
+
+        # 4. name charset. The agent prefix is the real identity for FULL and a
+        #    fixed 'sandbox' for SANDBOX (never the real identity), plus a random id.
+        agent = self.full_agent if profile == "full" else "sandbox"
+        if not _SID_RE.match(agent):
+            raise SpawnRejected(f"agent name {agent!r} breaks the [A-Za-z0-9_-]+ charset")
+        sid = f"{agent}-{secrets.token_hex(4)}"
+        if not _SID_RE.match(sid):
+            raise SpawnRejected(f"session name {sid!r} breaks the [A-Za-z0-9_-]+ charset")
+
+        # --- all guards passed: now (and only now) touch the machine ---
+        worktree = self.worktree_root / sid
+        try:
+            self.worktree_root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        wt = self._git(["git", "-C", repo_real, "worktree", "add", str(worktree), branch])
+        if getattr(wt, "returncode", 1) != 0:
+            raise SpawnRejected(
+                f"git worktree add failed: {getattr(wt, 'stderr', '') or 'unknown error'}")
+
+        env = self._build_env(profile, agent, worktree)
+        launch = self._claude_argv(profile, prompt)
+        env_argv = ["env", "-i", *[f"{k}={v}" for k, v in env.items()]]
+        # tmux new-window with the command AFTER '--' as separate argv elements is
+        # exec'd DIRECTLY by tmux (no sh -c), so neither the env pairs nor the
+        # prompt are ever shell-interpreted. The sid is charset-validated above.
+        self._runner([
+            "tmux", "new-window", "-t", self.tmux_session, "-n", sid,
+            "-c", str(worktree), "--", *env_argv, *launch,
+        ])
+
+        return HarnessSession(
+            sid=sid,
+            descriptor=SessionDescriptor(
+                sid=sid, host=self.host, harness=self.name, repo=repo_real,
+                branch=branch, model=desc.model, state="running", quality=profile,
+                permission_mode=desc.permission_mode,
+            ),
+            status="running",
+            branch=branch,
+        )
 
     async def stream(self, sid: str) -> AsyncIterator[SessionEvent]:
         now = time.time()

@@ -58,6 +58,19 @@ if TYPE_CHECKING:                               # task-plane types (no runtime i
     )
 
 
+class SpawnRejected(ValueError):  # noqa: N818  (raised-participle name, as ClaimRaced)
+    """Raised by a Harness.spawn when a dispatch request fails an RCE input guard.
+
+    This is the input-validation floor that stands INDEPENDENT of auth (spec
+    7.3): even a fully authenticated, authorized caller is refused here when the
+    repo is not on the per-host allowlist, the branch fails ``git
+    check-ref-format``, or the agent/session name breaks the ``[A-Za-z0-9_-]+``
+    charset. The daemon maps it to an HTTP 400 (bad request), never a 5xx, and
+    NOTHING is spawned. Fail closed: any uncertainty raises this rather than
+    proceeding to a subprocess.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Capability shape
 # ---------------------------------------------------------------------------
@@ -102,7 +115,8 @@ class SessionDescriptor:
     state: str = "running"           # "running" | "idle" | "ended" | "spawning"
     last_activity: float = 0.0       # epoch seconds of last observed activity
     last_message: str = ""           # last assistant line (for the list preview)
-    quality: str = "sandbox"         # quality mode: "full" | "sandbox"
+    quality: str = "sandbox"         # profile / quality tier: "full" | "sandbox"
+    permission_mode: str = "manual"  # per-action approval posture: "manual" | "auto"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -367,5 +381,5 @@ __all__ = [
     "register_harness", "build_harness", "warn_missing_capabilities",
     "SessionTaskBridge", "TaskSessionShim", "FakeHarness",
     "SessionDescriptor", "HarnessSession", "SessionEvent", "EventType",
-    "InputMessage", "BackgroundTask",
+    "InputMessage", "BackgroundTask", "SpawnRejected",
 ]

@@ -291,11 +291,36 @@ def test_act_kill_runaway_escalates_without_acting():
     assert "MAJOR" in result["reason"]
 
 
-def test_act_pause_dispatch_reports_not_enabled():
+def test_act_pause_dispatch_sets_the_persisted_flag(tmp_path, monkeypatch):
+    # pause-dispatch is now WIRED (P2): it flips the persisted emergency-brake flag
+    # on, which the daemon reads to 503 every POST /dispatch regardless of auth.
+    monkeypatch.setenv("SKCODE_STATE_DIR", str(tmp_path))
+    assert op.dispatch_is_paused() is False
     result = op.operator_act("pause-dispatch")
-    assert result["performed"] is False
-    assert result["enabled"] is False
-    assert "dispatch" in result["reason"].lower()
+    assert result["performed"] is True
+    assert result["paused"] is True
+    assert op.dispatch_is_paused() is True
+    assert (tmp_path / "dispatch.paused").exists()
+
+
+def test_act_pause_dispatch_resume_clears_the_flag(tmp_path, monkeypatch):
+    monkeypatch.setenv("SKCODE_STATE_DIR", str(tmp_path))
+    op.set_dispatch_paused(True)
+    assert op.dispatch_is_paused() is True
+    result = op.operator_act("pause-dispatch", resume=True)
+    assert result["performed"] is True
+    assert result["paused"] is False
+    assert op.dispatch_is_paused() is False
+    assert not (tmp_path / "dispatch.paused").exists()
+
+
+def test_cli_act_pause_dispatch_exits_zero_and_persists(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("SKCODE_STATE_DIR", str(tmp_path))
+    rc = op.main(["act", "pause-dispatch"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["paused"] is True
+    assert op.dispatch_is_paused() is True
 
 
 def test_act_unknown_action_refuses_cleanly():
