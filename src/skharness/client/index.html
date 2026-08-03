@@ -123,14 +123,6 @@
       </select>
       <div class="hint">richer model routing arrives with the skgateway update</div>
     </div>
-    <div class="field">
-      <label for="mode">mode</label>
-      <select id="mode">
-        <option value="interactive">interactive (stays open, chat-like)</option>
-        <option value="direct">direct (fast, one-shot)</option>
-      </select>
-      <div class="hint">interactive stays open for follow-ups; direct answers once then ends</div>
-    </div>
   </div>
   <div class="field prompt-field">
     <label for="prompt">prompt</label>
@@ -363,7 +355,9 @@ var branchEl = document.getElementById("branch");
 var profileEl = document.getElementById("profile");
 var harnessEl = document.getElementById("harness");
 var modelEl = document.getElementById("model");
-var modeEl = document.getElementById("mode");
+// Sessions are always interactive (stays open, chat-like) from the UI. The
+// backend still supports a one-shot "direct" mode, reserved for the fast/cheap
+// skgateway model path (a follow-on), so it is not offered as a picker here.
 var promptEl = document.getElementById("prompt");
 var dispatchBtn = document.getElementById("dispatch-btn");
 var composeMsg = document.getElementById("compose-msg");
@@ -452,7 +446,7 @@ function dispatchSubmit() {
     branch: repo ? (branchEl.value.trim() || "main") : "",
     profile: profileEl.value || "sandbox",
     permission_mode: "manual",
-    mode: modeEl.value || "direct",
+    mode: "interactive",
     prompt: prompt
   };
   dispatchBtn.disabled = true;
