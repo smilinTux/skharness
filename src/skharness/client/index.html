@@ -378,15 +378,21 @@ function loadTargets() {
       fillSelect(harnessEl, harnesses);
       fillSelect(profileEl, j.profiles || ["sandbox", "full"]);
       var repos = j.repos || [];
-      if (repos.length) {
-        repoUsesText = false;
-        repoSel.style.display = "";
-        repoText.style.display = "none";
-        fillSelect(repoSel, repos);
-        repoHint.textContent = "";
-      } else {
-        useRepoText("No advisory repo list; enter a repo the host allows.");
-      }
+      repoUsesText = false;
+      repoSel.style.display = "";
+      repoText.style.display = "none";
+      fillSelect(repoSel, repos);
+      // Prepend a "direct (no repo)" option and default to it: a fast, isolated
+      // scratch session (model Q&A) with no repo access. Pick a repo instead to
+      // start a coding session in an isolated worktree off its base branch.
+      var directOpt = document.createElement("option");
+      directOpt.value = "";
+      directOpt.textContent = "direct (no repo)";
+      repoSel.insertBefore(directOpt, repoSel.firstChild);
+      repoSel.value = "";
+      repoHint.textContent = repos.length
+        ? "direct = fast model session (no repo); or pick an allowed repo for a coding session"
+        : "direct model session (no repo)";
     })
     .catch(function () { useRepoText("Repo list unavailable; enter a repo the host allows."); });
 }
@@ -399,12 +405,11 @@ function dispatchSubmit() {
   var prompt = promptEl.value.trim();
   if (!prompt) { setComposeMsg("Prompt is required.", true); return; }
   var repo = currentRepo();
-  if (!repo) { setComposeMsg("Repo is required.", true); return; }
   var payload = {
     harness: harnessEl.value || "claude-code",
     model: modelEl.value || "sk-default",
     repo: repo,
-    branch: branchEl.value.trim() || "main",
+    branch: repo ? (branchEl.value.trim() || "main") : "",
     profile: profileEl.value || "sandbox",
     permission_mode: "manual",
     prompt: prompt
