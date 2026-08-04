@@ -148,9 +148,18 @@ def parse_windows(out: str, *, host: str) -> list[SessionDescriptor]:
     return sessions
 
 
-def scan_historical(sessions_root, *, host: str, limit: int = 50) -> list[SessionDescriptor]:
+#: The agent session archive is SHARED (jarvis heartbeats, cron dumps, etc.), not
+#: skcode-only, so it fills with non-interactive records that are noise in the Code
+#: list. Skip the obvious machine-generated ones (request dumps, cron rollups, the
+#: bare ``sessions`` index) so the list shows real coding sessions.
+_HISTORICAL_SKIP = re.compile(r"(?:request_dump|_cron_|^sessions$)")
+
+
+def scan_historical(sessions_root, *, host: str, limit: int = 20) -> list[SessionDescriptor]:
     """Enumerate ~/.skcapstone/agents/<agent>/sessions/*.json (or *.jsonl) as
-    ended SessionDescriptors (state='ended'), newest first, capped at `limit`."""
+    ended SessionDescriptors (state='ended'), newest first, capped at `limit`.
+    Machine-generated records (cron dumps, request dumps) are filtered out, see
+    :data:`_HISTORICAL_SKIP`."""
     root = Path(sessions_root)
     if not root.exists():
         return []
@@ -161,6 +170,8 @@ def scan_historical(sessions_root, *, host: str, limit: int = 50) -> list[Sessio
             continue
         for f in sdir.iterdir():
             if f.suffix not in (".json", ".jsonl"):
+                continue
+            if _HISTORICAL_SKIP.search(f.stem):
                 continue
             try:
                 mtime = f.stat().st_mtime
