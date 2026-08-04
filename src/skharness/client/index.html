@@ -66,6 +66,7 @@
   #compose .field { display: flex; flex-direction: column; gap: 4px; }
   #compose label { color: var(--muted); font-size: 12px; }
   #compose .hint { color: var(--muted); font-size: 11px; }
+  #compose .hint.warn { color: var(--warn); }
   #compose select, #compose input, #compose textarea {
     background: #151515; color: var(--fg); border: 1px solid var(--line);
     border-radius: 4px; padding: 6px 8px; font: inherit; }
@@ -125,10 +126,10 @@
     <div class="field">
       <label for="profile">profile</label>
       <select id="profile">
-        <option value="sandbox">sandbox</option>
-        <option value="full">full</option>
+        <option value="sandbox">sandbox (isolated clean-room)</option>
+        <option value="full">full (your real environment)</option>
       </select>
-      <div class="hint">sandbox = no operator identity/memory, full = wired</div>
+      <div class="hint" id="profile-hint"></div>
     </div>
     <div class="field">
       <label for="harness">harness</label>
@@ -411,6 +412,25 @@ var repoText = document.getElementById("repo-text");
 var repoHint = document.getElementById("repo-hint");
 var branchEl = document.getElementById("branch");
 var profileEl = document.getElementById("profile");
+var profileHintEl = document.getElementById("profile-hint");
+// Make the profile choice, and its consequences, explicit. FULL runs as the
+// operator (real HOME + tools + repos), so surface the skvault reminder: a
+// session cannot unlock the vault itself, and full-profile work that needs
+// secrets fails silently until the operator unlocks it out of band.
+function updateProfileHint() {
+  if (profileEl.value === "full") {
+    profileHintEl.textContent = "runs as YOU: your real HOME, tools/MCP, and repos. "
+      + "If the task needs secrets, unlock skvault first (skvault unlock), a session "
+      + "cannot unlock it for you. Treat it like handing over your terminal.";
+    profileHintEl.className = "hint warn";
+  } else {
+    profileHintEl.textContent = "isolated clean-room: no SKAGENT, no MCP, no skvault "
+      + "or repo access. Good for questions and scratch work.";
+    profileHintEl.className = "hint";
+  }
+}
+profileEl.addEventListener("change", updateProfileHint);
+updateProfileHint();
 var harnessEl = document.getElementById("harness");
 var modelEl = document.getElementById("model");
 // Sessions are always interactive (stays open, chat-like) from the UI. The
