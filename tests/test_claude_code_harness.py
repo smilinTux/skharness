@@ -13,6 +13,7 @@ from skharness.events import EventType
 from skharness.harness import Harness, HarnessSession, SessionDescriptor, SpawnRejected
 from skharness.harnesses.claude_code import (
     ClaudeCodeHarness,
+    is_gateway_model,
     map_model,
     new_lines,
     parse_repo_allowlist,
@@ -346,7 +347,8 @@ def _git_ok():
     return git, calls
 
 
-def _spawn_harness(repo_root: Path, *, runner, git_runner, profile_full_cfg=False):
+def _spawn_harness(repo_root: Path, *, runner, git_runner, profile_full_cfg=False,
+                   gateway_base=None, gateway_token=None):
     kw = dict(
         host=".158",
         runner=runner,
@@ -356,6 +358,10 @@ def _spawn_harness(repo_root: Path, *, runner, git_runner, profile_full_cfg=Fals
         claude_bin="claude",
         child_path="/usr/bin:/bin",
     )
+    if gateway_base is not None:
+        kw["gateway_base"] = gateway_base
+    if gateway_token is not None:
+        kw["gateway_token"] = gateway_token
     if profile_full_cfg:
         kw.update(full_agent="lumina", full_home=repo_root.parent / "home",
                   mcp_config=str(repo_root.parent / "mcp.full.json"))
@@ -650,16 +656,82 @@ async def test_spawn_rejects_invalid_mode(tmp_path):
     assert gcalls == [] and tcalls == []
 
 
-def test_map_model_maps_the_four_compose_ids():
-    # the compose form's four ids map onto concrete `claude --model` values
+def test_map_model_routes_gateway_ids_to_gateway_model_names():
+    # Anthropic ids resolve to concrete `claude --model` values.
     assert map_model("claude-sonnet-5") == "sonnet"
     assert map_model("claude-opus-4-8") == "opus"
-    assert map_model("sk-default") == "sonnet"      # default tier for now
-    assert map_model("ornith-big") == "sonnet"      # non-Anthropic => sonnet fallback
-    # unknown / empty never left blank (spawn always passes --model)
+    # Gateway ids now resolve to the model NAME skgateway routes on (via the
+    # Anthropic /v1/messages frontend), not a sonnet placeholder.
+    assert map_model("sk-default") == "sk-default"   # skgateway registry role -> ornith
+    assert map_model("ornith-big") == "ornith-big"   # skgateway -> chiap08 ornith 35B
+    # unknown / empty never left blank (spawn always passes --model), and fall
+    # closed to a safe concrete Anthropic model.
     assert map_model("") == "sonnet"
     assert map_model(None) == "sonnet"
     assert map_model("whatever") == "sonnet"
+
+
+def test_is_gateway_model_flags_local_routes_only():
+    assert is_gateway_model("sk-default")
+    assert is_gateway_model("ornith-big")
+    assert is_gateway_model("  ornith-big  ")     # trimmed
+    assert not is_gateway_model("claude-opus-4-8")
+    assert not is_gateway_model("claude-sonnet-5")
+    assert not is_gateway_model("")
+    assert not is_gateway_model(None)
+
+
+@pytest.mark.asyncio
+async def test_spawn_gateway_model_points_claude_at_skgateway(tmp_path, monkeypatch):
+    # A gateway model id spawns the SAME `claude` runner, but pointed at
+    # skgateway via ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN, with the cloud
+    # OAuth token DROPPED so it does not prefer the Anthropic cloud path.
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-secret")
+    repo = tmp_path / "skharness"
+    repo.mkdir()
+    runner, tcalls = _tmux_recorder()
+    git, _ = _git_ok()
+    h = _spawn_harness(repo, runner=runner, git_runner=git,
+                       gateway_base="http://localhost:18780", gateway_token="sk-local")
+
+    desc = SessionDescriptor(repo=str(repo), branch="x", model="ornith-big",
+                             quality="sandbox")
+    await h.spawn(desc, prompt="p")
+
+    nw = _new_window_argv(tcalls)
+    env = _env_pairs(nw)
+    launch = _launch_argv(nw)
+    assert env["ANTHROPIC_BASE_URL"] == "http://localhost:18780"
+    assert env["ANTHROPIC_AUTH_TOKEN"] == "sk-local"
+    # gateway path, NOT the cloud subscription path
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+    # --model carries the gateway model name skgateway routes on
+    assert launch[launch.index("--model") + 1] == "ornith-big"
+
+
+@pytest.mark.asyncio
+async def test_spawn_anthropic_model_keeps_oauth_and_no_gateway(tmp_path, monkeypatch):
+    # An Anthropic model id keeps the existing cloud path: OAuth token wired, no
+    # ANTHROPIC_BASE_URL override, --model is the concrete Anthropic value.
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-secret")
+    repo = tmp_path / "skharness"
+    repo.mkdir()
+    runner, tcalls = _tmux_recorder()
+    git, _ = _git_ok()
+    h = _spawn_harness(repo, runner=runner, git_runner=git,
+                       gateway_base="http://localhost:18780", gateway_token="sk-local")
+
+    desc = SessionDescriptor(repo=str(repo), branch="x", model="claude-opus-4-8",
+                             quality="sandbox")
+    await h.spawn(desc, prompt="p")
+
+    nw = _new_window_argv(tcalls)
+    env = _env_pairs(nw)
+    launch = _launch_argv(nw)
+    assert env.get("CLAUDE_CODE_OAUTH_TOKEN") == "oauth-secret"
+    assert "ANTHROPIC_BASE_URL" not in env
+    assert "ANTHROPIC_AUTH_TOKEN" not in env
+    assert launch[launch.index("--model") + 1] == "opus"
 
 
 @pytest.mark.asyncio

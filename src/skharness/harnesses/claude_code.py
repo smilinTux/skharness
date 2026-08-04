@@ -67,25 +67,39 @@ _DEFAULT_CHILD_PATH = (
 #: so the first-run wizard is skipped; the exact value is not load-bearing.
 _SEED_ONBOARDING_VERSION = "2.1.119"
 
-#: Map the compose-form model ids onto the values `claude --model` accepts today.
-#: claude speaks the Anthropic API, and skgateway is not yet an Anthropic-compat
-#: endpoint, so the non-Anthropic ids (sk-default / ornith-big) fall back to
-#: "sonnet" for now. Real routing (setting ANTHROPIC_BASE_URL at the gateway)
-#: lands with the skgateway update; until then every id resolves to a concrete
-#: Anthropic model and --model is ALWAYS passed.
+#: Compose-form model ids that route THROUGH skgateway (cloud-free) rather than
+#: to the Anthropic cloud. skgateway now exposes an Anthropic-compat
+#: ``/v1/messages`` frontend, so the SAME ``claude`` runner can reach these by
+#: pointing ANTHROPIC_BASE_URL at the gateway (see :meth:`_build_env`). skgateway
+#: routes ``sk-default`` (registry role) to local ornith and ``ornith-big`` to the
+#: chiap08 35B backend.
+_GATEWAY_MODELS = {"sk-default", "ornith-big"}
+
+#: Map the compose-form model ids onto the values passed to ``claude --model``.
+#: For Anthropic ids this is the concrete ``claude`` alias (sonnet/opus). For
+#: gateway ids it is the model NAME skgateway routes on (passed verbatim to the
+#: gateway's Anthropic frontend). --model is ALWAYS passed; unknown ids fall
+#: closed to a safe concrete Anthropic model.
 _MODEL_MAP = {
     "claude-sonnet-5": "sonnet",
     "claude-opus-4-8": "opus",
-    "sk-default": "sonnet",   # default tier for now (skgateway routing is a follow-on)
-    "ornith-big": "sonnet",   # non-Anthropic id: falls back to sonnet until skgateway is Anthropic-compat
+    "sk-default": "sk-default",   # skgateway registry role -> ornith (cloud-free)
+    "ornith-big": "ornith-big",   # skgateway -> chiap08 ornith 35B (cloud-free)
 }
 
 
-def map_model(model: str | None) -> str:
-    """Resolve a compose-form model id to a concrete ``claude --model`` value.
+def is_gateway_model(model: str | None) -> bool:
+    """True when ``model`` routes through skgateway (cloud-free) rather than the
+    Anthropic cloud. See :data:`_GATEWAY_MODELS`."""
+    return (model or "").strip() in _GATEWAY_MODELS
 
-    Unknown / empty ids fall back to ``"sonnet"`` (never left blank), so spawn can
-    always pass ``--model``. See :data:`_MODEL_MAP` for the routing note.
+
+def map_model(model: str | None) -> str:
+    """Resolve a compose-form model id to the ``claude --model`` value.
+
+    Anthropic ids -> a concrete ``claude`` alias; gateway ids -> the model name
+    skgateway routes on. Unknown / empty ids fall back to ``"sonnet"`` (never left
+    blank), so spawn can always pass ``--model``. See :data:`_MODEL_MAP`.
     """
     key = (model or "").strip()
     return _MODEL_MAP.get(key, "sonnet")
@@ -218,6 +232,8 @@ class ClaudeCodeHarness(Harness):
         full_home: Path | None = None,
         mcp_config: str | None = None,
         child_path: str | None = None,
+        gateway_base: str | None = None,
+        gateway_token: str | None = None,
     ) -> None:
         self.host = host
         self.tmux_session = tmux_session
@@ -240,6 +256,14 @@ class ClaudeCodeHarness(Harness):
         self.full_home = Path(full_home) if full_home else Path.home()
         self.mcp_config = mcp_config
         self.child_path = child_path or _DEFAULT_CHILD_PATH
+        # skgateway Anthropic-compat frontend: gateway models point `claude` here
+        # (ANTHROPIC_BASE_URL) instead of the Anthropic cloud. Loopback skgateway
+        # ignores the token (auth is off), but `claude` needs a non-empty auth
+        # value set, so default one; both are overridable via env for a remote gw.
+        self.gateway_base = gateway_base or os.environ.get(
+            "SKCODE_GATEWAY_BASE", "http://localhost:18780")
+        self.gateway_token = gateway_token or os.environ.get(
+            "SKCODE_GATEWAY_TOKEN", "sk-local")
 
     def capabilities(self) -> HarnessCapabilities:
         # Session plane over a PTY (tmux): reads + P1 inject/archive + P2 spawn.
@@ -364,7 +388,8 @@ class ClaudeCodeHarness(Harness):
             return False
         return getattr(r, "returncode", 1) == 0
 
-    def _build_env(self, profile: str, agent: str, worktree: Path) -> dict[str, str]:
+    def _build_env(self, profile: str, agent: str, worktree: Path,
+                   model: str | None = None) -> dict[str, str]:
         """Construct the child's ENTIRE environment for a profile (spec 6.2).
 
         Enforcement is by CONSTRUCTION, not by a flag: the returned dict is the
@@ -382,13 +407,24 @@ class ClaudeCodeHarness(Harness):
             "LANG": os.environ.get("LANG", "C.UTF-8"),
         }
         # Model ACCESS (not operator identity): a spawned claude session needs a
-        # credential to reach the model. CLAUDE_CODE_OAUTH_TOKEN is subscription
-        # model-access only, NOT SKAGENT / memory / MCP, so it is compatible with
-        # the sandbox's no-operator-context rule and is required for the session to
-        # actually run. Passed to both profiles when present in the host env.
-        _oauth = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-        if _oauth:
-            env["CLAUDE_CODE_OAUTH_TOKEN"] = _oauth
+        # credential to reach the model. This is model-access only, NOT SKAGENT /
+        # memory / MCP, so it is compatible with the sandbox's no-operator-context
+        # rule and is required for the session to actually run.
+        if is_gateway_model(model):
+            # Cloud-free path: point `claude` at skgateway's Anthropic /v1/messages
+            # frontend, which routes to a local model (ornith / chiap08). DROP the
+            # cloud OAuth token so claude uses the gateway base URL rather than
+            # preferring the Anthropic subscription path. The gateway token is
+            # model-access only (same category as the OAuth token), so it stays
+            # sandbox-compatible.
+            env["ANTHROPIC_BASE_URL"] = self.gateway_base
+            env["ANTHROPIC_AUTH_TOKEN"] = self.gateway_token
+        else:
+            # Anthropic cloud path: CLAUDE_CODE_OAUTH_TOKEN is subscription
+            # model-access, passed to both profiles when present in the host env.
+            _oauth = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+            if _oauth:
+                env["CLAUDE_CODE_OAUTH_TOKEN"] = _oauth
         if profile == "full":
             # Trusted interactive session: real operator identity + home wired.
             env["HOME"] = str(self.full_home)
@@ -558,7 +594,7 @@ class ClaudeCodeHarness(Harness):
         # seed is written there.
         if mode == "interactive":
             self._write_interactive_seed(worktree)
-        env = self._build_env(profile, agent, worktree)
+        env = self._build_env(profile, agent, worktree, desc.model)
         launch = self._claude_argv(profile, prompt, mode, desc.model)
         env_argv = ["env", "-i", *[f"{k}={v}" for k, v in env.items()]]
         # Ensure the target tmux session exists (a fresh host has no tmux server,
