@@ -186,6 +186,73 @@ def test_phase0_concreteness_gate_downgrades_valid_to_decompose(tmp_path, mocker
     board.mark_decomposed.assert_called_once()
 
 
+# -- decompose create-or-skip guard (regression for the 2026-08-03 mass pass that
+#    re-decomposed already-decomposed epics and created exact-title duplicates) ----
+
+def test_phase0_decompose_skips_epic_that_already_has_children(tmp_path, mocker):
+    # Epic already hand-carded children (tagged parent:<epic>) but carries NO
+    # meta.autopilot.decomposed flag. Re-decomposing it must be a no-op: no new
+    # children, decompose() never even runs, parent never re-parked.
+    board, created = _decompose_board(tmp_path)
+    _write_task(tmp_path, "child-1", tags=["parent:t-vague", "autopilot"], title="sub A")
+    harness = MagicMock()
+    harness.assess.return_value = Verdict(verdict="decompose", reason="too coarse")
+    harness.decompose.return_value = [
+        {"title": "sub A", "acceptance": ["a.py has f"]},
+        {"title": "sub B", "acceptance": ["b.py has g"]},
+    ]
+    mocker.patch("skharness.autocode.orchestrator._ground_card",
+                 return_value=_Grounding(grounded=False))
+    cands, decisions = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                                          caps=Caps(), run_id="r")
+    assert created == []                             # no duplicate children created
+    harness.decompose.assert_not_called()            # short-circuited before splitting
+    board.mark_decomposed.assert_not_called()        # epic not re-parked
+
+
+def test_phase0_decompose_child_skips_duplicate_title(tmp_path, mocker):
+    # A human hand-carded ONE of the subtasks as a top-level (unlinked) card. The
+    # epic has no parent:<epic> children, so the epic-level guard passes, but the
+    # per-child create-or-skip must skip the colliding title (case/space
+    # insensitive) and still create the genuinely-new sibling.
+    board, created = _decompose_board(tmp_path)
+    _write_task(tmp_path, "hand-a", tags=["repo:skos"], title="Sub  A")   # unlinked dup
+    harness = MagicMock()
+    harness.assess.return_value = Verdict(verdict="decompose", reason="too coarse")
+    harness.decompose.return_value = [
+        {"title": "sub a", "description": "", "acceptance": ["a.py has f"]},   # dup -> skip
+        {"title": "sub B", "description": "", "acceptance": ["b.py has g"]},   # new -> create
+    ]
+    mocker.patch("skharness.autocode.orchestrator._ground_card",
+                 return_value=_Grounding(grounded=False))
+    cands, decisions = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                                          caps=Caps(), run_id="r")
+    assert [c.title for c in created] == ["sub B"]   # only the non-duplicate created
+    board.mark_decomposed.assert_called_once()
+    parked_children = board.mark_decomposed.call_args.args[1]
+    assert len(parked_children) == 1                 # parent parked with just the new child
+
+
+def test_phase0_decompose_new_epic_still_creates_all_children(tmp_path, mocker):
+    # Genuinely-new epic (no existing children, no title collisions): the guard is
+    # inert and every child is created + the parent parked.
+    board, created = _decompose_board(tmp_path)
+    harness = MagicMock()
+    harness.assess.return_value = Verdict(verdict="decompose", reason="too coarse")
+    harness.decompose.return_value = [
+        {"title": "fresh A", "acceptance": ["a.py has f"]},
+        {"title": "fresh B", "acceptance": ["b.py has g"]},
+    ]
+    mocker.patch("skharness.autocode.orchestrator._ground_card",
+                 return_value=_Grounding(grounded=False))
+    cands, decisions = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                                          caps=Caps(), run_id="r")
+    assert sorted(c.title for c in created) == ["fresh A", "fresh B"]
+    for child in created:
+        assert "parent:t-vague" in child.tags
+    board.mark_decomposed.assert_called_once()
+
+
 def test_phase0_net_new_card_still_builds(tmp_path, mocker):
     board, created = _decompose_board(tmp_path)
     harness = MagicMock()

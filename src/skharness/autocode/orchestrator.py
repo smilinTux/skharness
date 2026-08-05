@@ -70,6 +70,41 @@ def repo_tag(task: dict) -> str | None:
     return repos[0] if len(repos) == 1 else None
 
 
+def _norm_title(title: str) -> str:
+    """Normalize a card title for duplicate detection: lowercased, whitespace
+    collapsed. Two titles that differ only in case or spacing dedup to one."""
+    return " ".join((title or "").split()).lower()
+
+
+def _iter_tasks(existing_tasks):
+    """Yield task dicts from a by-id map, a plain list, or None (empty)."""
+    if not existing_tasks:
+        return
+    values = existing_tasks.values() if isinstance(existing_tasks, dict) else existing_tasks
+    for t in values:
+        if isinstance(t, dict):
+            yield t
+
+
+def _card_parent(task: dict) -> str | None:
+    """Parent epic id a card is linked to, via a ``parent:<id>`` tag or
+    meta.autopilot.parent. None for a top-level / hand-carded card."""
+    for tag in (task.get("tags") or []):
+        if isinstance(tag, str) and tag.startswith("parent:"):
+            return tag.split(":", 1)[1]
+    return ((task.get("meta") or {}).get("autopilot") or {}).get("parent")
+
+
+def _existing_children(existing_tasks, parent_id: str) -> list[dict]:
+    """Cards already linked to ``parent_id`` (parent:<id> tag / meta.autopilot.parent).
+
+    An epic that already has children is never re-decomposed: create-or-skip at the
+    epic level. Catches epics a human hand-carded children for (no meta.decomposed
+    flag) and epics whose prior decompose run crashed before mark_decomposed.
+    """
+    return [t for t in _iter_tasks(existing_tasks) if _card_parent(t) == parent_id]
+
+
 def _ground_card(task: dict, config):
     """Host-side repo grounding for a card: fills codebase_context with facts and a
     concreteness score. Model-free, read-only. Ungrounded (grounded=False) when the
@@ -204,15 +239,27 @@ def _create_child(board, *, title: str, description: str, tags: list[str],
 
 def _decompose_card(board, harness, task: dict, brief: AssessBrief, *, caps: Caps,
                     run_id: str, decisions: list, config=None,
-                    dry_run: bool = False) -> None:
+                    existing_tasks=None, dry_run: bool = False) -> None:
     """Split a too-coarse parent into buildable child subtasks, park the parent.
-    Guardrails: idempotent (skip if already decomposed), depth-capped (ceiling ->
-    needs_decision, no infinite trees), child-count-capped, and empty/over-cap ->
-    needs_decision (never a silent drop). Children are born ``autopilot-untriaged``
-    so a human releases them before they build (unless decompose_autobuild)."""
+    Guardrails: idempotent (skip if already decomposed OR the epic already has
+    children on the board), create-or-skip per child (never re-create a
+    same-title child), depth-capped (ceiling -> needs_decision, no infinite
+    trees), child-count-capped, and empty/over-cap -> needs_decision (never a
+    silent drop). Children are born ``autopilot-untriaged`` so a human releases
+    them before they build (unless decompose_autobuild).
+
+    ``existing_tasks`` is the run's view of the board (by-id map or list) used for
+    the create-or-skip guards; when omitted the guards see nothing (legacy behavior).
+    """
     tid = task.get("id")
     ap = (task.get("meta") or {}).get("autopilot") or {}
-    if ap.get("decomposed"):                       # idempotency: already split
+    if ap.get("decomposed"):                       # idempotency: already split (parked)
+        return
+    # Create-or-skip at the EPIC level: if the board already carries children for
+    # this epic (parent:<id> tag / meta.autopilot.parent) -- hand-carded by a human,
+    # or written by a prior run that crashed before mark_decomposed -- re-splitting
+    # would duplicate them (this is the 2026-08-03 mass-pass failure). No-op.
+    if _existing_children(existing_tasks, tid):
         return
     depth = int(ap.get("decomp_depth", 0) or 0)
     if depth >= getattr(caps, "max_decompose_depth", 2):
@@ -259,8 +306,21 @@ def _decompose_card(board, harness, task: dict, brief: AssessBrief, *, caps: Cap
     parent_tags = [t for t in (task.get("tags") or [])
                    if t.startswith(("repo:", "quality:"))]
     autobuild = bool(getattr(_decompose_card, "_autobuild", False))
+    # Create-or-skip at the CHILD level: never create a child whose normalized
+    # title already exists as a child of this epic OR as an unlinked hand-carded
+    # card (the exact-title duplicates the mass pass produced). Seed the seen set
+    # from those cards, then dedup within this batch too.
+    seen_titles = {
+        _norm_title(t.get("title", ""))
+        for t in _iter_tasks(existing_tasks)
+        if t.get("id") != tid and _card_parent(t) in (tid, None)
+    }
     child_ids: list[str] = []
     for i, s in enumerate(specs[:max_children]):
+        norm = _norm_title(s.get("title", ""))
+        if norm in seen_titles:                    # duplicate (parent, title) -> skip
+            continue
+        seen_titles.add(norm)
         tags = list(parent_tags) + ["autopilot", f"parent:{tid}"]
         if not autobuild:
             tags.append("autopilot-untriaged")     # human-release gate (default)
@@ -270,7 +330,8 @@ def _decompose_card(board, harness, task: dict, brief: AssessBrief, *, caps: Cap
                       meta={"autopilot": {"parent": tid, "decomp_depth": depth + 1}},
                       task_id=child_id)
         child_ids.append(child_id)
-    board.mark_decomposed(tid, child_ids, run_id=run_id)
+    if child_ids:                                  # only park the epic if we created work
+        board.mark_decomposed(tid, child_ids, run_id=run_id)
 
 
 def phase0_assess(*, board, harness, tasks_dir, caps: Caps, run_id: str,
@@ -355,7 +416,8 @@ def phase0_assess(*, board, harness, tasks_dir, caps: Caps, run_id: str,
                 board.close_task_obsolete(tid, v.reason, run_id=run_id)
         elif v.verdict == "decompose":
             _decompose_card(board, harness, t, brief, caps=caps, run_id=run_id,
-                            decisions=decisions, config=config, dry_run=dry_run)
+                            decisions=decisions, config=config, existing_tasks=by_id,
+                            dry_run=dry_run)
         elif v.verdict == "needs_decision":
             decisions.append(DecisionItem(qid=stable_qid(v.reason or tid, tid),
                                           prompt=v.reason or f"Task {tid} needs a decision.",
