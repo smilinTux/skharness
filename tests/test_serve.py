@@ -7,9 +7,30 @@ from skharness.serve import (
     build_audit_log,
     build_default_verifier,
     build_dispatch_targets,
+    full_profile_allowed,
     resolve_bind,
     skcode_state_dir,
 )
+
+
+def test_full_profile_allowed_defaults_to_the_enrolled_operator(monkeypatch):
+    monkeypatch.delenv("SKCODE_FULL_PROFILE_SUBJECTS", raising=False)
+    assert full_profile_allowed("lumina@chef.skworld.io") is True
+    assert full_profile_allowed("mallory@evil.io") is False
+
+
+def test_full_profile_allowed_honors_env_allowlist(monkeypatch):
+    monkeypatch.setenv("SKCODE_FULL_PROFILE_SUBJECTS", "a@x.io, b@y.io")
+    assert full_profile_allowed("a@x.io") is True
+    assert full_profile_allowed("b@y.io") is True
+    # a subject not on the explicit list (even the former default) is denied full
+    assert full_profile_allowed("lumina@chef.skworld.io") is False
+
+
+def test_full_profile_allowed_rejects_blank_subject(monkeypatch):
+    monkeypatch.delenv("SKCODE_FULL_PROFILE_SUBJECTS", raising=False)
+    assert full_profile_allowed("") is False
+    assert full_profile_allowed(None) is False  # type: ignore[arg-type]
 
 
 def test_default_port_is_9394():

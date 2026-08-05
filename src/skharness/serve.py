@@ -149,7 +149,7 @@ def build_dispatch_authorizer(home: Path | None = None):
     dispatch (501 authz-not-configured) rather than allowing it unauthenticated.
     """
     try:
-        from capauth.authz import DEFAULT_RULES, CapabilityRule, decide
+        from capauth.authz import DEFAULT_RULES, CapabilityRule, Decision, decide
         from capauth.pairing import EnrollmentMode
     except Exception:
         return None
@@ -163,10 +163,40 @@ def build_dispatch_authorizer(home: Path | None = None):
     )
 
     def _authorize(subject: str, resource: dict, context: dict):
-        return decide(subject, DISPATCH_CAPABILITY, resource, context,
-                      base_dir=home, rules=rules)
+        dec = decide(subject, DISPATCH_CAPABILITY, resource, context,
+                     base_dir=home, rules=rules)
+        # HARDENED 2026-08-05: the `full` profile spawns a session with the real
+        # operator identity + HOME + MCP (the widest blast radius). Restrict it to
+        # an explicit subject allowlist; every other verified operator is
+        # sandbox-only. Reuse the decision's audit obligation so the PEP still
+        # records exactly one audit entry. Lumina is the default allowed subject.
+        if dec.allow and str(resource.get("profile", "")) == "full" \
+                and not full_profile_allowed(subject):
+            return Decision(
+                allow=False,
+                reason=(f"full profile denied for {subject!r}: not on "
+                        "SKCODE_FULL_PROFILE_SUBJECTS (sandbox-only operator)"),
+                obligations=dec.obligations,
+            )
+        return dec
 
     return _authorize
+
+
+#: Subjects allowed to dispatch the `full` profile (real identity + HOME + MCP).
+#: Comma-separated env; defaults to the enrolled operator. Everyone else who
+#: passes the dispatch gate is restricted to the sandbox profile.
+_DEFAULT_FULL_SUBJECTS = "lumina@chef.skworld.io"
+
+
+def full_profile_allowed(subject: str) -> bool:
+    """True when ``subject`` may dispatch the ``full`` profile (see
+    ``SKCODE_FULL_PROFILE_SUBJECTS``). Blank/unknown subjects are never allowed."""
+    if not subject:
+        return False
+    raw = os.environ.get("SKCODE_FULL_PROFILE_SUBJECTS", _DEFAULT_FULL_SUBJECTS)
+    allowed = {s.strip() for s in raw.split(",") if s.strip()}
+    return subject in allowed
 
 
 def build_dispatch_targets():
