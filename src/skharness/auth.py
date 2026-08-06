@@ -13,8 +13,13 @@ SAME valid token (R2.4 scope split). A verifier returns:
   the scopes it carries, which is how the real capauth verifier lets the daemon
   grant read-only view (``skcode.stream``) without arming write (``skcode.inject``).
 
-The deny-all default (serve.build_default_verifier) returns ``False`` and so
-denies every route regardless of the scope a route asks for.
+The daemon's default verifier (serve.select_verifier) is now the REAL capauth
+verifier (CR-3.2): a caller is accepted only with a valid, signed, unexpired,
+unrevoked, skcode-audience capauth token. Deny-all (serve.build_default_verifier)
+returns ``False`` and denies every route regardless of scope; it is the
+fail-closed FALLBACK, used only when capauth is unreachable or the operator forces
+it via ``SKCODE_FORCE_DENY_ALL``. There is no configuration in which a
+missing/invalid token is accepted.
 """
 
 from __future__ import annotations

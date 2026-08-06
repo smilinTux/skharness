@@ -28,9 +28,17 @@ SKCODE_AUDIENCE = "skcode"
 # The capability the dispatch PDP decides on (spec 7.4).
 DISPATCH_CAPABILITY = "skcode.dispatch"
 
-# Env flag that opts INTO the real capauth verifier. Unset/off keeps the P0
-# deny-all placeholder, so the RCE surface stays gated by default (R2.4).
+# CR-3.2: the daemon now converges on REAL capauth token verification by DEFAULT
+# (see select_verifier). REAL_VERIFIER_ENV is kept for backward compatibility as a
+# redundant explicit opt-in (truthy still forces the real verifier); it is no
+# longer required, because real is the default.
 REAL_VERIFIER_ENV = "SKCODE_REAL_VERIFIER"
+
+# Escape hatch: force the deny-all placeholder even when capauth is importable.
+# Truthy -> deny-all. This is the ONLY way to turn the real verifier OFF, and it
+# still fails CLOSED (denies everything). Unset/off keeps the real capauth
+# verifier (the CR-3.2 default).
+FORCE_DENY_ENV = "SKCODE_FORCE_DENY_ALL"
 _TRUTHY = {"1", "true", "yes", "on"}
 
 
@@ -213,18 +221,31 @@ def build_dispatch_targets():
 
 
 def select_verifier() -> Verifier:
-    """Pick the verifier the daemon runs with.
+    """Pick the verifier the daemon runs with (CR-3.2: real capauth by default).
 
-    Default (``SKCODE_REAL_VERIFIER`` unset or not truthy): the P0 deny-all
-    placeholder, byte-identical to prior behavior, so the RCE surface stays
-    gated. Only when the flag is explicitly ON is the real capauth verifier
-    constructed. This is the ONLY thing the flag changes; routes, the bind
-    guard, and the gate wiring are untouched.
+    The daemon now performs REAL capauth token verification by default: a caller
+    is accepted only with a valid, signed, unexpired, unrevoked, skcode-audience
+    capauth token (see ``build_capauth_verifier``). Deny-all is the fail-closed
+    FALLBACK, never the happy path. It is returned only when:
+
+    * ``SKCODE_FORCE_DENY_ALL`` is truthy (operator escape hatch), OR
+    * capauth cannot be imported / the verifier cannot be constructed (capauth
+      unreachable). Construction failure is caught here and falls back to
+      deny-all, so a broken capauth install DENIES every caller rather than
+      crashing the daemon or, worse, letting anyone through.
+
+    Either way the RCE surface stays gated: the real verifier itself fails closed
+    on every missing/invalid/expired/revoked/wrong-audience token, and the
+    fallback denies all. There is no configuration in which a bad or absent token
+    is accepted. Routes, the bind guard, and the gate wiring are untouched.
     """
-    flag = os.environ.get(REAL_VERIFIER_ENV, "").strip().lower()
-    if flag in _TRUTHY:
+    if os.environ.get(FORCE_DENY_ENV, "").strip().lower() in _TRUTHY:
+        return build_default_verifier()
+    try:
         return build_capauth_verifier()
-    return build_default_verifier()
+    except Exception:
+        # capauth unreachable / import or construction error -> fail CLOSED.
+        return build_default_verifier()
 
 
 def main(argv: list[str] | None = None) -> int | None:

@@ -24,19 +24,19 @@ import json
 from pathlib import Path
 
 import pytest
-
-from skharness import serve
-from skharness.serve import (
-    REAL_VERIFIER_ENV,
-    build_capauth_verifier,
-    build_default_verifier,
-    select_verifier,
-)
-
 from capauth.tokens import (
     export_token,
     issue_token,
     mint_audience_token,
+)
+
+from skharness import serve
+from skharness.serve import (
+    FORCE_DENY_ENV,
+    REAL_VERIFIER_ENV,
+    build_capauth_verifier,
+    build_default_verifier,
+    select_verifier,
 )
 
 
@@ -74,41 +74,72 @@ def _skcode_token(agent_home: Path):
 
 
 # --------------------------------------------------------------------------- #
-# Flag wiring: default stays deny-all, byte-identical to today.
+# Flag wiring (CR-3.2): real capauth verification by DEFAULT, deny-all fallback.
 # --------------------------------------------------------------------------- #
 
 class TestFlagWiring:
-    def test_default_off_selects_deny_all(self, monkeypatch, agent_home):
-        """Unset flag -> deny-all: even a would-be-valid token is rejected."""
+    def test_default_selects_real_capauth_verifier(self, monkeypatch, agent_home):
+        """Unset flags -> the REAL capauth verifier is used (CR-3.2 flip).
+
+        A would-be-valid token is now ACCEPTED (returns a scope-carrying
+        AuthContext), proving the daemon no longer defaults to deny-all.
+        """
         monkeypatch.delenv(REAL_VERIFIER_ENV, raising=False)
-        # A token that the REAL verifier would accept (stub the signature half).
+        monkeypatch.delenv(FORCE_DENY_ENV, raising=False)
+        # Point the real verifier at the tmp capauth home and isolate the
+        # audience gate (stub the signature/validity half True).
+        monkeypatch.setattr(serve, "build_capauth_verifier",
+                            lambda: build_capauth_verifier(home=agent_home))
         monkeypatch.setattr("capauth.tokens.verify_token", lambda t, h=None: True)
         wire = _wire(_skcode_token(agent_home))
 
         verifier = select_verifier()
-        assert verifier(wire) is False
-        # Byte-identical to the P0 placeholder: rejects everything.
+        result = verifier(wire)
+        assert result                                   # accepted (not deny-all)
+        assert result.has_scope("skcode.stream") is True
+        # Still fails closed on bad input.
         assert verifier("anything") is False
         assert verifier("") is False
 
-    @pytest.mark.parametrize("val", ["0", "false", "no", "off", "", "  ", "bogus"])
-    def test_non_truthy_values_stay_deny_all(self, monkeypatch, agent_home, val):
-        monkeypatch.setenv(REAL_VERIFIER_ENV, val)
+    @pytest.mark.parametrize("val", ["1", "true", "TRUE", "Yes", "on"])
+    def test_force_deny_all_selects_deny_all(self, monkeypatch, agent_home, val):
+        """SKCODE_FORCE_DENY_ALL truthy -> deny-all, even a valid token rejected."""
+        monkeypatch.setenv(FORCE_DENY_ENV, val)
         monkeypatch.setattr("capauth.tokens.verify_token", lambda t, h=None: True)
         wire = _wire(_skcode_token(agent_home))
-        assert select_verifier()(wire) is False
+        verifier = select_verifier()
+        assert verifier(wire) is False
+        assert verifier("anything") is False
 
-    @pytest.mark.parametrize("val", ["1", "true", "TRUE", "Yes", "on"])
-    def test_flag_on_selects_capauth_verifier(self, monkeypatch, val):
-        """Truthy flag -> the capauth builder is used (not deny-all)."""
+    @pytest.mark.parametrize("val", ["0", "false", "no", "off", "", "  ", "bogus"])
+    def test_non_truthy_force_deny_stays_real(self, monkeypatch, agent_home, val):
+        """A non-truthy SKCODE_FORCE_DENY_ALL does NOT force deny-all."""
+        monkeypatch.setenv(FORCE_DENY_ENV, val)
         sentinel = object()
-        monkeypatch.setenv(REAL_VERIFIER_ENV, val)
         monkeypatch.setattr(serve, "build_capauth_verifier", lambda: (lambda t: sentinel))
-        chosen = select_verifier()
-        assert chosen("whatever") is sentinel
+        assert select_verifier()("whatever") is sentinel
+
+    def test_capauth_unreachable_falls_back_to_deny_all(self, monkeypatch, agent_home):
+        """FAIL-CLOSED (a): capauth import/construction fails -> deny-all fallback.
+
+        When ``build_capauth_verifier`` cannot be constructed (capauth
+        unreachable), ``select_verifier`` must fall back to deny-all rather than
+        crash or fail open. Even a would-be-valid token is rejected.
+        """
+        monkeypatch.delenv(FORCE_DENY_ENV, raising=False)
+
+        def _boom():
+            raise ImportError("capauth unreachable")
+
+        monkeypatch.setattr(serve, "build_capauth_verifier", _boom)
+        monkeypatch.setattr("capauth.tokens.verify_token", lambda t, h=None: True)
+        wire = _wire(_skcode_token(agent_home))
+        verifier = select_verifier()
+        assert verifier(wire) is False
+        assert verifier("anything") is False
 
     def test_default_verifier_is_still_deny_all(self):
-        """The placeholder itself is unchanged."""
+        """The placeholder itself is unchanged (the fallback still denies all)."""
         v = build_default_verifier()
         assert v("anything") is False
 
@@ -195,3 +226,54 @@ class TestCapauthVerifier:
     def test_fails_closed_on_garbage(self, agent_home, garbage):
         verifier = build_capauth_verifier(home=agent_home)
         assert verifier(garbage) is False
+
+
+# --------------------------------------------------------------------------- #
+# CR-3.2 fail-closed contract, explicit: the RCE gate DENIES on every failure
+# mode and ALLOWS only a valid token. This is the security-critical guarantee.
+# --------------------------------------------------------------------------- #
+
+class TestFailClosed:
+    def test_a_capauth_unreachable_verify_raises_denies(self, agent_home, monkeypatch):
+        """(a) capauth unreachable: the verify call itself raises -> DENY.
+
+        Even a well-formed, correct-audience token is rejected when the capauth
+        verify path errors (keyring down, backend unreachable). The verifier
+        swallows the exception and fails closed; it never lets the caller in.
+        """
+        def _boom(*a, **k):
+            raise RuntimeError("capauth backend unreachable")
+
+        # verify_audience_token calls capauth.tokens.verify_token internally for a
+        # correct-audience token; make that raise to simulate the backend being
+        # unreachable. The verifier must swallow it and DENY.
+        monkeypatch.setattr("capauth.tokens.verify_token", _boom)
+        wire = _wire(_skcode_token(agent_home))   # correct skcode audience
+        verifier = build_capauth_verifier(home=agent_home)
+        assert verifier(wire) is False
+
+    def test_b_missing_token_denies(self, agent_home):
+        """(b) missing/empty token -> DENY."""
+        verifier = build_capauth_verifier(home=agent_home)
+        assert verifier("") is False
+        assert verifier("   ") is False
+        assert verifier(None) is False
+
+    def test_c_invalid_token_denies(self, agent_home):
+        """(c) invalid token (garbage bearer) -> DENY."""
+        verifier = build_capauth_verifier(home=agent_home)
+        assert verifier("totally-not-a-token") is False
+        assert verifier(
+            base64.urlsafe_b64encode(b'{"not":"a token"}').decode("ascii")
+        ) is False
+
+    def test_d_valid_token_allows(self, agent_home, monkeypatch):
+        """The one accept path: a valid, correct-audience token -> ALLOW."""
+        # Isolate the audience gate (stub the signature/validity half True).
+        monkeypatch.setattr("capauth.tokens.verify_token", lambda t, h=None: True)
+        wire = _wire(_skcode_token(agent_home))
+        verifier = build_capauth_verifier(home=agent_home)
+        result = verifier(wire)
+        assert result
+        assert result.has_scope("skcode.stream") is True
+        assert result.has_scope("skcode.inject") is True
