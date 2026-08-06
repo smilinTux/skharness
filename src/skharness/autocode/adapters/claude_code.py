@@ -86,6 +86,13 @@ class ClaudeCodeAdapter(BaseCliAdapter):
                 "headless_api": "none", "hot_set_model": False}
 
     def _argv(self, prompt: str, light: bool = False) -> list[str]:
+        # The prompt is NOT a positional arg: `claude -p` reads it from stdin when
+        # not given inline, and a large prompt (card + codebase context + prior
+        # round feedback) passed on argv blows past the OS ARG_MAX, so `docker run`
+        # dies with OSError [Errno 7] "Argument list too long" partway through a
+        # multi-round build. Feed it via stdin instead (see _stdin_for); this
+        # mirrors the opencode adapter's fix.
+        #
         # light = a JUDGMENT call (assess/grade): answer the JSON question in a
         # single turn with NO tools. These calls need no repo access, but running
         # them as a full agentic session (many turns + Bash/Edit/Write, cwd mounted
@@ -93,19 +100,24 @@ class ClaudeCodeAdapter(BaseCliAdapter):
         # task it otherwise grades valid -- the flake that stranded runs at phase 0.
         # One turn, no tools => it just answers, fast and stable.
         if light:
-            return ["claude", "-p", prompt, "--dangerously-skip-permissions",
+            return ["claude", "-p", "--dangerously-skip-permissions",
                     "--model", self.model,
                     "--max-turns", "1", "--output-format", "json"]
         # Bound the agentic loop. Without --max-turns, `claude -p` runs unbounded
         # turns: on a focused TDD task it writes the correct code early, then keeps
         # exploring/re-verifying until the sandbox run_timeout (1800s) KILLS it at
-        # exit 124 — before it emits its final JSON, so the orchestrator never gets
+        # exit 124 -- before it emits its final JSON, so the orchestrator never gets
         # control to grade/commit/PR. A bounded round always RETURNS; the Ralph loop
         # (fresh session, re-reads disk each round) continues any unfinished work.
-        return ["claude", "-p", prompt, "--dangerously-skip-permissions",
+        return ["claude", "-p", "--dangerously-skip-permissions",
                 "--model", self.model,
                 "--max-turns", str(self.max_turns),
                 "--output-format", "json", "--allowedTools", ",".join(self.allowed_tools)]
+
+    def _stdin_for(self, prompt: str) -> str | None:
+        # Prompt on stdin, never argv: avoids the ARG_MAX / "Argument list too
+        # long" failure on large prompts (see _argv). `claude -p` consumes it.
+        return prompt
 
     def _image(self) -> str:
         return self.image
