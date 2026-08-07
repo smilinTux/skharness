@@ -67,6 +67,18 @@ _DEFAULT_CHILD_PATH = (
 #: so the first-run wizard is skipped; the exact value is not load-bearing.
 _SEED_ONBOARDING_VERSION = "2.1.119"
 
+#: CR-6.2 C1 (cloud OAuth token exfil). By CONSTRUCTION the sandbox profile does
+#: NOT receive the operator's real Anthropic subscription token
+#: (``CLAUDE_CODE_OAUTH_TOKEN``): a sandbox session is the untrusted,
+#: ``--dangerously-skip-permissions``, prompt-injectable surface CR-6 is meant to
+#: contain, and a prompt-injected sandbox agent with that token in its env could
+#: exfiltrate it. The token is withheld from sandbox by DEFAULT; the ONLY way to
+#: put it back is this explicit, documented opt-in (default OFF). ``full`` sessions
+#: (allowlisted, trusted operator identity) always get it when present. Prefer the
+#: gateway / Ornith models (see :data:`_GATEWAY_MODELS`), which never touch this
+#: token at all.
+_SANDBOX_CLOUD_TOKEN_ENV = "SKCODE_SANDBOX_ALLOW_CLOUD_TOKEN"
+
 #: Compose-form model ids that route THROUGH skgateway (cloud-free) rather than
 #: to the Anthropic cloud. skgateway now exposes an Anthropic-compat
 #: ``/v1/messages`` frontend, so the SAME ``claude`` runner can reach these by
@@ -86,6 +98,23 @@ _MODEL_MAP = {
     "sk-default": "sk-default",   # skgateway registry role -> ornith (cloud-free)
     "ornith-big": "ornith-big",   # skgateway -> chiap08 ornith 35B (cloud-free)
 }
+
+
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _env_truthy(name: str) -> bool:
+    """True when env var ``name`` is set to a truthy value (1/true/yes/on)."""
+    return os.environ.get(name, "").strip().lower() in _TRUTHY
+
+
+def sandbox_cloud_token_allowed() -> bool:
+    """True only when the explicit opt-in (:data:`_SANDBOX_CLOUD_TOKEN_ENV`) is set.
+
+    Default is OFF: the sandbox profile does NOT receive the operator's cloud
+    OAuth token (CR-6.2 C1). Flip the env only for a deliberate, documented case.
+    """
+    return _env_truthy(_SANDBOX_CLOUD_TOKEN_ENV)
 
 
 def is_gateway_model(model: str | None) -> bool:
@@ -264,6 +293,11 @@ class ClaudeCodeHarness(Harness):
             "SKCODE_GATEWAY_BASE", "http://localhost:18780")
         self.gateway_token = gateway_token or os.environ.get(
             "SKCODE_GATEWAY_TOKEN", "sk-local")
+        # CR-6.2 C2 (inject blast radius): the set of session ids THIS daemon
+        # actually spawned. inject is scoped to these by default so it can only
+        # drive skcode-spawned sessions, never an arbitrary full-privilege agent
+        # window (lumina/jarvis) that merely shares the `skchat-agents` tmux.
+        self._spawned_sids: set[str] = set()
 
     def capabilities(self) -> HarnessCapabilities:
         # Session plane over a PTY (tmux): reads + P1 inject/archive + P2 spawn.
@@ -341,6 +375,20 @@ class ClaudeCodeHarness(Harness):
         self._runner(["tmux", "kill-window", "-t", target])
         return {"sid": sid, "archived": True, "transcript_path": str(path)}
 
+    def _inject_target_allowed(self, sid: str) -> bool:
+        """CR-6.2 C2: may inject reach ``sid``?
+
+        By default inject is scoped to sessions THIS daemon spawned
+        (``_spawned_sids``), so a caller holding a ``skcode.inject`` token can NOT
+        drive keystrokes into an arbitrary window of the shared ``skchat-agents``
+        tmux (e.g. a full-privilege lumina/jarvis runtime). The documented escape
+        hatch ``SKCODE_INJECT_ANY_WINDOW`` (default OFF) restores the old
+        any-live-window behavior for a deliberate operator case.
+        """
+        if _env_truthy("SKCODE_INJECT_ANY_WINDOW"):
+            return True
+        return sid in self._spawned_sids
+
     async def inject(self, sid: str, text: str) -> dict:
         """Inject operator `text` into a running session as tmux keystrokes (P1).
 
@@ -349,12 +397,26 @@ class ClaudeCodeHarness(Harness):
         ``tmux send-keys -t skchat-agents:<sid> <text> Enter``. This is a WRITE
         verb; the daemon route that calls it stays behind the capauth bearer gate.
 
+        Scoped by CONSTRUCTION (CR-6.2 C2): inject only reaches a session THIS
+        daemon spawned (see :meth:`_inject_target_allowed`). A target that is not a
+        daemon-spawned sid is refused as a clean no-op and NEVER touches tmux, so
+        inject cannot drive an arbitrary agent window that merely shares the
+        `skchat-agents` tmux session.
+
         Idempotent + safe: an invalid sid, or a sid with no live tmux window
         (already archived / never running), returns a clean ``injected: False``
         no-op result rather than raising, and NEVER touches tmux.
         """
         if not _SID_RE.match(sid):
             return {"sid": sid, "injected": False, "reason": "invalid session id"}
+
+        if not self._inject_target_allowed(sid):
+            return {
+                "sid": sid,
+                "injected": False,
+                "reason": ("not a daemon-spawned session (inject is scoped to "
+                           "sessions this daemon spawned)"),
+            }
 
         live_ids = {s.sid for s in self._list_windows()}
         if sid not in live_ids:
@@ -421,9 +483,16 @@ class ClaudeCodeHarness(Harness):
             env["ANTHROPIC_AUTH_TOKEN"] = self.gateway_token
         else:
             # Anthropic cloud path: CLAUDE_CODE_OAUTH_TOKEN is subscription
-            # model-access, passed to both profiles when present in the host env.
+            # model-access. CR-6.2 C1: it is passed to the trusted ``full`` profile
+            # when present, but WITHHELD from the untrusted ``sandbox`` profile by
+            # default so a prompt-injected sandbox agent can never read the
+            # operator's real Anthropic token out of its env. The only way to put
+            # it back into a sandbox is the explicit, documented opt-in
+            # (SKCODE_SANDBOX_ALLOW_CLOUD_TOKEN); prefer gateway/Ornith models,
+            # which drop the cloud token entirely (see the branch above).
             _oauth = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-            if _oauth:
+            _cloud_ok = profile == "full" or sandbox_cloud_token_allowed()
+            if _oauth and _cloud_ok:
                 env["CLAUDE_CODE_OAUTH_TOKEN"] = _oauth
         if profile == "full":
             # Trusted interactive session: real operator identity + home wired.
@@ -617,6 +686,10 @@ class ClaudeCodeHarness(Harness):
             "tmux", "set-window-option", "-t", f"{self.tmux_session}:{sid}",
             "remain-on-exit", "on",
         ])
+
+        # CR-6.2 C2: remember this is a daemon-spawned session so inject may reach
+        # it (and ONLY it, plus its siblings). Recorded after the window is created.
+        self._spawned_sids.add(sid)
 
         return HarnessSession(
             sid=sid,

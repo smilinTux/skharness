@@ -28,6 +28,11 @@ SKCODE_AUDIENCE = "skcode"
 # The capability the dispatch PDP decides on (spec 7.4).
 DISPATCH_CAPABILITY = "skcode.dispatch"
 
+# The capability the inject/ratify PDP decides on (CR-6.2 C2/C8). Verified tier
+# (RCE keystroke-inject into a running agent PTY). Seeded in
+# capauth.authz.DEFAULT_RULES (C3).
+INJECT_CAPABILITY = "skcode.inject"
+
 # CR-3.2: the daemon now converges on REAL capauth token verification by DEFAULT
 # (see select_verifier). REAL_VERIFIER_ENV is kept for backward compatibility as a
 # redundant explicit opt-in (truthy still forces the real verifier); it is no
@@ -191,6 +196,49 @@ def build_dispatch_authorizer(home: Path | None = None):
     return _authorize
 
 
+def build_inject_authorizer(home: Path | None = None):
+    """Wire the real capauth authz PDP for the inject/ratify write surface
+    (CR-6.2 C2/C8).
+
+    Mirrors :func:`build_dispatch_authorizer` but for ``skcode.inject`` at the
+    VERIFIED floor, so inject/ratify enforce the enrollment-mode floor in CODE (a
+    ``decide`` allow), not only at token issuance. Returns a callable
+    ``(subject, resource, context) -> Decision``.
+
+    Fails CLOSED: if capauth cannot be imported, returns a deny-all authorizer
+    (every inject denied) rather than None, so a broken capauth install can never
+    silently drop the floor back to scope-only. The bearer/scope gate still runs
+    first, and the deny-all verifier pin still denies before this is ever reached.
+    """
+    try:
+        from capauth.authz import DEFAULT_RULES, CapabilityRule, decide
+        from capauth.pairing import EnrollmentMode
+    except Exception:
+        def _deny_all(subject: str, resource: dict, context: dict):
+            class _D:
+                allow = False
+                reason = "capauth unavailable: inject denied (fail closed)"
+                obligations: list = []
+            return _D()
+        return _deny_all
+
+    rules = dict(DEFAULT_RULES)
+    # skcode.inject is now seeded in DEFAULT_RULES (C3); re-assert it here as
+    # belt-and-suspenders so the floor holds even against an older capauth.
+    rules[INJECT_CAPABILITY] = CapabilityRule(
+        capability=INJECT_CAPABILITY,
+        required_capability=INJECT_CAPABILITY,
+        minimum_mode=EnrollmentMode.VERIFIED,
+        description="Send operator keystrokes into a running agent PTY (RCE): verified only.",
+    )
+
+    def _authorize(subject: str, resource: dict, context: dict):
+        return decide(subject, INJECT_CAPABILITY, resource, context,
+                      base_dir=home, rules=rules)
+
+    return _authorize
+
+
 #: Subjects allowed to dispatch the `full` profile (real identity + HOME + MCP).
 #: Comma-separated env; defaults to the enrolled operator. Everyone else who
 #: passes the dispatch gate is restricted to the sandbox profile.
@@ -289,6 +337,7 @@ def _serve(argv: list[str]) -> None:
         host_id=args.host_id,
         audit_log=build_audit_log(),
         authorize_dispatch=build_dispatch_authorizer(),
+        authorize_inject=build_inject_authorizer(),
         dispatch_targets=build_dispatch_targets(),
         dispatch_paused=dispatch_is_paused,
     )

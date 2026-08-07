@@ -2,6 +2,7 @@
 
 Driven by FakeHarness + FastAPI TestClient (no real tmux, no real bind).
 """
+import dataclasses as _dc
 import types as _t
 
 import pytest
@@ -423,3 +424,106 @@ def test_scope_split_deny_all_denies_read_and_write():
             "/api/v1/sessions/lumina-abc12345/stream?token=tok"
         ):
             pass
+
+
+# ---- CR-6.2 C2/C8: inject/ratify PDP enrollment-mode floor (decide) -----------
+# The scope gate proves POSSESSION of skcode.inject; the PDP floor proves the
+# subject is VERIFIED. When the daemon is wired with an inject authorizer (as the
+# live serve.build_inject_authorizer does), inject/ratify route through decide()
+# and a deny is 403, audited, with the harness never reached.
+
+
+@_dc.dataclass
+class _Ob:
+    kind: str = "audit"
+    data: dict = _dc.field(default_factory=dict)
+
+
+@_dc.dataclass
+class _Dec:
+    allow: bool
+    reason: str = ""
+    obligations: list = _dc.field(default_factory=list)
+
+
+def _allow_inject(record=None):
+    def _a(subject, resource, context):
+        if record is not None:
+            record.append((subject, resource, context))
+        return _Dec(allow=True, reason="granted",
+                    obligations=[_Ob(data={"decision": "allow", "subject": subject})])
+    return _a
+
+
+def _deny_inject(record=None):
+    def _a(subject, resource, context):
+        if record is not None:
+            record.append((subject, resource, context))
+        return _Dec(allow=False, reason="insufficient enrollment mode",
+                    obligations=[_Ob(data={"decision": "deny", "subject": subject})])
+    return _a
+
+
+def test_inject_without_the_verified_capability_is_refused_403():
+    # A subject that passes the scope gate but is BELOW the verified floor: the PDP
+    # denies, inject is 403, audited, and the harness inject() is never reached.
+    harness = _inject_harness()
+    harness._spawned_sids = getattr(harness, "_spawned_sids", set())
+    audits, calls = [], []
+    write = _ctx_verifier("skcode.stream", "skcode.inject")
+    app = build_daemon_app(harness=harness, verify_caller=write,
+                           authorize_inject=_deny_inject(calls), audit_log=audits.append)
+    r = TestClient(app).post("/api/v1/sessions/lumina-abc12345/inject",
+                             json={"text": "hi"}, headers=_H)
+    assert r.status_code == 403
+    assert r.json()["detail"] == "inject not authorized"
+    assert harness.injected == []            # never actuated
+    assert calls and calls[0][1]["sid"] == "lumina-abc12345"   # PDP consulted
+    assert any("deny" in a for a in audits)
+
+
+def test_inject_with_the_verified_capability_actuates_and_audits_subject_and_hash():
+    import hashlib
+    harness = _inject_harness()
+    audits, calls = [], []
+    write = _ctx_verifier("skcode.stream", "skcode.inject")
+    # _ctx_verifier carries no subject; the audit records "unknown-device" then.
+    app = build_daemon_app(harness=harness, verify_caller=write,
+                           authorize_inject=_allow_inject(calls), audit_log=audits.append)
+    text = "run the tests"
+    r = TestClient(app).post("/api/v1/sessions/lumina-abc12345/inject",
+                             json={"text": text}, headers=_H)
+    assert r.status_code == 200
+    assert harness.injected == [("lumina-abc12345", text)]
+    blob = " ".join(audits)
+    # CR-6.2 C3: audit carries the subject + a CONTENT HASH (never the raw text).
+    assert "skcode.inject" in blob and "allow" in blob
+    assert hashlib.sha256(text.encode()).hexdigest() in blob
+    assert text not in blob                  # the raw keystrokes are NOT logged
+
+
+def test_inject_floor_absent_falls_back_to_scope_only():
+    # No inject authorizer wired (a test double / legacy build): the shipped scope
+    # gate stands alone and a scoped token still injects (no PDP regression).
+    harness = _inject_harness()
+    write = _ctx_verifier("skcode.stream", "skcode.inject")
+    app = build_daemon_app(harness=harness, verify_caller=write)
+    r = TestClient(app).post("/api/v1/sessions/lumina-abc12345/inject",
+                             json={"text": "x"}, headers=_H)
+    assert r.status_code == 200
+    assert harness.injected == [("lumina-abc12345", "x")]
+
+
+def test_ratify_below_the_verified_floor_is_refused_403(mocker):
+    # ratify carries the same skcode.inject floor: a below-floor subject is 403 and
+    # the grade path is never reached.
+    sessions = [SessionDescriptor(sid="lumina-abc12345", host=".158",
+                                  harness="fake", repo="skharness", branch="wt/x")]
+    write = _ctx_verifier("skcode.stream", "skcode.inject")
+    app = build_daemon_app(
+        harness=_GradingHarness(sessions=sessions, grade_result=_five_complete()),
+        verify_caller=write, authorize_inject=_deny_inject(),
+        resolve_ratify=lambda s: (None, "", []), audit_log=lambda s: None)
+    r = TestClient(app).post("/api/v1/sessions/lumina-abc12345/ratify", json={},
+                             headers=_H)
+    assert r.status_code == 403

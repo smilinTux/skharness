@@ -1,0 +1,112 @@
+"""skcode-hostd route-coverage completeness gate (CR-6.2 C3).
+
+Mirrors skchat's dataplane coverage gate: enumerate the LIVE FastAPI route table
+and assert every served route is classified as exactly ONE of public / gated-with-
+scope. A new gated route that skips classification breaks CI the same day, not at
+the enable flip. It also asserts the two PDP-decided scopes (skcode.inject,
+skcode.dispatch) each have a capauth DEFAULT_RULES row, so ``decide`` never fails
+closed on "unknown capability" once the surface is enabled.
+"""
+from __future__ import annotations
+
+from starlette.routing import WebSocketRoute
+
+from skharness.daemon import (
+    PDP_SCOPES,
+    PUBLIC_ROUTES,
+    ROUTE_SCOPES,
+    build_daemon_app,
+    classify_route,
+)
+from skharness.harness import FakeHarness
+
+
+def _app():
+    return build_daemon_app(harness=FakeHarness(sessions=[], events={}),
+                            verify_caller=lambda t: False)
+
+
+# FastAPI auto-mounts these interactive-docs endpoints; they are framework
+# defaults, not part of skcode-hostd's declared surface, so the coverage gate for
+# OUR routes excludes them (they serve the OpenAPI schema / Swagger UI, no secrets).
+_FRAMEWORK_DOC_PATHS = frozenset({
+    "/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json",
+})
+
+
+def _served_routes() -> list[tuple[str, str]]:
+    """Every served (METHOD, path_format) on the real app. Websocket routes report
+    as method "WS"; HEAD/OPTIONS are auto-added by Starlette and carry no auth
+    semantics of their own, so they are skipped; the FastAPI framework doc routes
+    are excluded (see :data:`_FRAMEWORK_DOC_PATHS`)."""
+    out: list[tuple[str, str]] = []
+    for route in _app().routes:
+        path = getattr(route, "path_format", None) or getattr(route, "path", None)
+        if not path or path in _FRAMEWORK_DOC_PATHS:
+            continue
+        if isinstance(route, WebSocketRoute):
+            out.append(("WS", path))
+            continue
+        for method in getattr(route, "methods", None) or ():
+            if method in ("HEAD", "OPTIONS"):
+                continue
+            out.append((method.upper(), path))
+    return out
+
+
+def test_every_served_route_is_classified():
+    """COMPLETENESS: every served route is public OR gated-with-a-known-scope."""
+    unclassified: list[str] = []
+    for method, path in _served_routes():
+        klass, _scope = classify_route(method, path)
+        if klass is None:
+            unclassified.append(f"{method} {path}")
+    assert not unclassified, (
+        "served routes with no declared class (unsafe to enable the RCE surface):\n  "
+        + "\n  ".join(sorted(unclassified))
+    )
+
+
+def test_no_dead_route_declarations():
+    """DRIFT GUARD: every declared route (public or gated) is actually served."""
+    served = set(_served_routes())
+    declared = set(PUBLIC_ROUTES) | set(ROUTE_SCOPES)
+    dead = declared - served
+    assert not dead, f"declared routes that are not served (typo / removed route): {sorted(dead)}"
+
+
+def test_public_and_gated_maps_are_disjoint():
+    """A route is never BOTH public and gated (single class)."""
+    both = set(PUBLIC_ROUTES) & set(ROUTE_SCOPES)
+    assert not both, f"routes classified as BOTH public and gated: {sorted(both)}"
+
+
+def test_pdp_scopes_have_capauth_rule_rows():
+    """KNOWN CAPABILITIES ONLY: every PDP-decided scope (inject, dispatch) has a
+    rule row in capauth.authz.DEFAULT_RULES, so decide() never fails closed on an
+    unknown capability once inject/dispatch are enabled."""
+    from capauth.authz import DEFAULT_RULES
+
+    missing = sorted(PDP_SCOPES - set(DEFAULT_RULES))
+    assert not missing, f"PDP scopes with no capauth rule row: {missing}"
+
+
+def test_stream_scope_is_read_not_pdp():
+    """skcode.stream is a scope-only read capability: it gates the WS stream and is
+    NOT one of the PDP-decided scopes (no capauth rule row expected)."""
+    from capauth.authz import DEFAULT_RULES
+
+    assert ROUTE_SCOPES[("WS", "/api/v1/sessions/{sid}/stream")] == "skcode.stream"
+    assert "skcode.stream" not in PDP_SCOPES
+    assert "skcode.stream" not in DEFAULT_RULES
+
+
+def test_the_three_write_and_rce_routes_are_gated_on_the_right_scopes():
+    """Regression pins for the load-bearing CR-6.2 routes."""
+    assert classify_route("POST", "/api/v1/sessions/{sid}/inject") == ("gated", "skcode.inject")
+    assert classify_route("POST", "/api/v1/sessions/{sid}/ratify") == ("gated", "skcode.inject")
+    assert classify_route("POST", "/api/v1/dispatch") == ("gated", "skcode.dispatch")
+    assert classify_route("GET", "/api/v1/dispatch/targets") == ("gated", "skcode.dispatch")
+    # discovery + client are public (no bearer)
+    assert classify_route("GET", "/.well-known/skworld-module.json") == ("public", None)
+    assert classify_route("GET", "/app") == ("public", None)
