@@ -18,6 +18,7 @@ from skharness.harnesses.claude_code import (
     new_lines,
     parse_repo_allowlist,
     parse_windows,
+    sandbox_cloud_token_allowed,
     scan_historical,
 )
 
@@ -254,24 +255,68 @@ async def test_archive_is_idempotent(tmp_path):
 
 @pytest.mark.asyncio
 async def test_inject_sends_send_keys_to_the_window(tmp_path):
-    sid = "lumina-abc12345"
+    sid = "sandbox-abc12345"
     sent: list[list[str]] = []
 
     def runner(argv):
         if "list-windows" in argv:
-            return "monitor\t1\nlumina-abc12345\t1700000100\n"
+            return "monitor\t1\nsandbox-abc12345\t1700000100\n"
         if "send-keys" in argv:
             sent.append(list(argv))
             return ""
         raise AssertionError(f"unexpected tmux call: {argv}")
 
     h = ClaudeCodeHarness(runner=runner, sessions_root=tmp_path, host=".158")
+    # CR-6.2 C2: inject is scoped to daemon-spawned sids; register this one as one.
+    h._spawned_sids.add(sid)
     result = await h.inject(sid, "run the tests")
 
     assert result == {"sid": sid, "injected": True}
     # text then a separate Enter keypress, targeting the session's tmux window
-    assert sent == [["tmux", "send-keys", "-t", "skchat-agents:lumina-abc12345",
+    assert sent == [["tmux", "send-keys", "-t", "skchat-agents:sandbox-abc12345",
                      "run the tests", "Enter"]]
+
+
+@pytest.mark.asyncio
+async def test_inject_refuses_non_daemon_spawned_window(tmp_path):
+    # CR-6.2 C2: a live window that this daemon did NOT spawn (e.g. a full-privilege
+    # lumina/jarvis runtime sharing the `skchat-agents` tmux) is refused as a clean
+    # no-op, and inject NEVER sends keys to it.
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        if "list-windows" in argv:
+            return "monitor\t1\nlumina-deadbeef\t1700000100\n"
+        raise AssertionError(f"must not send keys to a foreign window: {argv}")
+
+    h = ClaudeCodeHarness(runner=runner, sessions_root=tmp_path, host=".158")
+    # lumina-deadbeef is a LIVE window but was not spawned by this daemon.
+    result = await h.inject("lumina-deadbeef", "sudo rm -rf /")
+
+    assert result["injected"] is False
+    assert "daemon-spawned" in result["reason"]
+    assert all("send-keys" not in c for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_inject_any_window_override_restores_reach(tmp_path, monkeypatch):
+    # The documented escape hatch (default OFF) lets inject reach any live window.
+    monkeypatch.setenv("SKCODE_INJECT_ANY_WINDOW", "1")
+    sent: list[list[str]] = []
+
+    def runner(argv):
+        if "list-windows" in argv:
+            return "monitor\t1\nlumina-deadbeef\t1700000100\n"
+        if "send-keys" in argv:
+            sent.append(list(argv))
+            return ""
+        raise AssertionError(f"unexpected tmux call: {argv}")
+
+    h = ClaudeCodeHarness(runner=runner, sessions_root=tmp_path, host=".158")
+    result = await h.inject("lumina-deadbeef", "hi")
+    assert result == {"sid": "lumina-deadbeef", "injected": True}
+    assert sent and sent[0][:2] == ["tmux", "send-keys"]
 
 
 @pytest.mark.asyncio
@@ -285,7 +330,10 @@ async def test_inject_unknown_sid_is_a_clean_noop(tmp_path):
         raise AssertionError(f"must not send keys to an unknown sid: {argv}")
 
     h = ClaudeCodeHarness(runner=runner, sessions_root=tmp_path, host=".158")
-    result = await h.inject("opus-deadbeef", "hi")  # not a live window
+    # Register as daemon-spawned so we exercise the no-live-window branch (C2 scope
+    # check passes), not the not-daemon-spawned refusal.
+    h._spawned_sids.add("opus-deadbeef")
+    result = await h.inject("opus-deadbeef", "hi")  # spawned, but not a live window
 
     assert result["injected"] is False
     assert "no live session" in result["reason"]
@@ -423,6 +471,10 @@ async def test_spawn_sandbox_creates_worktree_named_window_and_scoped_env(tmp_pa
     assert "--mcp-config" not in nw
     # and nothing sk* leaked into the child env
     assert not any(k.startswith("SK") for k in env)
+    # CR-6.2 C2: the spawned sid is now injectable (recorded as daemon-spawned).
+    assert session.sid in h._spawned_sids
+    assert h._inject_target_allowed(session.sid) is True
+    assert h._inject_target_allowed("lumina-deadbeef") is False
 
 
 @pytest.mark.asyncio
@@ -710,9 +762,12 @@ async def test_spawn_gateway_model_points_claude_at_skgateway(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_spawn_anthropic_model_keeps_oauth_and_no_gateway(tmp_path, monkeypatch):
-    # An Anthropic model id keeps the existing cloud path: OAuth token wired, no
-    # ANTHROPIC_BASE_URL override, --model is the concrete Anthropic value.
+async def test_spawn_anthropic_model_withholds_oauth_from_sandbox_by_default(tmp_path, monkeypatch):
+    # CR-6.2 C1: an Anthropic (cloud) model on the SANDBOX profile does NOT get the
+    # operator's real OAuth token by default. A prompt-injectable sandbox agent
+    # must not be able to read/exfiltrate the operator's Anthropic subscription
+    # token. --model + base URL behave as before; only the token is withheld.
+    monkeypatch.delenv("SKCODE_SANDBOX_ALLOW_CLOUD_TOKEN", raising=False)
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-secret")
     repo = tmp_path / "skharness"
     repo.mkdir()
@@ -728,10 +783,58 @@ async def test_spawn_anthropic_model_keeps_oauth_and_no_gateway(tmp_path, monkey
     nw = _new_window_argv(tcalls)
     env = _env_pairs(nw)
     launch = _launch_argv(nw)
-    assert env.get("CLAUDE_CODE_OAUTH_TOKEN") == "oauth-secret"
+    # THE precondition: the sandbox env does NOT carry the operator's cloud token.
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
     assert "ANTHROPIC_BASE_URL" not in env
     assert "ANTHROPIC_AUTH_TOKEN" not in env
     assert launch[launch.index("--model") + 1] == "opus"
+
+
+@pytest.mark.asyncio
+async def test_spawn_anthropic_model_full_profile_keeps_oauth(tmp_path, monkeypatch):
+    # The trusted FULL profile (allowlisted, real operator identity) still gets the
+    # cloud token: the withholding is scoped to the untrusted sandbox surface.
+    monkeypatch.delenv("SKCODE_SANDBOX_ALLOW_CLOUD_TOKEN", raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-secret")
+    repo = tmp_path / "skharness"
+    repo.mkdir()
+    runner, tcalls = _tmux_recorder()
+    git, _ = _git_ok()
+    h = _spawn_harness(repo, runner=runner, git_runner=git, profile_full_cfg=True)
+
+    desc = SessionDescriptor(repo=str(repo), branch="main", model="claude-opus-4-8",
+                             quality="full")
+    await h.spawn(desc, prompt="p")
+
+    env = _env_pairs(_new_window_argv(tcalls))
+    assert env.get("CLAUDE_CODE_OAUTH_TOKEN") == "oauth-secret"
+    assert "ANTHROPIC_BASE_URL" not in env
+
+
+@pytest.mark.asyncio
+async def test_spawn_sandbox_cloud_token_optin_restores_oauth(tmp_path, monkeypatch):
+    # The documented opt-in (default OFF) is the ONLY way a sandbox gets the cloud
+    # token back. When explicitly set, the token is injected again.
+    monkeypatch.setenv("SKCODE_SANDBOX_ALLOW_CLOUD_TOKEN", "1")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-secret")
+    assert sandbox_cloud_token_allowed() is True
+    repo = tmp_path / "skharness"
+    repo.mkdir()
+    runner, tcalls = _tmux_recorder()
+    git, _ = _git_ok()
+    h = _spawn_harness(repo, runner=runner, git_runner=git)
+
+    desc = SessionDescriptor(repo=str(repo), branch="x", model="claude-opus-4-8",
+                             quality="sandbox")
+    await h.spawn(desc, prompt="p")
+
+    env = _env_pairs(_new_window_argv(tcalls))
+    assert env.get("CLAUDE_CODE_OAUTH_TOKEN") == "oauth-secret"
+
+
+def test_sandbox_cloud_token_disallowed_by_default(monkeypatch):
+    monkeypatch.delenv("SKCODE_SANDBOX_ALLOW_CLOUD_TOKEN", raising=False)
+    assert sandbox_cloud_token_allowed() is False
 
 
 @pytest.mark.asyncio

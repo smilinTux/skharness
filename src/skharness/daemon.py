@@ -14,6 +14,7 @@ verifier lands (R2.4). Bind a Tailscale IP only (serve.py enforces this).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Callable
@@ -61,6 +62,74 @@ SCOPE_WRITE = "skcode.inject"
 # separate authz allow decision AND an audit sink (all fail closed).
 SCOPE_DISPATCH = "skcode.dispatch"
 
+# The capauth capability the inject/ratify PDP decides on (CR-6.2 C2/C8). Same
+# string as SCOPE_WRITE; seeded VERIFIED in capauth.authz.DEFAULT_RULES (C3), so
+# routing inject/ratify through decide() enforces the enrollment-mode floor in
+# code, not only at token issuance.
+INJECT_CAPABILITY = SCOPE_WRITE
+
+
+# --------------------------------------------------------------------------- #
+# Route-coverage classification (SKWorld Authorization Model L1.3; CR-6.2 C3).
+# Every HTTP/WS route this daemon serves is exactly ONE class: PUBLIC (no bearer)
+# or gated on a named scope. The coverage-completeness test enumerates the LIVE
+# app route table and asserts every served route is declared here, so a new gated
+# route can never ship unclassified (the same class of gap the skchat dataplane
+# coverage gate closes). ``skcode.stream`` is scope-only (read/view, no PDP
+# decision); ``skcode.inject`` and ``skcode.dispatch`` are additionally PDP-decided
+# and carry a capauth DEFAULT_RULES row.
+# --------------------------------------------------------------------------- #
+PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset({
+    ("GET", "/.well-known/skworld-module.json"),
+    ("GET", "/"),
+    ("GET", "/app"),
+})
+
+#: (METHOD, path_format) -> required scope for every gated route. "WS" is the
+#: websocket stream (browsers cannot set headers, so its token rides the query).
+ROUTE_SCOPES: dict[tuple[str, str], str] = {
+    ("GET", "/api/v1/hosts/self"): SCOPE_READ,
+    ("GET", "/api/v1/sessions"): SCOPE_READ,
+    ("GET", "/api/v1/sessions/{sid}"): SCOPE_READ,
+    ("GET", "/api/v1/dispatch/targets"): SCOPE_DISPATCH,
+    ("POST", "/api/v1/sessions/{sid}/ratify"): SCOPE_WRITE,
+    ("POST", "/api/v1/sessions/{sid}/inject"): SCOPE_WRITE,
+    ("POST", "/api/v1/dispatch"): SCOPE_DISPATCH,
+    ("WS", "/api/v1/sessions/{sid}/stream"): SCOPE_READ,
+}
+
+#: Scopes that route through the capauth PDP (decide) and so REQUIRE a rule row in
+#: capauth.authz.DEFAULT_RULES. ``skcode.stream`` is deliberately excluded (it is a
+#: scope-only read capability with no PDP decision).
+PDP_SCOPES: frozenset[str] = frozenset({SCOPE_WRITE, SCOPE_DISPATCH})
+
+
+def classify_route(method: str, path: str) -> tuple[str | None, str | None]:
+    """Classify a served route as ("public", None) | ("gated", scope) | (None, None).
+
+    (None, None) means UNCLASSIFIED, which the coverage test treats as a failure:
+    a gated route with no declared scope is unsafe to ship (it might not be gated
+    at all, or be gated on an unknown scope).
+    """
+    key = (method.upper(), path)
+    if key in PUBLIC_ROUTES:
+        return ("public", None)
+    scope = ROUTE_SCOPES.get(key)
+    if scope is not None:
+        return ("gated", scope)
+    return (None, None)
+
+
+def _content_hash(text: str | None) -> str:
+    """A sha256 hex digest of injected content for the audit line (CR-6.2 C3).
+
+    The raw keystrokes are NEVER logged (a session may be sent secrets); the audit
+    records only this digest + a length, so an inject is attributable to WHAT was
+    sent (comparable across lines) without disclosing the content itself.
+    """
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
 _CLIENT_DIR = Path(__file__).parent / "client"
 _PLACEHOLDER = (
     "<!doctype html><meta charset=utf-8><title>skcode-hostd</title>"
@@ -86,6 +155,7 @@ def build_daemon_app(
     emit_event: Callable[[str, SessionEvent], None] | None = None,
     audit_log: Callable[[str], None] | None = None,
     authorize_dispatch: Authorizer | None = None,
+    authorize_inject: Authorizer | None = None,
     dispatch_targets: TargetsProvider | None = None,
     dispatch_paused: PausePredicate | None = None,
 ) -> FastAPI:
@@ -122,6 +192,28 @@ def build_daemon_app(
                 data = ob.model_dump()
             _emit_audit({"kind": getattr(ob, "kind", "audit"), "data": data or {}})
 
+    def _enforce_inject_floor(subject: str, resource: dict) -> None:
+        """CR-6.2 C2/C8: the PDP enrollment-mode floor for the write surface.
+
+        When an inject authorizer is configured (production wiring), route the
+        inject/ratify write through ``capauth.authz.decide`` the way dispatch does,
+        requiring the verified-tier ``skcode.inject`` capability. A deny is 403 and
+        audited; the actuation is never reached. When no authorizer is configured
+        (test doubles that exercise only the shipped scope split), the scope gate
+        stands alone and this is a no-op. The live daemon always wires the
+        authorizer (serve.build_inject_authorizer), so the floor is enforced in
+        code there, not only at token issuance.
+        """
+        if authorize_inject is None:
+            return
+        decision = authorize_inject(subject, resource, {})
+        _emit_decision_obligations(decision)
+        if not bool(getattr(decision, "allow", False)):
+            _emit_audit({"event": "skcode.inject", "subject": subject,
+                         "resource": resource, "decision": "deny",
+                         "reason": getattr(decision, "reason", "")})
+            raise HTTPException(403, "inject not authorized")
+
     @app.get("/.well-known/skworld-module.json")
     async def module_manifest(request: Request):
         # Public discovery metadata (NO bearer): the shell reads the manifest to
@@ -155,8 +247,11 @@ def build_daemon_app(
         # the session's EXISTING worktree diff. It never merges/commits/pushes (see
         # skharness.autocode.ratify), so it does not modify the repo. It is still
         # a WRITE-class action (it actuates a grade over the session), so it needs
-        # SCOPE_WRITE: a read-only token cannot trigger it.
-        _auth(authorization, SCOPE_WRITE)
+        # SCOPE_WRITE: a read-only token cannot trigger it. CR-6.2 C2/C8: it also
+        # passes the PDP mode floor (verified skcode.inject) when the authorizer is
+        # wired, exactly like inject.
+        auth = _authed_context(authorization, SCOPE_WRITE)
+        _enforce_inject_floor(_subject(auth), {"host": host_id, "sid": sid, "action": "ratify"})
         session = next((s for s in await harness.list_sessions() if s.sid == sid), None)
         if session is None:
             raise HTTPException(404, "session not found")
@@ -192,15 +287,31 @@ def build_daemon_app(
         # with no/invalid token is 401/403 and harness.inject is never reached.
         # A read-only (skcode.stream) token is 403 here too: inject needs
         # SCOPE_WRITE, so enabling view never arms keystroke-inject.
-        _auth(authorization, SCOPE_WRITE)
+        auth = _authed_context(authorization, SCOPE_WRITE)
+        subject = _subject(auth)
+        # CR-6.2 C2/C8: PDP mode floor. When configured, inject routes through
+        # capauth.authz.decide requiring the verified-tier skcode.inject
+        # capability; a deny is 403 (audited) and the harness is never reached.
+        _enforce_inject_floor(subject, {"host": host_id, "sid": sid, "action": "inject"})
         try:
             body = await request.json()
         except Exception:
             body = {}
         text = (body or {}).get("text", "")
         result = await harness.inject(sid, text)
-        if audit_log is not None:
-            audit_log(f"inject {sid} {'OK' if result.get('injected') else 'NOOP'}")
+        # CR-6.2 C3: enrich the inject audit with the subject + a content HASH
+        # (never the raw keystrokes) so the action is attributable to WHO + WHAT
+        # without recording secrets typed into a session.
+        _emit_audit({
+            "event": "skcode.inject",
+            "subject": subject,
+            "sid": sid,
+            "decision": "allow",
+            "injected": bool(result.get("injected")),
+            "reason": result.get("reason", ""),
+            "content_sha256": _content_hash(text),
+            "content_len": len(text or ""),
+        })
         return JSONResponse(result)
 
     @app.get("/api/v1/dispatch/targets")
