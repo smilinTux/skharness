@@ -3,7 +3,9 @@
 Date: 2026-08-08
 Author: Lumina (Opus 4.8 harness session)
 Repo: `~/clawd/skcapstone-repos/skharness` (branch `master`)
-Status: approved decisions, pre-implementation
+Status: DONE + DEPLOYED (skharness `2ba879d`). Verified e2e: inject on an
+interactive session respawns a `--resume` turn that appends structured events to
+the same log and recalls prior context ("77"), cloud-free via local Ornith.
 
 ## Context
 
