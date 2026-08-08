@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=61", "setuptools_scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "skharness"
-version = "0.3.1"
+dynamic = ["version"]
 description = "Sovereign phone-drives-my-agent-swarm harness (execution: sessions + autocode engine)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -62,3 +62,17 @@ markers = [
     # tests/conftest.py hook auto-skips these when skcapstone cannot be imported.
     "needs_skcapstone: requires the optional sibling skcapstone package (auto-skipped when absent)",
 ]
+
+[tool.setuptools_scm]
+# The git tag IS the version. A push to the default branch cuts the next
+# patch tag (see .github/workflows/publish.yml), so every release carries a
+# genuinely new version instead of rebuilding 0.3.1 forever.
+#
+# These repos also carry NON-semver tags (swarm-20260717, fixwave-20260723,
+# memory-index-fix-20260804, nextcloud-v0.3.0). setuptools-scm defaults to the
+# newest tag of ANY shape, which derived a nonsense version like
+# 20260805.dev25 for skcapstone. Both settings below restrict it to release
+# tags only, matching the `--match 'v[0-9]*'` the tag job uses, so the two
+# cannot disagree about which tag is current.
+tag_regex = "^v(?P<version>[0-9]+\\.[0-9]+\\.[0-9]+)$"
+git_describe_command = ["git", "describe", "--dirty", "--tags", "--long", "--match", "v[0-9]*"]
