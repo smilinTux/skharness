@@ -139,12 +139,12 @@
     <div class="field">
       <label for="model">model</label>
       <select id="model">
-        <option value="sk-default">sk-default</option>
-        <option value="claude-sonnet-5">claude-sonnet-5</option>
-        <option value="claude-opus-4-8">claude-opus-4-8</option>
-        <option value="ornith-big">ornith-big</option>
+        <option value="sk-default">sk-default (local Ornith, cloud-free)</option>
+        <option value="claude-sonnet-5">claude-sonnet-5 (Anthropic cloud)</option>
+        <option value="claude-opus-4-8">claude-opus-4-8 (Anthropic cloud)</option>
+        <option value="ornith-big">ornith-big (local Ornith 35B, cloud-free)</option>
       </select>
-      <div class="hint">richer model routing arrives with the skgateway update</div>
+      <div class="hint" id="model-hint"></div>
     </div>
   </div>
   <div class="field prompt-field">
@@ -433,6 +433,22 @@ profileEl.addEventListener("change", updateProfileHint);
 updateProfileHint();
 var harnessEl = document.getElementById("harness");
 var modelEl = document.getElementById("model");
+// Say plainly where each model runs. The sk-* / ornith ids route THROUGH
+// skgateway to a local Ornith backend (no Anthropic cloud call, no cloud
+// token); the claude-* ids call the Anthropic cloud. This is live routing,
+// not a placeholder.
+var modelHintEl = document.getElementById("model-hint");
+function updateModelHint() {
+  if (modelEl.value === "sk-default" || modelEl.value === "ornith-big") {
+    modelHintEl.textContent = "routes through skgateway to local Ornith: "
+      + "cloud-free, no Anthropic call, no cloud token. Fast, private, sovereign.";
+  } else {
+    modelHintEl.textContent = "calls the Anthropic cloud (needs the operator's "
+      + "cloud token; withheld from sandbox by default).";
+  }
+}
+modelEl.addEventListener("change", updateModelHint);
+updateModelHint();
 // Sessions are always interactive (stays open, chat-like) from the UI. The
 // backend still supports a one-shot "direct" mode, reserved for the fast/cheap
 // skgateway model path (a follow-on), so it is not offered as a picker here.
