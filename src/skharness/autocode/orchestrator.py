@@ -351,17 +351,53 @@ def _decompose_card(board, harness, task: dict, brief: AssessBrief, *, caps: Cap
         seen_titles.add(norm)
         tags = list(parent_tags) + ["autopilot", f"parent:{tid}"]
         if not autobuild:
-            tags.append("autopilot-untriaged")     # human-release gate (default)
+            # Born STAGED into the "Proposed" lane: autopilot-staged hides the child
+            # from OPEN/unblocked entirely (never selected or built), autopilot-untriaged
+            # is the legacy build gate. A human runs `skos autopilot release <epic>` to
+            # promote the whole set. This is what keeps a scoped decomposition from
+            # dumping unreviewed children onto the active buildable backlog.
+            tags += ["autopilot-untriaged", "autopilot-staged"]
         child_id = stable_qid(f"{tid}:{s.get('title', i)}", tid)[:8]
         _create_child(board, title=s.get("title", ""), description=s.get("description", ""),
                       tags=tags, acceptance_criteria=s.get("acceptance") or [],
-                      meta={"autopilot": {"parent": tid, "decomp_depth": depth + 1}},
+                      meta={"autopilot": {"parent": tid, "decomp_depth": depth + 1,
+                                          "staged": not autobuild}},
                       task_id=child_id)
         child_ids.append(child_id)
     if run_budget is not None:                     # consume the per-run child budget
         run_budget[0] -= len(child_ids)
     if child_ids:                                  # only park the epic if we created work
         board.mark_decomposed(tid, child_ids, run_id=run_id)
+
+
+def release_epic(epic_id: str, *, board=None, tasks=None,
+                 run_id: str | None = None) -> list[str]:
+    """Promote an epic's STAGED children into the active buildable backlog.
+
+    Strips ``autopilot-staged`` (which hides a card in the Proposed lane and out of
+    unblocked/selection) and ``autopilot-untriaged`` (the build gate) from every card
+    tagged ``parent:<epic_id>``. This is the human "pick-up" action after reviewing a
+    scoped decomposition. Idempotent: cards without the staged tag are skipped.
+    Returns the released child ids.
+    """
+    if board is None:
+        from skcapstone.coordination import Board
+        from skcapstone.mcp_tools._helpers import _shared_root
+        board = Board(_shared_root())
+    if tasks is None:
+        tasks = load_raw_tasks(_default_tasks_dir())
+    run_id = run_id or _new_run_id()
+    released: list[str] = []
+    for t in _iter_tasks(tasks):
+        if _card_parent(t) != epic_id:
+            continue
+        if "autopilot-staged" not in (t.get("tags") or []):
+            continue
+        board.update_task(t.get("id"),
+                          remove_tags=["autopilot-staged", "autopilot-untriaged"],
+                          run_id=run_id)
+        released.append(t.get("id"))
+    return released
 
 
 def phase0_assess(*, board, harness, tasks_dir, caps: Caps, run_id: str,

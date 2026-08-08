@@ -62,11 +62,6 @@ _DEFAULT_CHILD_PATH = (
 )
 
 
-#: The onboarding version stamped into the seeded ~/.claude.json for interactive
-#: sessions. It only needs to be a version claude accepts as "already onboarded"
-#: so the first-run wizard is skipped; the exact value is not load-bearing.
-_SEED_ONBOARDING_VERSION = "2.1.119"
-
 #: CR-6.2 C1 (cloud OAuth token exfil). By CONSTRUCTION the sandbox profile does
 #: NOT receive the operator's real Anthropic subscription token
 #: (``CLAUDE_CODE_OAUTH_TOKEN``): a sandbox session is the untrusted,
@@ -401,6 +396,12 @@ class ClaudeCodeHarness(Harness):
         # drive skcode-spawned sessions, never an arbitrary full-privilege agent
         # window (lumina/jarvis) that merely shares the `skchat-agents` tmux.
         self._spawned_sids: set[str] = set()
+        # B2: for an interactive (resumable) session, the spawn context inject needs
+        # to rebuild the `claude -p --resume` env + argv (profile/model/agent; the
+        # worktree is derived from the sid). Populated only for interactive spawns,
+        # so inject's destructive respawn-pane can ONLY target a session THIS daemon
+        # started as resumable. In-memory (same lifetime as _spawned_sids).
+        self._resume_ctx: dict[str, dict] = {}
 
     def capabilities(self) -> HarnessCapabilities:
         # Session plane over a PTY (tmux): reads + P1 inject/archive + P2 spawn.
@@ -493,22 +494,27 @@ class ClaudeCodeHarness(Harness):
         return sid in self._spawned_sids
 
     async def inject(self, sid: str, text: str) -> dict:
-        """Inject operator `text` into a running session as tmux keystrokes (P1).
+        """Inject an operator follow-up into a running session (P1, B2 resume).
 
-        Sends `text` followed by an Enter keypress to the session's tmux window
-        via the injectable argv runner (never shell=True):
-        ``tmux send-keys -t skchat-agents:<sid> <text> Enter``. This is a WRITE
-        verb; the daemon route that calls it stays behind the capauth bearer gate.
+        The session runs headless stream-json, so a follow-up is delivered as a
+        fresh ``claude -p --resume <session_id>`` turn RESPAWNED in the same tmux
+        pane, NOT raw keystrokes into a TUI (claude does not read a pty stdin under
+        ``--print``). The resumed turn's structured events append to the same
+        `.skcode/stream.jsonl`, so :meth:`stream` surfaces them with no client
+        change. This is a WRITE verb; the daemon route stays behind the capauth gate.
 
-        Scoped by CONSTRUCTION (CR-6.2 C2): inject only reaches a session THIS
-        daemon spawned (see :meth:`_inject_target_allowed`). A target that is not a
-        daemon-spawned sid is refused as a clean no-op and NEVER touches tmux, so
-        inject cannot drive an arbitrary agent window that merely shares the
-        `skchat-agents` tmux session.
+        Gated by CONSTRUCTION:
+        - CR-6.2 C2: only a session THIS daemon spawned
+          (:meth:`_inject_target_allowed`).
+        - B2: only a session recorded as RESUMABLE (``_resume_ctx``, interactive
+          spawns only), because ``respawn-pane -k`` is DESTRUCTIVE (it replaces the
+          pane's process). So inject can never kill+respawn an arbitrary window,
+          even past the C2 escape hatch.
 
-        Idempotent + safe: an invalid sid, or a sid with no live tmux window
-        (already archived / never running), returns a clean ``injected: False``
-        no-op result rather than raising, and NEVER touches tmux.
+        Idempotent + safe: an invalid sid, a non-daemon-spawned / non-resumable
+        target, a sid with no live window, or a session whose turn 1 has not emitted
+        its init event yet (no session_id) each return a clean ``injected: False``
+        no-op and NEVER respawn anything.
         """
         if not _SID_RE.match(sid):
             return {"sid": sid, "injected": False, "reason": "invalid session id"}
@@ -529,11 +535,43 @@ class ClaudeCodeHarness(Harness):
                 "reason": "no live session (already archived or never running)",
             }
 
+        ctx = self._resume_ctx.get(sid)
+        if not ctx:
+            return {
+                "sid": sid,
+                "injected": False,
+                "reason": ("not a resumable session (only interactive sessions this "
+                           "daemon spawned can be injected)"),
+            }
+
+        session_id = self._read_session_id(sid)
+        if not session_id:
+            return {
+                "sid": sid,
+                "injected": False,
+                "reason": "session not ready (turn 1 has not emitted its init event yet)",
+            }
+
+        worktree = self.worktree_root / sid
+        env = self._build_env(ctx["profile"], ctx["agent"], worktree, ctx["model"])
+        resume = self._resume_argv(ctx["profile"], ctx["model"], session_id, text)
+        env_argv = ["env", "-i", *[f"{k}={v}" for k, v in env.items()]]
         target = f"{self.tmux_session}:{sid}"
-        # Send the text, then a separate Enter keypress so the running CLI reads
-        # it as a submitted line. argv-based runner => no shell, and the sid is
-        # charset-validated above, so nothing here is shell-interpolated.
-        self._runner(["tmux", "send-keys", "-t", target, text, "Enter"])
+        # Respawn the pane with the resume turn. respawn-pane execs the argv after
+        # '--' DIRECTLY (no sh -c), same as new-window; -k replaces the prior
+        # (usually exited) one-shot process; -c scopes cwd to the worktree. The
+        # message is a distinct argv element, never shell-parsed; the sid is
+        # charset-validated above.
+        self._runner([
+            "tmux", "respawn-pane", "-k", "-c", str(worktree), "-t", target,
+            "--", *env_argv, *resume,
+        ])
+        # Re-attach pipe-pane so the resumed turn's JSONL appends to the same log
+        # (respawn replaces the process; re-issuing pipe-pane is idempotent with -o).
+        self._runner([
+            "tmux", "pipe-pane", "-o", "-t", target,
+            f"cat >> '{self._stream_log_path(sid)}'",
+        ])
         return {"sid": sid, "injected": True}
 
     # --- spawn: start a NEW session (the Dispatch unlock, skcode P2) -----------
@@ -613,42 +651,25 @@ class ClaudeCodeHarness(Harness):
             env["HOME"] = str(worktree)
         return env
 
-    def _claude_argv(self, profile: str, prompt: str, mode: str, model: str) -> list[str]:
-        """Build the ``claude`` launch argv for a session ``mode``.
+    def _claude_argv(self, profile: str, prompt: str, model: str) -> list[str]:
+        """Build the headless ``claude`` launch argv for a NEW session (turn 1).
+
+        Both session modes launch identically (B2): ``claude -p
+        --dangerously-skip-permissions --output-format stream-json --verbose
+        [--mcp-config ...] --model <m> <prompt>``. Print mode (-p) runs the prompt
+        and skips the first-run onboarding wizard; ``--output-format stream-json
+        --verbose`` emits newline-delimited JSON events (parsed by
+        :func:`parse_stream_json_line`) instead of a rendered TUI. The mode
+        difference is downstream only: a DIRECT session is one-shot, an INTERACTIVE
+        session is resumable via :meth:`inject` (``claude -p --resume``).
 
         The prompt is a distinct argv element (DATA), never interpolated into a
-        shell string. The sk* MCP config is added ONLY for the full profile; the
-        sandbox profile never references it. ``--model`` is ALWAYS passed, mapped
-        via :func:`map_model`.
-
-        DIRECT mode (default): ``claude -p --dangerously-skip-permissions ... --model <m> <prompt>``.
-        Print mode (-p) runs the prompt non-interactively and produces output,
-        skipping the first-run onboarding wizard that would otherwise block a
-        fresh-HOME sandbox forever. --dangerously-skip-permissions lets the
-        session act without per-action approval; it is confined to the sandbox
-        worktree / scratch dir and the no-operator-context env.
-
-        INTERACTIVE mode: ``claude ... --model <m> <prompt>`` (NO -p, NO
-        --dangerously-skip-permissions). The prompt runs, then the TUI STAYS OPEN
-        in manual mode ready for injected follow-ups (the inject path). Interactive
-        runs WITHOUT --dangerously-skip-permissions on purpose: claude asks
-        per-action permission (safer, not less safe). The first-run dialogs are
-        skipped instead by the seeded ~/.claude.json spawn writes into the worktree
-        HOME (see :meth:`_write_interactive_seed`).
+        shell string. The sk* MCP config is added ONLY for the full profile;
+        ``--model`` is ALWAYS passed, mapped via :func:`map_model`.
         """
-        if mode == "interactive":
-            argv = [self.claude_bin, *self.claude_base_args]
-        else:
-            # DIRECT: print mode + structured events (Task 3-B1). --output-format
-            # stream-json --verbose makes claude emit newline-delimited JSON
-            # events (system/init, assistant, tool_use, tool_result, result)
-            # instead of a rendered TUI, so the stream is parsed structurally
-            # (see :func:`parse_stream_json_line`) rather than screen-scraped.
-            # --verbose is REQUIRED with stream-json or only the final result is
-            # emitted, not the incremental events.
-            argv = [self.claude_bin, "-p", "--dangerously-skip-permissions",
-                    "--output-format", "stream-json", "--verbose",
-                    *self.claude_base_args]
+        argv = [self.claude_bin, "-p", "--dangerously-skip-permissions",
+                "--output-format", "stream-json", "--verbose",
+                *self.claude_base_args]
         if profile == "full" and self.mcp_config:
             argv += ["--mcp-config", str(self.mcp_config)]
         argv += ["--model", map_model(model)]
@@ -657,37 +678,24 @@ class ClaudeCodeHarness(Harness):
         argv += [str(prompt or "")]
         return argv
 
-    def _write_interactive_seed(self, worktree: Path) -> Path:
-        """Seed ``<worktree>/.claude.json`` so an interactive session skips ALL
-        first-run dialogs (onboarding, trust-folder, bypass-warning).
+    def _resume_argv(self, profile: str, model: str, session_id: str,
+                     text: str) -> list[str]:
+        """Build the ``claude -p --resume`` argv for an inject follow-up (B2).
 
-        The child's HOME is the worktree (``env -i`` scopes it there), so claude
-        reads this file as ``~/.claude.json``. The ``projects`` key MUST be keyed
-        by the absolute worktree path (the child's HOME + cwd) for the trust dialog
-        to be pre-accepted. Interactive mode has no ``-p`` to auto-skip the wizard,
-        so this seed is what lets a fresh HOME launch straight into the session.
+        Same headless flags as :meth:`_claude_argv`, plus ``--resume <session_id>``
+        to continue the prior conversation, with the operator message as the LAST
+        argv element (DATA, never shell-parsed). ``session_id`` is a claude-issued
+        UUID read from the session's own stream-json init event.
         """
-        wt = str(worktree)
-        seed = {
-            "hasCompletedOnboarding": True,
-            "lastOnboardingVersion": _SEED_ONBOARDING_VERSION,
-            "theme": "dark",
-            "numStartups": 5,
-            "bypassPermissionsModeAccepted": True,
-            "projects": {
-                wt: {
-                    "hasTrustDialogAccepted": True,
-                    "hasCompletedProjectOnboarding": True,
-                    "allowedTools": [],
-                }
-            },
-        }
-        # The worktree dir already exists after `git worktree add` / the scratch
-        # mkdir; ensure it anyway so seeding never races the dir into existence.
-        worktree.mkdir(parents=True, exist_ok=True)
-        path = worktree / ".claude.json"
-        path.write_text(json.dumps(seed, indent=2))
-        return path
+        argv = [self.claude_bin, "-p", "--resume", str(session_id),
+                "--dangerously-skip-permissions",
+                "--output-format", "stream-json", "--verbose",
+                *self.claude_base_args]
+        if profile == "full" and self.mcp_config:
+            argv += ["--mcp-config", str(self.mcp_config)]
+        argv += ["--model", map_model(model)]
+        argv += [str(text or "")]
+        return argv
 
     async def spawn(self, desc: SessionDescriptor, *, prompt: str) -> HarnessSession:
         """Start a NEW claude-code session in an isolated worktree + tmux window.
@@ -775,25 +783,20 @@ class ClaudeCodeHarness(Harness):
             except OSError as exc:
                 raise SpawnRejected(f"scratch dir create failed: {exc}")
 
-        # Interactive mode has no -p to auto-skip the first-run wizard, so seed a
-        # ~/.claude.json (keyed by the worktree = the child's HOME) that pre-accepts
-        # every first-run dialog. Direct mode's -p already skips onboarding, so no
-        # seed is written there.
-        if mode == "interactive":
-            self._write_interactive_seed(worktree)
+        # B2: both modes launch headless stream-json (-p skips onboarding), so no
+        # ~/.claude.json seed is written for either. The mode difference is only
+        # that interactive is resumable via inject.
         env = self._build_env(profile, agent, worktree, desc.model)
-        launch = self._claude_argv(profile, prompt, mode, desc.model)
+        launch = self._claude_argv(profile, prompt, desc.model)
         env_argv = ["env", "-i", *[f"{k}={v}" for k, v in env.items()]]
-        # DIRECT sessions emit stream-json; make the capture dir now so the
-        # pipe-pane `cat >>` (attached below) can write the JSONL into it. Its
-        # existence is ALSO the signal stream() uses to parse structurally vs
-        # screen-scrape, so only direct sessions get a .skcode dir.
+        # EVERY session emits stream-json; make the capture dir now so the pipe-pane
+        # `cat >>` (attached below) can write the JSONL into it. Its existence is
+        # ALSO the signal stream() uses to parse structurally vs screen-scrape.
         stream_log = self._stream_log_path(sid)
-        if mode == "direct":
-            try:
-                stream_log.parent.mkdir(parents=True, exist_ok=True)
-            except OSError:
-                pass
+        try:
+            stream_log.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
         # Ensure the target tmux session exists (a fresh host has no tmux server,
         # so `new-window -t skchat-agents` would silently fail and the session
         # would never appear in list_sessions). `new-session -d` creates it if
@@ -814,23 +817,29 @@ class ClaudeCodeHarness(Harness):
             "tmux", "set-window-option", "-t", f"{self.tmux_session}:{sid}",
             "remain-on-exit", "on",
         ])
-        if mode == "direct":
-            # Copy the pane's output (the stream-json JSONL) to the capture file so
-            # stream() can tail + parse it. pipe-pane runs its command via /bin/sh,
-            # but the command is a FIXED `cat >> '<path>'`: the path is
-            # worktree_root (fixed config) / sid (charset-validated [A-Za-z0-9_-]+)
-            # / .skcode/stream.jsonl, so it contains no shell metacharacters and
-            # nothing operator-supplied. The claude launch itself stays shell-free
-            # (exec'd directly by new-window above); only this side-channel copy
-            # uses sh, and only with a path this code fully controls.
-            self._runner([
-                "tmux", "pipe-pane", "-o", "-t", f"{self.tmux_session}:{sid}",
-                f"cat >> '{stream_log}'",
-            ])
+        # Copy the pane's output (the stream-json JSONL) to the capture file so
+        # stream() can tail + parse it. pipe-pane runs its command via /bin/sh, but
+        # the command is a FIXED `cat >> '<path>'`: the path is worktree_root (fixed
+        # config) / sid (charset-validated [A-Za-z0-9_-]+) / .skcode/stream.jsonl,
+        # so it contains no shell metacharacters and nothing operator-supplied. The
+        # claude launch itself stays shell-free (exec'd directly by new-window
+        # above); only this side-channel copy uses sh, with a path this code owns.
+        self._runner([
+            "tmux", "pipe-pane", "-o", "-t", f"{self.tmux_session}:{sid}",
+            f"cat >> '{stream_log}'",
+        ])
 
         # CR-6.2 C2: remember this is a daemon-spawned session so inject may reach
         # it (and ONLY it, plus its siblings). Recorded after the window is created.
         self._spawned_sids.add(sid)
+        # B2: an interactive session is resumable; record what inject needs to
+        # rebuild the `claude -p --resume` env + argv. Direct sessions are one-shot
+        # and get NO resume context, so inject's destructive respawn cannot touch
+        # them (or any window this daemon did not start as resumable).
+        if mode == "interactive":
+            self._resume_ctx[sid] = {
+                "profile": profile, "model": desc.model, "agent": agent,
+            }
 
         return HarnessSession(
             sid=sid,
@@ -850,6 +859,34 @@ class ClaudeCodeHarness(Harness):
         spawn-time state. The parent ``.skcode`` dir's existence is the signal that
         a session is structured (spawn creates it only for direct mode)."""
         return self.worktree_root / sid / ".skcode" / "stream.jsonl"
+
+    def _read_session_id(self, sid: str) -> str | None:
+        """Return the LATEST ``system/init`` session_id from the session's
+        stream.jsonl, or None if there is no init event yet (turn 1 not started /
+        not far enough) or no file.
+
+        inject ``--resume`` chains from the MOST RECENT turn: a resumed turn emits a
+        fresh init, so the last init's session_id carries all prior turns. Fail soft
+        (blank / non-JSON lines are skipped, never raise)."""
+        latest = None
+        try:
+            with open(self._stream_log_path(sid), "r", encoding="utf-8",
+                      errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except (ValueError, TypeError):
+                        continue
+                    if (isinstance(obj, dict) and obj.get("type") == "system"
+                            and obj.get("subtype") == "init"
+                            and obj.get("session_id")):
+                        latest = obj["session_id"]
+        except FileNotFoundError:
+            return None
+        return latest
 
     async def stream(self, sid: str) -> AsyncIterator[SessionEvent]:
         now = time.time()

@@ -336,7 +336,42 @@ def test_phase0_decompose_budget_allows_epic_that_fits(tmp_path, mocker):
         caps=Caps(max_decompose_children_per_run=8), run_id="r", only_ids=["t-vague"])
     assert len(created) == 2                           # fits the budget: split proceeds
     board.mark_decomposed.assert_called_once()
-    board.mark_decomposed.assert_called_once()
+
+
+# -- B2 staged "Proposed" lane: decomposed children are born staged (hidden from
+#    OPEN/build) until `skos autopilot release <epic>` strips the stage --------------
+
+def test_phase0_scoped_decompose_children_born_staged(tmp_path, mocker):
+    board, created = _decompose_board(tmp_path)
+    harness = MagicMock()
+    harness.assess.return_value = Verdict(verdict="decompose", reason="coarse")
+    harness.decompose.return_value = [{"title": "sub A", "acceptance": ["a.py has f"]}]
+    mocker.patch("skharness.autocode.orchestrator._ground_card",
+                 return_value=_Grounding(grounded=False))
+    orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                       caps=Caps(), run_id="r", only_ids=["t-vague"])
+    assert created                                       # split happened
+    for c in created:
+        assert "autopilot-staged" in c.tags              # born into the Proposed lane
+        assert c.meta["autopilot"]["staged"] is True
+
+
+def test_release_epic_strips_stage_from_children(tmp_path):
+    board = MagicMock()
+    tasks = [
+        {"id": "c1", "tags": ["repo:skos", "parent:e1", "autopilot-staged",
+                              "autopilot-untriaged"]},
+        {"id": "c2", "tags": ["repo:skos", "parent:e1", "autopilot-staged"]},
+        {"id": "c3", "tags": ["repo:skos", "parent:e1"]},              # already released
+        {"id": "x9", "tags": ["parent:other", "autopilot-staged"]},   # different epic
+    ]
+    released = orch.release_epic("e1", board=board, tasks=tasks)
+    assert released == ["c1", "c2"]                       # only staged children of e1
+    calls = {c.args[0]: c.kwargs for c in board.update_task.call_args_list}
+    assert set(calls) == {"c1", "c2"}
+    for kw in calls.values():
+        assert "autopilot-staged" in kw["remove_tags"]
+        assert "autopilot-untriaged" in kw["remove_tags"]
 
 
 def test_phase0_net_new_card_still_builds(tmp_path, mocker):

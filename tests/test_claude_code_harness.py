@@ -355,28 +355,110 @@ async def test_archive_is_idempotent(tmp_path):
 # --- inject: send operator text into a running session (P1 write surface) -----
 
 
+def _seed_resumable_session(wt_root, sid, *, model="sk-default",
+                            session_id="sess-1", extra_lines=""):
+    """A turn-1-complete structured session on disk: the .skcode/stream.jsonl
+    carries a system/init event (so inject can read the session_id to --resume)."""
+    skdir = wt_root / sid / ".skcode"
+    skdir.mkdir(parents=True, exist_ok=True)
+    (skdir / "stream.jsonl").write_text(
+        json.dumps({"type": "system", "subtype": "init",
+                    "model": model, "session_id": session_id}) + "\n"
+        + json.dumps({"type": "result", "subtype": "success",
+                      "is_error": False}) + "\n"
+        + extra_lines
+    )
+    return skdir / "stream.jsonl"
+
+
 @pytest.mark.asyncio
-async def test_inject_sends_send_keys_to_the_window(tmp_path):
+async def test_inject_respawns_with_resume(tmp_path):
+    # B2: a follow-up is a headless `claude -p --resume <session_id>` respawned in
+    # the same pane (NOT raw send-keys into a TUI). inject reads the session_id from
+    # the session's stream.jsonl init event, respawns with --resume + the message as
+    # a distinct argv element, then re-attaches pipe-pane so the resumed turn's
+    # structured events append to the same log.
+    wt_root = tmp_path / "wt"
     sid = "sandbox-abc12345"
-    sent: list[list[str]] = []
+    _seed_resumable_session(wt_root, sid, model="sk-default", session_id="sess-1")
+    calls: list[list[str]] = []
 
     def runner(argv):
+        calls.append(list(argv))
         if "list-windows" in argv:
             return "monitor\t1\nsandbox-abc12345\t1700000100\n"
-        if "send-keys" in argv:
-            sent.append(list(argv))
-            return ""
-        raise AssertionError(f"unexpected tmux call: {argv}")
+        return ""
 
-    h = ClaudeCodeHarness(runner=runner, sessions_root=tmp_path, host=".158")
-    # CR-6.2 C2: inject is scoped to daemon-spawned sids; register this one as one.
+    h = ClaudeCodeHarness(runner=runner, worktree_root=wt_root, host=".158",
+                          claude_bin="claude")
+    # CR-6.2 C2 gate + the B2 resume context this daemon recorded at spawn.
     h._spawned_sids.add(sid)
+    h._resume_ctx[sid] = {"profile": "sandbox", "model": "sk-default", "agent": "sandbox"}
     result = await h.inject(sid, "run the tests")
 
     assert result == {"sid": sid, "injected": True}
-    # text then a separate Enter keypress, targeting the session's tmux window
-    assert sent == [["tmux", "send-keys", "-t", "skchat-agents:sandbox-abc12345",
-                     "run the tests", "Enter"]]
+    respawn = next(c for c in calls if "respawn-pane" in c)
+    assert "-k" in respawn                                    # replace the pane process
+    assert respawn[respawn.index("--resume") + 1] == "sess-1"  # resumes turn 1
+    assert "-p" in respawn and "--dangerously-skip-permissions" in respawn
+    assert respawn[respawn.index("--output-format") + 1] == "stream-json"
+    assert "--verbose" in respawn
+    assert respawn[respawn.index("--model") + 1] == "sk-default"
+    assert respawn[-1] == "run the tests"                     # prompt is DATA, last
+    # env rebuilt under env -i, with the gateway wiring for sk-default
+    joined = " ".join(respawn)
+    assert "env -i " in joined and "ANTHROPIC_BASE_URL=" in joined
+    # pipe-pane re-attached to keep appending events; NO raw send-keys anymore
+    assert any("pipe-pane" in c for c in calls)
+    assert not any("send-keys" in c for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_inject_before_turn1_init_is_a_clean_noop(tmp_path):
+    # A resumable session whose turn 1 has not emitted its init event yet (no
+    # session_id to resume) must be a clean no-op, never a respawn.
+    wt_root = tmp_path / "wt"
+    sid = "sandbox-abc12345"
+    (wt_root / sid / ".skcode").mkdir(parents=True)  # dir exists, stream.jsonl empty
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        if "list-windows" in argv:
+            return "monitor\t1\nsandbox-abc12345\t1700000100\n"
+        return ""
+
+    h = ClaudeCodeHarness(runner=runner, worktree_root=wt_root, host=".158")
+    h._spawned_sids.add(sid)
+    h._resume_ctx[sid] = {"profile": "sandbox", "model": "sk-default", "agent": "sandbox"}
+    result = await h.inject(sid, "hi")
+    assert result["injected"] is False
+    assert "not ready" in result["reason"].lower()
+    assert not any("respawn-pane" in c for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_inject_without_resume_context_is_refused(tmp_path):
+    # B2 inject respawns the pane (respawn-pane -k is DESTRUCTIVE), so it must ONLY
+    # touch a session this daemon spawned as a structured/resumable session
+    # (has _resume_ctx). A live window lacking resume context is refused as a no-op,
+    # even past the C2 gate, so inject can never kill+respawn a foreign window.
+    wt_root = tmp_path / "wt"
+    sid = "sandbox-abc12345"
+    _seed_resumable_session(wt_root, sid)  # on-disk init exists...
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        if "list-windows" in argv:
+            return "monitor\t1\nsandbox-abc12345\t1700000100\n"
+        return ""
+
+    h = ClaudeCodeHarness(runner=runner, worktree_root=wt_root, host=".158")
+    h._spawned_sids.add(sid)  # ...but NO _resume_ctx recorded
+    result = await h.inject(sid, "hi")
+    assert result["injected"] is False
+    assert not any("respawn-pane" in c for c in calls)
 
 
 @pytest.mark.asyncio
@@ -398,27 +480,28 @@ async def test_inject_refuses_non_daemon_spawned_window(tmp_path):
 
     assert result["injected"] is False
     assert "daemon-spawned" in result["reason"]
-    assert all("send-keys" not in c for c in calls)
+    assert all("respawn-pane" not in c for c in calls)
 
 
 @pytest.mark.asyncio
-async def test_inject_any_window_override_restores_reach(tmp_path, monkeypatch):
-    # The documented escape hatch (default OFF) lets inject reach any live window.
+async def test_inject_any_window_override_still_cannot_respawn_foreign_window(tmp_path, monkeypatch):
+    # The C2 escape hatch widens the daemon-spawned gate, but B2 inject respawns
+    # the pane (respawn-pane -k KILLS whatever runs there). A foreign window has no
+    # _resume_ctx, so inject STILL no-ops and never respawns it, even with the
+    # override on. This is safer than the old raw send-keys behaviour.
     monkeypatch.setenv("SKCODE_INJECT_ANY_WINDOW", "1")
-    sent: list[list[str]] = []
+    calls: list[list[str]] = []
 
     def runner(argv):
+        calls.append(list(argv))
         if "list-windows" in argv:
             return "monitor\t1\nlumina-deadbeef\t1700000100\n"
-        if "send-keys" in argv:
-            sent.append(list(argv))
-            return ""
-        raise AssertionError(f"unexpected tmux call: {argv}")
+        return ""
 
     h = ClaudeCodeHarness(runner=runner, sessions_root=tmp_path, host=".158")
-    result = await h.inject("lumina-deadbeef", "hi")
-    assert result == {"sid": "lumina-deadbeef", "injected": True}
-    assert sent and sent[0][:2] == ["tmux", "send-keys"]
+    result = await h.inject("lumina-deadbeef", "sudo rm -rf /")
+    assert result["injected"] is False
+    assert not any("respawn-pane" in c for c in calls)
 
 
 @pytest.mark.asyncio
@@ -439,8 +522,8 @@ async def test_inject_unknown_sid_is_a_clean_noop(tmp_path):
 
     assert result["injected"] is False
     assert "no live session" in result["reason"]
-    # never sent keys, only ever consulted the live window set
-    assert all("send-keys" not in c for c in calls)
+    # never respawned, only ever consulted the live window set
+    assert all("respawn-pane" not in c for c in calls)
 
 
 @pytest.mark.asyncio
@@ -793,9 +876,10 @@ async def test_direct_mode_emits_structured_stream_json(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_interactive_mode_has_no_structured_capture(tmp_path):
-    # Interactive keeps the TUI (for inject) + capture-pane path: no stream-json,
-    # no pipe-pane, no .skcode dir.
+async def test_interactive_mode_now_has_structured_capture(tmp_path):
+    # B2: interactive is ALSO headless stream-json (structured), same as direct.
+    # It gets a .skcode dir + pipe-pane; the difference from direct is only that it
+    # is resumable via inject (recorded in _resume_ctx).
     repo = tmp_path / "skharness"
     repo.mkdir()
     runner, tcalls = _tmux_recorder()
@@ -803,13 +887,16 @@ async def test_interactive_mode_has_no_structured_capture(tmp_path):
     h = _spawn_harness(repo, runner=runner, git_runner=git)
 
     desc = SessionDescriptor(repo=str(repo), branch="x", quality="sandbox",
-                             model="claude-sonnet-5", mode="interactive")
+                             model="sk-default", mode="interactive")
     session = await h.spawn(desc, prompt="do it")
 
     launch = _launch_argv(_new_window_argv(tcalls))
-    assert "--output-format" not in launch
-    assert not any("pipe-pane" in c for c in tcalls)
-    assert not (repo.parent / "wt" / session.sid / ".skcode").exists()
+    assert launch[launch.index("--output-format") + 1] == "stream-json"
+    assert any("pipe-pane" in c for c in tcalls)
+    assert (repo.parent / "wt" / session.sid / ".skcode").is_dir()
+    # recorded as resumable so a later inject can --resume it
+    assert session.sid in h._resume_ctx
+    assert h._resume_ctx[session.sid]["model"] == "sk-default"
 
 
 @pytest.mark.asyncio
@@ -863,8 +950,61 @@ async def test_stream_without_skcode_dir_still_screen_scrapes(tmp_path):
     assert texts == ["a", "b"]
 
 
+def test_read_session_id_returns_the_latest_init(tmp_path):
+    # inject --resume must chain from the MOST RECENT turn, so _read_session_id
+    # returns the LAST system/init's session_id (a resumed turn emits a fresh init).
+    wt_root = tmp_path / "wt"
+    sid = "sandbox-abc12345"
+    skdir = wt_root / sid / ".skcode"
+    skdir.mkdir(parents=True)
+    (skdir / "stream.jsonl").write_text(
+        json.dumps({"type": "system", "subtype": "init", "session_id": "first"}) + "\n"
+        + json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "hi"}]}}) + "\n"
+        + json.dumps({"type": "system", "subtype": "init", "session_id": "second"}) + "\n"
+    )
+    h = ClaudeCodeHarness(runner=lambda a: "", worktree_root=wt_root, host=".158")
+    assert h._read_session_id(sid) == "second"
+    # empty / missing file -> None (turn 1 not started or no init yet)
+    empty = "sandbox-deadbeef"
+    (wt_root / empty / ".skcode").mkdir(parents=True)
+    (wt_root / empty / ".skcode" / "stream.jsonl").write_text("")
+    assert h._read_session_id(empty) is None
+    assert h._read_session_id("sandbox-nofile00") is None
+
+
 @pytest.mark.asyncio
-async def test_interactive_mode_omits_print_flags_and_seeds_claude_json(tmp_path):
+async def test_stream_yields_events_from_multiple_resumed_turns(tmp_path):
+    # After an inject --resume appends a second turn to the same stream.jsonl,
+    # stream() surfaces events from BOTH turns (the tail reads all appended lines).
+    wt_root = tmp_path / "wt"
+    sid = "sandbox-abc12345"
+    skdir = wt_root / sid / ".skcode"
+    skdir.mkdir(parents=True)
+    (skdir / "stream.jsonl").write_text(
+        json.dumps({"type": "system", "subtype": "init", "model": "sk-default",
+                    "session_id": "s1"}) + "\n"
+        + json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "turn one"}]}}) + "\n"
+        + json.dumps({"type": "result", "subtype": "success", "is_error": False}) + "\n"
+        + json.dumps({"type": "system", "subtype": "init", "model": "sk-default",
+                      "session_id": "s2"}) + "\n"
+        + json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "turn two"}]}}) + "\n"
+        + json.dumps({"type": "result", "subtype": "success", "is_error": False}) + "\n"
+    )
+    h = ClaudeCodeHarness(runner=lambda a: "", worktree_root=wt_root, host=".158",
+                          poll_interval=0.0, max_polls=1)
+    out = [e async for e in h.stream(sid)]
+    texts = [e.text for e in out if e.type == EventType.ASSISTANT_TEXT]
+    assert texts == ["turn one", "turn two"]
+
+
+@pytest.mark.asyncio
+async def test_interactive_mode_is_headless_resumable_no_seed(tmp_path):
+    # B2: interactive turn 1 is a headless stream-json launch identical to direct
+    # (-p + bypass + stream-json + verbose). No TUI, so NO ~/.claude.json seed is
+    # written (headless -p skips onboarding). Follow-ups arrive via inject --resume.
     repo = tmp_path / "skharness"
     repo.mkdir()
     runner, tcalls = _tmux_recorder()
@@ -877,26 +1017,17 @@ async def test_interactive_mode_omits_print_flags_and_seeds_claude_json(tmp_path
     assert session.descriptor.mode == "interactive"
 
     launch = _launch_argv(_new_window_argv(tcalls))
-    # interactive drops BOTH -p and --dangerously-skip-permissions (per-action perms)
-    assert "-p" not in launch
-    assert "--dangerously-skip-permissions" not in launch
-    # still always passes --model (opus here)
+    # headless: -p AND --dangerously-skip-permissions (matches direct; approved)
+    assert "-p" in launch
+    assert "--dangerously-skip-permissions" in launch
+    assert launch[launch.index("--output-format") + 1] == "stream-json"
+    assert "--verbose" in launch
     assert launch[launch.index("--model") + 1] == "opus"
     # prompt is still the LAST argv element (data)
     assert launch[-1] == "stay open"
 
-    # the seed ~/.claude.json is written into the worktree (the child's HOME) and
-    # pre-accepts every first-run dialog, keyed by the ABSOLUTE worktree path
-    worktree = repo.parent / "wt" / session.sid
-    seed_path = worktree / ".claude.json"
-    assert seed_path.exists()
-    seed = json.loads(seed_path.read_text())
-    assert seed["hasCompletedOnboarding"] is True
-    assert seed["bypassPermissionsModeAccepted"] is True
-    assert str(worktree) in seed["projects"]
-    proj = seed["projects"][str(worktree)]
-    assert proj["hasTrustDialogAccepted"] is True
-    assert proj["hasCompletedProjectOnboarding"] is True
+    # NO ~/.claude.json seed is written anymore (the TUI onboarding path is gone)
+    assert not (repo.parent / "wt" / session.sid / ".claude.json").exists()
 
 
 @pytest.mark.asyncio
