@@ -14,7 +14,10 @@ ALLOWED = ["Read", "Edit", "Write", "Bash", "mcp__skcapstone__coord_score"]
 def test_argv_carries_skip_permissions_json_and_allowlist():
     a = ClaudeCodeAdapter(ALLOWED, mcp_endpoints=["http://localhost:18780/v1"])
     argv = a._argv("PROMPT")
-    assert argv[:3] == ["claude", "-p", "PROMPT"]          # extends the real build
+    # The prompt is fed on STDIN now (ARG_MAX fix, commit ac27b62), not argv, so it
+    # is NOT a positional element; the build starts claude -p in bypass mode.
+    assert argv[:3] == ["claude", "-p", "--dangerously-skip-permissions"]
+    assert "PROMPT" not in argv
     assert "--dangerously-skip-permissions" in argv
     assert argv[argv.index("--output-format") + 1] == "json"
     assert argv[argv.index("--allowedTools") + 1] == \
