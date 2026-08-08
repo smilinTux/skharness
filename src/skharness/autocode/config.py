@@ -37,6 +37,7 @@ class Caps:
     max_tokens_per_run: int = 2_000_000
     max_usd_per_day: float = 25.0
     max_subtasks_per_card: int = 8        # a decompose can never explode the board
+    max_decompose_children_per_run: int = 24  # per-RUN child ceiling across all epics (anti-flood)
     max_decompose_depth: int = 2          # children carry decomp_depth; ceiling -> needs_decision
     concreteness_floor: float = 0.34      # repo card below this (and not net_new) -> decompose
 

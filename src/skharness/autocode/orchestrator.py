@@ -239,7 +239,8 @@ def _create_child(board, *, title: str, description: str, tags: list[str],
 
 def _decompose_card(board, harness, task: dict, brief: AssessBrief, *, caps: Caps,
                     run_id: str, decisions: list, config=None,
-                    existing_tasks=None, dry_run: bool = False) -> None:
+                    existing_tasks=None, dry_run: bool = False,
+                    run_budget: list | None = None) -> None:
     """Split a too-coarse parent into buildable child subtasks, park the parent.
     Guardrails: idempotent (skip if already decomposed OR the epic already has
     children on the board), create-or-skip per child (never re-create a
@@ -260,6 +261,18 @@ def _decompose_card(board, harness, task: dict, brief: AssessBrief, *, caps: Cap
     # or written by a prior run that crashed before mark_decomposed -- re-splitting
     # would duplicate them (this is the 2026-08-03 mass-pass failure). No-op.
     if _existing_children(existing_tasks, tid):
+        return
+    # REPO INVARIANT (fixes the 164 no-repo children): an epic with no single
+    # repo:<name> tag cannot be routed to a codebase, so its children would be
+    # unbuildable orphans. Route the epic to a human to assign a repo instead of
+    # emitting no-repo children. Runs BEFORE decompose() so we never even split it.
+    if not repo_tag(task):
+        decisions.append(DecisionItem(
+            qid=stable_qid(f"decompose-norepo {tid}", tid),
+            prompt=f"Epic {tid} has no single repo:<name> tag; assign one before it "
+                   "can be split into buildable children.",
+            options={"map": "add-repo-tag", "skip": "skip"},
+            action_ref=tid, priority=task.get("priority") or "high"))
         return
     depth = int(ap.get("decomp_depth", 0) or 0)
     if depth >= getattr(caps, "max_decompose_depth", 2):
@@ -303,6 +316,21 @@ def _decompose_card(board, harness, task: dict, brief: AssessBrief, *, caps: Cap
         return
     if dry_run:
         return
+    # PER-RUN BUDGET (anti-flood, defense in depth behind the scope gate): even a
+    # scoped --tag run that matches many epics cannot carpet-split the board. If
+    # this epic's full child set does not fit the remaining run budget, defer the
+    # WHOLE epic to a decision rather than partially splitting it (a partial split
+    # would park the parent as if done and strand the rest).
+    n_children = len(specs[:max_children])
+    if run_budget is not None and n_children > run_budget[0]:
+        decisions.append(DecisionItem(
+            qid=stable_qid(f"decompose-budget {tid}", tid),
+            prompt=f"Epic {tid} needs {n_children} children but the per-run decompose "
+                   f"budget ({run_budget[0]} left) is exhausted; re-run scoped to it "
+                   "next pass.",
+            options={"skip": "skip"}, action_ref=tid,
+            priority=task.get("priority") or "high"))
+        return
     parent_tags = [t for t in (task.get("tags") or [])
                    if t.startswith(("repo:", "quality:"))]
     autobuild = bool(getattr(_decompose_card, "_autobuild", False))
@@ -330,6 +358,8 @@ def _decompose_card(board, harness, task: dict, brief: AssessBrief, *, caps: Cap
                       meta={"autopilot": {"parent": tid, "decomp_depth": depth + 1}},
                       task_id=child_id)
         child_ids.append(child_id)
+    if run_budget is not None:                     # consume the per-run child budget
+        run_budget[0] -= len(child_ids)
     if child_ids:                                  # only park the epic if we created work
         board.mark_decomposed(tid, child_ids, run_id=run_id)
 
@@ -368,6 +398,9 @@ def phase0_assess(*, board, harness, tasks_dir, caps: Caps, run_id: str,
     else:
         ids = sorted(board.unblocked_task_ids())
     scoped = bool(only or only_ids or only_tag)
+    # Per-run decompose budget (mutable holder, threaded into _decompose_card so the
+    # cap spans ALL epics in this run, not just one). Anti-flood defense in depth.
+    dc_budget = [getattr(caps, "max_decompose_children_per_run", 24)]
     for tid in ids:
         t = by_id.get(tid)
         if not t or t.get("status") in ("completed", "closed", "obsolete"):
@@ -415,9 +448,22 @@ def phase0_assess(*, board, harness, tasks_dir, caps: Caps, run_id: str,
             if not dry_run:
                 board.close_task_obsolete(tid, v.reason, run_id=run_id)
         elif v.verdict == "decompose":
-            _decompose_card(board, harness, t, brief, caps=caps, run_id=run_id,
-                            decisions=decisions, config=config, existing_tasks=by_id,
-                            dry_run=dry_run)
+            # SCOPE GATE (fixes the board-wide sweep that flooded ~821 cards): an
+            # UNSCOPED (daily/board-wide) run never carpet-splits. A too-coarse epic
+            # becomes a "scope it" decision; it is only split when an operator
+            # explicitly scopes the run to it (--task/--tasks/--tag). This ties
+            # decomposition to an epic actually being picked up.
+            if not scoped:
+                decisions.append(DecisionItem(
+                    qid=stable_qid(f"decompose-scope {tid}", tid),
+                    prompt=f"Epic {tid} is too coarse to build; split it with a scoped "
+                           f"run (`skos autopilot triage --tasks {tid}`).",
+                    options={"skip": "skip"}, action_ref=tid,
+                    priority=t.get("priority") or "high"))
+            else:
+                _decompose_card(board, harness, t, brief, caps=caps, run_id=run_id,
+                                decisions=decisions, config=config, existing_tasks=by_id,
+                                dry_run=dry_run, run_budget=dc_budget)
         elif v.verdict == "needs_decision":
             decisions.append(DecisionItem(qid=stable_qid(v.reason or tid, tid),
                                           prompt=v.reason or f"Task {tid} needs a decision.",

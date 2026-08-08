@@ -109,7 +109,7 @@ def test_phase0_decompose_verdict_creates_children_and_parks_parent(tmp_path, mo
     mocker.patch("skharness.autocode.orchestrator._ground_card",
                  return_value=_Grounding(grounded=False))
     cands, decisions = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
-                                          caps=Caps(), run_id="r")
+                                          caps=Caps(), run_id="r", only_ids=["t-vague"])
     assert [c.ref for c in cands] == []            # parent is NOT built
     assert len(created) == 2                        # two children created
     for child in created:
@@ -137,7 +137,8 @@ def test_phase0_decompose_incoherent_children_escalate_not_created(tmp_path, moc
                                "foreign_ext": [".go"], "foreign_terms": [r"\bstruct\b"]})
     cfg = SimpleNamespace(repo=lambda n: SimpleNamespace(path="/x", base_branch="main"))
     cands, decisions = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
-                                          caps=Caps(), run_id="r", config=cfg)
+                                          caps=Caps(), run_id="r", config=cfg,
+                                          only_ids=["t-vague"])
     assert created == []                              # no garbage children created
     assert len(decisions) == 1                        # escalated to human
     board.mark_decomposed.assert_not_called()
@@ -151,7 +152,7 @@ def test_phase0_decompose_empty_escalates_not_drops(tmp_path, mocker):
     mocker.patch("skharness.autocode.orchestrator._ground_card",
                  return_value=_Grounding(grounded=False))
     cands, decisions = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
-                                          caps=Caps(), run_id="r")
+                                          caps=Caps(), run_id="r", only_ids=["t-vague"])
     assert created == []
     assert len(decisions) == 1                       # escalated to human, not dropped
     board.mark_decomposed.assert_not_called()
@@ -165,7 +166,8 @@ def test_phase0_decompose_depth_ceiling_escalates(tmp_path, mocker):
     mocker.patch("skharness.autocode.orchestrator._ground_card",
                  return_value=_Grounding(grounded=False))
     _cands, decisions = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
-                                           caps=Caps(max_decompose_depth=2), run_id="r")
+                                           caps=Caps(max_decompose_depth=2), run_id="r",
+                                           only_ids=["t-vague"])
     harness.decompose.assert_not_called()            # at ceiling: never split again
     assert len(decisions) == 1
 
@@ -180,7 +182,7 @@ def test_phase0_concreteness_gate_downgrades_valid_to_decompose(tmp_path, mocker
                  return_value=_Grounding(grounded=True, concreteness=0.0, net_new=False,
                                          context="REPO FACTS"))
     cands, _ = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
-                                  caps=Caps(), run_id="r")
+                                  caps=Caps(), run_id="r", only_ids=["t-vague"])
     assert [c.ref for c in cands] == []             # NOT built as valid
     harness.decompose.assert_called_once()           # routed to decompose instead
     board.mark_decomposed.assert_called_once()
@@ -204,7 +206,7 @@ def test_phase0_decompose_skips_epic_that_already_has_children(tmp_path, mocker)
     mocker.patch("skharness.autocode.orchestrator._ground_card",
                  return_value=_Grounding(grounded=False))
     cands, decisions = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
-                                          caps=Caps(), run_id="r")
+                                          caps=Caps(), run_id="r", only_ids=["t-vague"])
     assert created == []                             # no duplicate children created
     harness.decompose.assert_not_called()            # short-circuited before splitting
     board.mark_decomposed.assert_not_called()        # epic not re-parked
@@ -226,7 +228,7 @@ def test_phase0_decompose_child_skips_duplicate_title(tmp_path, mocker):
     mocker.patch("skharness.autocode.orchestrator._ground_card",
                  return_value=_Grounding(grounded=False))
     cands, decisions = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
-                                          caps=Caps(), run_id="r")
+                                          caps=Caps(), run_id="r", only_ids=["t-vague"])
     assert [c.title for c in created] == ["sub B"]   # only the non-duplicate created
     board.mark_decomposed.assert_called_once()
     parked_children = board.mark_decomposed.call_args.args[1]
@@ -246,10 +248,94 @@ def test_phase0_decompose_new_epic_still_creates_all_children(tmp_path, mocker):
     mocker.patch("skharness.autocode.orchestrator._ground_card",
                  return_value=_Grounding(grounded=False))
     cands, decisions = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
-                                          caps=Caps(), run_id="r")
+                                          caps=Caps(), run_id="r", only_ids=["t-vague"])
     assert sorted(c.title for c in created) == ["fresh A", "fresh B"]
     for child in created:
         assert "parent:t-vague" in child.tags
+
+
+# -- decompose flood guard (regression for the 2026-08-06/07 mass pass that emitted
+#    ~821 untriaged children board-wide, 164 of them with no repo) -----------------
+
+def test_phase0_unscoped_decompose_queues_scope_decision_not_children(tmp_path, mocker):
+    # FIX C1: an UNSCOPED (daily/board-wide) run must NEVER carpet-split. A decompose
+    # verdict becomes a "scope it" decision, no children, so the bare triage that
+    # flooded the board can no longer emit anything.
+    board, created = _decompose_board(tmp_path)
+    harness = MagicMock()
+    harness.assess.return_value = Verdict(verdict="decompose", reason="too coarse")
+    harness.decompose.return_value = [{"title": "sub A", "acceptance": ["a.py has f"]}]
+    mocker.patch("skharness.autocode.orchestrator._ground_card",
+                 return_value=_Grounding(grounded=False))
+    cands, decisions = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                                          caps=Caps(), run_id="r")   # UNSCOPED
+    assert created == []                              # nothing emitted board-wide
+    harness.decompose.assert_not_called()             # never even split
+    assert [d.action_ref for d in decisions] == ["t-vague"]   # queued for a scoped run
+    board.mark_decomposed.assert_not_called()
+
+
+def test_phase0_decompose_norepo_epic_queues_decision_not_children(tmp_path, mocker):
+    # FIX A: an epic with no single repo:<name> tag cannot be routed to a codebase.
+    # It must become a decision, never no-repo orphan children (the 164-orphan bug),
+    # even when the run is properly scoped to it.
+    _write_task(tmp_path, "t-norepo", tags=[], acceptance_criteria=["do it"])  # NO repo tag
+    board = _board(["t-norepo"])
+    created = []
+    board.create_task.side_effect = lambda task: created.append(task)
+    harness = MagicMock()
+    harness.assess.return_value = Verdict(verdict="decompose", reason="too coarse")
+    harness.decompose.return_value = [{"title": "sub", "acceptance": ["x"]}]
+    mocker.patch("skharness.autocode.orchestrator._ground_card",
+                 return_value=_Grounding(grounded=False))
+    cands, decisions = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                                          caps=Caps(), run_id="r", only_ids=["t-norepo"])
+    assert created == []                              # no no-repo orphans created
+    harness.decompose.assert_not_called()             # a no-repo epic is never split
+    assert len(decisions) == 1 and "repo" in decisions[0].prompt.lower()
+
+
+def test_phase0_decompose_run_budget_defers_epic_over_budget(tmp_path, mocker):
+    # FIX C2: even a scoped --tag run spanning many epics cannot exceed the per-run
+    # child budget. With budget=1 and an epic needing 2 children, the WHOLE epic is
+    # deferred to a decision (never a partial split that would park the parent).
+    _write_task(tmp_path, "e1", tags=["repo:skos", "big"], acceptance_criteria=["w"])
+    board = _board(["e1"])
+    created = []
+    board.create_task.side_effect = lambda task: created.append(task)
+    harness = MagicMock()
+    harness.assess.return_value = Verdict(verdict="decompose", reason="coarse")
+    harness.decompose.return_value = [
+        {"title": "s1", "acceptance": ["a.py"]},
+        {"title": "s2", "acceptance": ["b.py"]},
+    ]
+    mocker.patch("skharness.autocode.orchestrator._ground_card",
+                 return_value=_Grounding(grounded=False))
+    cands, decisions = orch.phase0_assess(
+        board=board, harness=harness, tasks_dir=tmp_path,
+        caps=Caps(max_decompose_children_per_run=1), run_id="r", only_tag="big")
+    assert created == []                              # not partially split
+    board.mark_decomposed.assert_not_called()         # parent not parked
+    assert any("budget" in d.prompt.lower() for d in decisions)
+
+
+def test_phase0_decompose_budget_allows_epic_that_fits(tmp_path, mocker):
+    # FIX C2 (positive): an epic whose full child set fits the remaining budget is
+    # split normally; the budget only defers epics that would overflow it.
+    board, created = _decompose_board(tmp_path)
+    harness = MagicMock()
+    harness.assess.return_value = Verdict(verdict="decompose", reason="coarse")
+    harness.decompose.return_value = [
+        {"title": "sub A", "acceptance": ["a.py has f"]},
+        {"title": "sub B", "acceptance": ["b.py has g"]},
+    ]
+    mocker.patch("skharness.autocode.orchestrator._ground_card",
+                 return_value=_Grounding(grounded=False))
+    cands, decisions = orch.phase0_assess(
+        board=board, harness=harness, tasks_dir=tmp_path,
+        caps=Caps(max_decompose_children_per_run=8), run_id="r", only_ids=["t-vague"])
+    assert len(created) == 2                           # fits the budget: split proceeds
+    board.mark_decomposed.assert_called_once()
     board.mark_decomposed.assert_called_once()
 
 
