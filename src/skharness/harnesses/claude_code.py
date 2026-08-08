@@ -481,6 +481,12 @@ class ClaudeCodeHarness(Harness):
             # sandbox-compatible.
             env["ANTHROPIC_BASE_URL"] = self.gateway_base
             env["ANTHROPIC_AUTH_TOKEN"] = self.gateway_token
+            # A gateway model id (sk-default / ornith-big) is not one `claude`
+            # ships a context-window for, so it otherwise prints a noisy
+            # "not a model this version recognizes" warning into the transcript
+            # and assumes a 200k window. Suppress the enforcement so the session
+            # output stays clean; skgateway owns the real routing + limits.
+            env["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] = "1"
         else:
             # Anthropic cloud path: CLAUDE_CODE_OAUTH_TOKEN is subscription
             # model-access. CR-6.2 C1: it is passed to the trusted ``full`` profile

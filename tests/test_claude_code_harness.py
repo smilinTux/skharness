@@ -757,6 +757,10 @@ async def test_spawn_gateway_model_points_claude_at_skgateway(tmp_path, monkeypa
     assert env["ANTHROPIC_AUTH_TOKEN"] == "sk-local"
     # gateway path, NOT the cloud subscription path
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+    # unknown-model window enforcement is disabled so `claude` does not print a
+    # noisy "not a model this version recognizes" warning into the transcript
+    # (skgateway owns the real routing + context limits for gateway ids).
+    assert env["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] == "1"
     # --model carries the gateway model name skgateway routes on
     assert launch[launch.index("--model") + 1] == "ornith-big"
 
