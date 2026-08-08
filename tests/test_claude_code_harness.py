@@ -409,8 +409,13 @@ async def test_inject_respawns_with_resume(tmp_path):
     joined = " ".join(respawn)
     assert "env -i " in joined and "ANTHROPIC_BASE_URL=" in joined
     # pipe-pane re-attached to keep appending events; NO raw send-keys anymore
-    assert any("pipe-pane" in c for c in calls)
+    pp = next(c for c in calls if "pipe-pane" in c)
     assert not any("send-keys" in c for c in calls)
+    # re-attach must NOT use -o: `-o` is a toggle ("open only if none exists") and
+    # respawn preserves the spawn-time pipe, so -o would CLOSE it and the resumed
+    # turn's output would never reach the log.
+    assert "-o" not in pp
+    assert str(wt_root / sid / ".skcode" / "stream.jsonl") in " ".join(pp)
 
 
 @pytest.mark.asyncio

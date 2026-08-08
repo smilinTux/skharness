@@ -566,10 +566,13 @@ class ClaudeCodeHarness(Harness):
             "tmux", "respawn-pane", "-k", "-c", str(worktree), "-t", target,
             "--", *env_argv, *resume,
         ])
-        # Re-attach pipe-pane so the resumed turn's JSONL appends to the same log
-        # (respawn replaces the process; re-issuing pipe-pane is idempotent with -o).
+        # Re-attach pipe-pane so the resumed turn's JSONL appends to the same log.
+        # NO -o here: `-o` is a TOGGLE ("open only if none exists"), and respawn
+        # preserves the spawn-time pipe, so `-o` would CLOSE it and the resumed
+        # turn's output would never reach the file. Plain pipe-pane unconditionally
+        # (re)opens the pipe; `cat >>` keeps appending to the same log.
         self._runner([
-            "tmux", "pipe-pane", "-o", "-t", target,
+            "tmux", "pipe-pane", "-t", target,
             f"cat >> '{self._stream_log_path(sid)}'",
         ])
         return {"sid": sid, "injected": True}
