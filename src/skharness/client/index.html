@@ -54,6 +54,8 @@
   .ev.status { color: var(--good); }
   .ev.needs_input { color: var(--warn); }
   .ev.tool_call, .ev.tool_result { color: var(--tool); }
+  .ev.tool_call, .ev.tool_result { white-space: pre-wrap; font-size: 13px; }
+  .ev.tool_result.err { color: var(--warn); }
   .ev.diff { color: var(--diff); }
   /* Compose (New session) panel. This holds the ONLY write affordance in the
      whole client: the gated POST /api/v1/dispatch. Everything else stays GET /
@@ -262,8 +264,56 @@ function isChromeLine(text) {
 }
 
 var _lastRenderedText = "";
+// A DIRECT session streams structured stream-json events (tool_call / tool_result
+// / status-with-subtype), not a scraped TUI. The moment we see any structured-only
+// event we flip into structured render mode for the rest of THIS stream: clean
+// per-type rendering, no chrome filter, no TUI-redraw dedupe (structured events
+// are each emitted once, so dedupe would wrongly drop a legitimately repeated
+// line). A capture-pane session only ever sends assistant_text + the "attached"
+// status, so it never trips this and keeps the chrome-filter + dedupe path.
+var _structured = false;
+
+function isStructuredSignal(ev) {
+  if (ev.type === "tool_call" || ev.type === "tool_result") { return true; }
+  if (ev.type === "status" && ev.data && ev.data.subtype) { return true; }
+  return false;
+}
+
+function appendEvDiv(cls, text) {
+  if (transcriptEl.firstChild && transcriptEl.firstChild.className === "placeholder") {
+    transcriptEl.textContent = "";
+  }
+  var div = document.createElement("div");
+  div.className = cls;
+  div.textContent = text;
+  transcriptEl.appendChild(div);
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+function renderStructured(ev) {
+  var d = ev.data || {};
+  if (ev.type === "tool_call") {
+    var name = d.name || ev.text || "tool";
+    var input = "";
+    try { input = d.input ? " " + JSON.stringify(d.input) : ""; } catch (e) {}
+    appendEvDiv("ev tool_call", "⚙ " + name + input);
+  } else if (ev.type === "tool_result") {
+    var body = (ev.text || "").replace(/\s+$/, "");
+    appendEvDiv("ev tool_result" + (d.is_error ? " err" : ""),
+                "↳ " + (body || "(no output)"));
+  } else if (ev.type === "assistant_text") {
+    if (ev.text) { appendEvDiv("ev assistant_text", ev.text); }
+  } else if (ev.type === "status") {
+    if (ev.text) { appendEvDiv("ev status", ev.text); }
+  } else if (ev.text) {
+    appendEvDiv("ev " + (ev.type || ""), ev.text);
+  }
+}
 
 function addEvent(ev) {
+  if (!_structured && isStructuredSignal(ev)) { _structured = true; }
+  if (_structured) { renderStructured(ev); return; }
+  // --- capture-pane (TUI) path: chrome-filter + dedupe raw terminal lines ---
   var text = ev.text || "";
   if (isChromeLine(text)) { return; }
   // Collapse TUI redraws: skip a line identical to the one just rendered, and
@@ -272,14 +322,7 @@ function addEvent(ev) {
   if (text === _lastRenderedText) { return; }
   if (isBlank && !_lastRenderedText.trim()) { return; }
   _lastRenderedText = text;
-  if (transcriptEl.firstChild && transcriptEl.firstChild.className === "placeholder") {
-    transcriptEl.textContent = "";
-  }
-  var div = document.createElement("div");
-  div.className = "ev " + (ev.type || "");
-  div.textContent = text || JSON.stringify(ev.data || {});
-  transcriptEl.appendChild(div);
-  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  appendEvDiv("ev " + (ev.type || ""), text || JSON.stringify(ev.data || {}));
 }
 
 function openStream(sid) {
@@ -294,6 +337,7 @@ function openStream(sid) {
   if (injectBtn) { injectBtn.disabled = false; }
   if (injectMsg) { injectMsg.textContent = ""; }
   _lastRenderedText = "";
+  _structured = false;
   transcriptEl.textContent = "";
   var url = wsUrl("/api/v1/sessions/" + encodeURIComponent(sid) + "/stream");
   try {

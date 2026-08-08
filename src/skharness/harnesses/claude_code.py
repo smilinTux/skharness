@@ -228,6 +228,109 @@ def scan_historical(sessions_root, *, host: str, limit: int = 20) -> list[Sessio
     return [sd for _, sd in found[:limit]]
 
 
+def _stringify_tool_content(content) -> str:
+    """Flatten a tool_result ``content`` into display text.
+
+    Anthropic allows tool_result content to be either a plain string OR a list of
+    content blocks (each ``{"type":"text","text":...}`` or otherwise). Join the
+    text of block lists; pass a string through; JSON-dump anything else so the
+    parser never loses information and never raises."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and "text" in block:
+                parts.append(str(block["text"]))
+            else:
+                parts.append(json.dumps(block))
+        return "\n".join(parts)
+    if content is None:
+        return ""
+    return json.dumps(content)
+
+
+def parse_stream_json_line(line: str, *, ts: float = 0.0) -> list[SessionEvent]:
+    """Parse ONE ``claude --output-format stream-json`` line into SessionEvents.
+
+    Structured output for DIRECT sessions (Task 3-B1): instead of scraping the
+    rendered TUI, direct sessions run ``claude -p --output-format stream-json
+    --verbose`` and this maps each emitted JSON event onto typed SessionEvents.
+    One line can yield SEVERAL events (an assistant message with N content blocks
+    -> N events) or ZERO.
+
+    FAIL SOFT by contract: a blank line, non-JSON (the pipe-pane capture also
+    picks up a trailing ``ESC[?25h`` and a "no stdin" stderr warning), a
+    non-object, a missing ``type``, or an unknown ``type`` all yield ``[]`` and
+    never raise. The event schema can shift across claude versions, so this only
+    reads the fields it needs and ignores the rest.
+    """
+    s = (line or "").strip()
+    if not s:
+        return []
+    try:
+        obj = json.loads(s)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(obj, dict):
+        return []
+    etype = obj.get("type")
+    if etype == "system":
+        # Only the init event is worth surfacing (model + session id); other
+        # system subtypes are internal noise.
+        if obj.get("subtype") != "init":
+            return []
+        model = obj.get("model") or "?"
+        return [SessionEvent(
+            type=EventType.STATUS, ts=ts,
+            text=f"session started · model={model}",
+            data={"subtype": "init", "model": obj.get("model"),
+                  "session_id": obj.get("session_id")},
+        )]
+    if etype in ("assistant", "user"):
+        msg = obj.get("message") or {}
+        content = msg.get("content")
+        # Some shapes carry a bare string instead of a block list.
+        if isinstance(content, str):
+            if etype == "assistant" and content:
+                return [SessionEvent(type=EventType.ASSISTANT_TEXT, text=content, ts=ts)]
+            return []
+        if not isinstance(content, list):
+            return []
+        events: list[SessionEvent] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text" and block.get("text"):
+                events.append(SessionEvent(
+                    type=EventType.ASSISTANT_TEXT, text=str(block["text"]), ts=ts))
+            elif btype == "tool_use":
+                events.append(SessionEvent(
+                    type=EventType.TOOL_CALL, ts=ts,
+                    text=str(block.get("name") or ""),
+                    data={"id": block.get("id"), "name": block.get("name"),
+                          "input": block.get("input")}))
+            elif btype == "tool_result":
+                events.append(SessionEvent(
+                    type=EventType.TOOL_RESULT, ts=ts,
+                    text=_stringify_tool_content(block.get("content")),
+                    data={"tool_use_id": block.get("tool_use_id"),
+                          "is_error": block.get("is_error")}))
+        return events
+    if etype == "result":
+        is_error = bool(obj.get("is_error"))
+        subtype = obj.get("subtype")
+        text = "turn failed" if is_error else "turn complete"
+        return [SessionEvent(
+            type=EventType.STATUS, ts=ts, text=text,
+            data={"subtype": subtype, "is_error": is_error,
+                  "num_turns": obj.get("num_turns"),
+                  "stop_reason": obj.get("stop_reason")},
+        )]
+    return []
+
+
 def new_lines(prev: str, cur: str) -> list[str]:
     """Lines present in `cur` beyond the common prefix of `prev` (naive tail diff
     for the read-only capture-pane poll)."""
@@ -536,7 +639,16 @@ class ClaudeCodeHarness(Harness):
         if mode == "interactive":
             argv = [self.claude_bin, *self.claude_base_args]
         else:
-            argv = [self.claude_bin, "-p", "--dangerously-skip-permissions", *self.claude_base_args]
+            # DIRECT: print mode + structured events (Task 3-B1). --output-format
+            # stream-json --verbose makes claude emit newline-delimited JSON
+            # events (system/init, assistant, tool_use, tool_result, result)
+            # instead of a rendered TUI, so the stream is parsed structurally
+            # (see :func:`parse_stream_json_line`) rather than screen-scraped.
+            # --verbose is REQUIRED with stream-json or only the final result is
+            # emitted, not the incremental events.
+            argv = [self.claude_bin, "-p", "--dangerously-skip-permissions",
+                    "--output-format", "stream-json", "--verbose",
+                    *self.claude_base_args]
         if profile == "full" and self.mcp_config:
             argv += ["--mcp-config", str(self.mcp_config)]
         argv += ["--model", map_model(model)]
@@ -672,6 +784,16 @@ class ClaudeCodeHarness(Harness):
         env = self._build_env(profile, agent, worktree, desc.model)
         launch = self._claude_argv(profile, prompt, mode, desc.model)
         env_argv = ["env", "-i", *[f"{k}={v}" for k, v in env.items()]]
+        # DIRECT sessions emit stream-json; make the capture dir now so the
+        # pipe-pane `cat >>` (attached below) can write the JSONL into it. Its
+        # existence is ALSO the signal stream() uses to parse structurally vs
+        # screen-scrape, so only direct sessions get a .skcode dir.
+        stream_log = self._stream_log_path(sid)
+        if mode == "direct":
+            try:
+                stream_log.parent.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
         # Ensure the target tmux session exists (a fresh host has no tmux server,
         # so `new-window -t skchat-agents` would silently fail and the session
         # would never appear in list_sessions). `new-session -d` creates it if
@@ -692,6 +814,19 @@ class ClaudeCodeHarness(Harness):
             "tmux", "set-window-option", "-t", f"{self.tmux_session}:{sid}",
             "remain-on-exit", "on",
         ])
+        if mode == "direct":
+            # Copy the pane's output (the stream-json JSONL) to the capture file so
+            # stream() can tail + parse it. pipe-pane runs its command via /bin/sh,
+            # but the command is a FIXED `cat >> '<path>'`: the path is
+            # worktree_root (fixed config) / sid (charset-validated [A-Za-z0-9_-]+)
+            # / .skcode/stream.jsonl, so it contains no shell metacharacters and
+            # nothing operator-supplied. The claude launch itself stays shell-free
+            # (exec'd directly by new-window above); only this side-channel copy
+            # uses sh, and only with a path this code fully controls.
+            self._runner([
+                "tmux", "pipe-pane", "-o", "-t", f"{self.tmux_session}:{sid}",
+                f"cat >> '{stream_log}'",
+            ])
 
         # CR-6.2 C2: remember this is a daemon-spawned session so inject may reach
         # it (and ONLY it, plus its siblings). Recorded after the window is created.
@@ -708,12 +843,28 @@ class ClaudeCodeHarness(Harness):
             branch=branch,
         )
 
+    def _stream_log_path(self, sid: str) -> Path:
+        """The structured stream-json capture file for a DIRECT session:
+        ``<worktree_root>/<sid>/.skcode/stream.jsonl``. Deterministic from the sid
+        (worktree = worktree_root / sid), so :meth:`stream` can find it without any
+        spawn-time state. The parent ``.skcode`` dir's existence is the signal that
+        a session is structured (spawn creates it only for direct mode)."""
+        return self.worktree_root / sid / ".skcode" / "stream.jsonl"
+
     async def stream(self, sid: str) -> AsyncIterator[SessionEvent]:
         now = time.time()
         if not _SID_RE.match(sid):
             yield SessionEvent(type=EventType.STATUS, text="invalid session id", ts=now)
             return
         yield SessionEvent(type=EventType.STATUS, text="attached", ts=now)
+        # A DIRECT session captures structured stream-json to .skcode/stream.jsonl;
+        # its .skcode dir existing means "parse events, do not screen-scrape". A
+        # legacy / interactive session has no such dir and keeps the capture-pane
+        # path below.
+        if self._stream_log_path(sid).parent.exists():
+            async for ev in self._stream_structured(sid):
+                yield ev
+            return
         prev = ""
         polls = 0
         target = f"{self.tmux_session}:{sid}"
@@ -723,6 +874,44 @@ class ClaudeCodeHarness(Harness):
                 yield SessionEvent(type=EventType.ASSISTANT_TEXT, text=line,
                                    ts=time.time())
             prev = cur
+            polls += 1
+            if self.max_polls is not None and polls >= self.max_polls:
+                break
+            await asyncio.sleep(self.poll_interval)
+
+    async def _stream_structured(self, sid: str) -> AsyncIterator[SessionEvent]:
+        """Tail ``.skcode/stream.jsonl`` and yield typed events (Task 3-B1).
+
+        Reads only COMPLETE newline-terminated lines each poll and buffers any
+        partial trailing line (the writer may be mid-flush), the same discipline
+        as the capture-pane tail. Each complete line is parsed with
+        :func:`parse_stream_json_line` (fail-soft: terminal noise / partial JSON
+        yield no events, never an exception). The file may not exist for the first
+        few polls (pipe-pane creates it on first output); that is treated as empty
+        until it appears. Read position is tracked by byte offset so growth is
+        picked up incrementally.
+        """
+        log = self._stream_log_path(sid)
+        offset = 0
+        buf = ""
+        polls = 0
+        while self.max_polls is None or polls < self.max_polls:
+            try:
+                with open(log, "r", encoding="utf-8", errors="replace") as fh:
+                    fh.seek(offset)
+                    chunk = fh.read()
+                    offset = fh.tell()
+            except FileNotFoundError:
+                chunk = ""
+            if chunk:
+                buf += chunk
+                # Keep the last (possibly partial) line in the buffer; only parse
+                # up to the final newline.
+                lines = buf.split("\n")
+                buf = lines.pop()
+                for line in lines:
+                    for ev in parse_stream_json_line(line, ts=time.time()):
+                        yield ev
             polls += 1
             if self.max_polls is not None and polls >= self.max_polls:
                 break

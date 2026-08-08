@@ -17,6 +17,7 @@ from skharness.harnesses.claude_code import (
     map_model,
     new_lines,
     parse_repo_allowlist,
+    parse_stream_json_line,
     parse_windows,
     sandbox_cloud_token_allowed,
     scan_historical,
@@ -45,6 +46,107 @@ def test_new_lines_returns_only_the_tail():
     assert new_lines("a\nb\n", "a\nb\nc\nd\n") == ["c", "d"]
     assert new_lines("", "x\ny\n") == ["x", "y"]
     assert new_lines("a\nb\n", "a\nb\n") == []
+
+
+# --- stream-json parser (Task 3-B1: structured output for direct mode) --------
+# The parser turns ONE claude `--output-format stream-json` line into zero or
+# more typed SessionEvents. It must FAIL SOFT (blank / non-JSON / unknown type /
+# missing fields never raise, they yield []), because a real stream is
+# interleaved with terminal noise (the pipe-pane capture also picks up a trailing
+# ESC[?25h cursor sequence and a "no stdin" stderr warning).
+
+def test_parse_stream_json_blank_and_garbage_are_ignored():
+    assert parse_stream_json_line("") == []
+    assert parse_stream_json_line("   ") == []
+    assert parse_stream_json_line("\x1b[?25h") == []          # trailing ANSI
+    assert parse_stream_json_line("Warning: no stdin data") == []  # stderr noise
+    assert parse_stream_json_line("{not json") == []
+    assert parse_stream_json_line("[1,2,3]") == []            # JSON, but not an event obj
+    assert parse_stream_json_line('{"no":"type"}') == []
+
+
+def test_parse_stream_json_system_init_yields_status_with_model():
+    line = json.dumps({"type": "system", "subtype": "init",
+                       "model": "sk-default", "session_id": "abc"})
+    evs = parse_stream_json_line(line)
+    assert len(evs) == 1
+    assert evs[0].type == EventType.STATUS
+    assert "sk-default" in evs[0].text
+    assert evs[0].data["session_id"] == "abc"
+    # a non-init system event is not surfaced (noise)
+    assert parse_stream_json_line(json.dumps({"type": "system", "subtype": "x"})) == []
+
+
+def test_parse_stream_json_assistant_text_block():
+    line = json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "the answer is 4"}]}})
+    evs = parse_stream_json_line(line)
+    assert [e.type for e in evs] == [EventType.ASSISTANT_TEXT]
+    assert evs[0].text == "the answer is 4"
+
+
+def test_parse_stream_json_assistant_multiple_blocks_text_and_tool():
+    line = json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "let me check"},
+        {"type": "tool_use", "id": "tu_1", "name": "Bash",
+         "input": {"command": "echo hi"}},
+    ]}})
+    evs = parse_stream_json_line(line)
+    assert [e.type for e in evs] == [EventType.ASSISTANT_TEXT, EventType.TOOL_CALL]
+    assert evs[1].text == "Bash"
+    assert evs[1].data["name"] == "Bash"
+    assert evs[1].data["id"] == "tu_1"
+    assert evs[1].data["input"] == {"command": "echo hi"}
+
+
+def test_parse_stream_json_user_tool_result():
+    line = json.dumps({"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "tu_1", "is_error": False,
+         "content": "hi\n"}]}})
+    evs = parse_stream_json_line(line)
+    assert [e.type for e in evs] == [EventType.TOOL_RESULT]
+    assert evs[0].text == "hi\n"
+    assert evs[0].data["tool_use_id"] == "tu_1"
+    assert evs[0].data["is_error"] is False
+
+
+def test_parse_stream_json_tool_result_content_as_block_list():
+    # Anthropic allows tool_result content to be a list of blocks, not just a str.
+    line = json.dumps({"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "tu_2",
+         "content": [{"type": "text", "text": "line-a"},
+                     {"type": "text", "text": "line-b"}]}]}})
+    evs = parse_stream_json_line(line)
+    assert len(evs) == 1
+    assert evs[0].type == EventType.TOOL_RESULT
+    assert "line-a" in evs[0].text and "line-b" in evs[0].text
+
+
+def test_parse_stream_json_result_success_is_turn_status():
+    line = json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                       "num_turns": 1, "stop_reason": "end_turn",
+                       "result": "the answer is 4"})
+    evs = parse_stream_json_line(line)
+    assert len(evs) == 1
+    assert evs[0].type == EventType.STATUS
+    assert evs[0].data["is_error"] is False
+    assert evs[0].data["subtype"] == "success"
+
+
+def test_parse_stream_json_result_error_surfaces_error():
+    line = json.dumps({"type": "result", "subtype": "error_during_execution",
+                       "is_error": True})
+    evs = parse_stream_json_line(line)
+    assert len(evs) == 1
+    assert evs[0].type == EventType.STATUS
+    assert evs[0].data["is_error"] is True
+
+
+def test_parse_stream_json_ts_is_carried():
+    line = json.dumps({"type": "assistant",
+                       "message": {"content": [{"type": "text", "text": "x"}]}})
+    evs = parse_stream_json_line(line, ts=123.5)
+    assert evs[0].ts == 123.5
 
 
 def test_scan_historical_reads_agent_session_dirs(tmp_path):
@@ -656,6 +758,109 @@ async def test_direct_mode_is_default_and_keeps_print_flags(tmp_path):
     assert launch[launch.index("--model") + 1] == "sonnet"
     # NO seed file is written for direct (no worktree/.claude.json)
     assert not (repo.parent / "wt" / session.sid / ".claude.json").exists()
+
+
+# --- Task 3-B1: structured stream-json capture for DIRECT sessions ------------
+
+
+@pytest.mark.asyncio
+async def test_direct_mode_emits_structured_stream_json(tmp_path):
+    # Direct sessions run with --output-format stream-json --verbose so their
+    # output is structured events, not a scraped TUI. The daemon also attaches a
+    # pipe-pane that copies the JSONL to <worktree>/.skcode/stream.jsonl.
+    repo = tmp_path / "skharness"
+    repo.mkdir()
+    runner, tcalls = _tmux_recorder()
+    git, _ = _git_ok()
+    h = _spawn_harness(repo, runner=runner, git_runner=git)
+
+    desc = SessionDescriptor(repo=str(repo), branch="x", quality="sandbox",
+                             model="sk-default")  # direct by default
+    session = await h.spawn(desc, prompt="do it")
+
+    launch = _launch_argv(_new_window_argv(tcalls))
+    assert "--output-format" in launch
+    assert launch[launch.index("--output-format") + 1] == "stream-json"
+    assert "--verbose" in launch
+    # the .skcode capture dir exists and a pipe-pane targets the stream.jsonl
+    skdir = repo.parent / "wt" / session.sid / ".skcode"
+    assert skdir.is_dir()
+    pp = next((c for c in tcalls if "pipe-pane" in c), None)
+    assert pp is not None, f"no pipe-pane call recorded: {tcalls}"
+    joined = " ".join(pp)
+    assert session.sid in joined
+    assert str(skdir / "stream.jsonl") in joined
+
+
+@pytest.mark.asyncio
+async def test_interactive_mode_has_no_structured_capture(tmp_path):
+    # Interactive keeps the TUI (for inject) + capture-pane path: no stream-json,
+    # no pipe-pane, no .skcode dir.
+    repo = tmp_path / "skharness"
+    repo.mkdir()
+    runner, tcalls = _tmux_recorder()
+    git, _ = _git_ok()
+    h = _spawn_harness(repo, runner=runner, git_runner=git)
+
+    desc = SessionDescriptor(repo=str(repo), branch="x", quality="sandbox",
+                             model="claude-sonnet-5", mode="interactive")
+    session = await h.spawn(desc, prompt="do it")
+
+    launch = _launch_argv(_new_window_argv(tcalls))
+    assert "--output-format" not in launch
+    assert not any("pipe-pane" in c for c in tcalls)
+    assert not (repo.parent / "wt" / session.sid / ".skcode").exists()
+
+
+@pytest.mark.asyncio
+async def test_stream_parses_structured_log_when_present(tmp_path):
+    # When a session has a .skcode/stream.jsonl (a direct/structured session),
+    # stream() parses typed events from it and NEVER screen-scrapes the pane.
+    wt_root = tmp_path / "wt"
+    sid = "sandbox-abc12345"
+    skdir = wt_root / sid / ".skcode"
+    skdir.mkdir(parents=True)
+    (skdir / "stream.jsonl").write_text(
+        json.dumps({"type": "system", "subtype": "init",
+                    "model": "sk-default", "session_id": "s1"}) + "\n"
+        + json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "hello"}]}}) + "\n"
+        + "\x1b[?25h\n"  # terminal noise the pipe-pane capture also picks up
+        + json.dumps({"type": "result", "subtype": "success",
+                      "is_error": False}) + "\n"
+    )
+
+    def runner(argv):
+        assert "capture-pane" not in argv, "structured mode must not screen-scrape"
+        return ""
+
+    h = ClaudeCodeHarness(runner=runner, worktree_root=wt_root, host=".158",
+                          poll_interval=0.0, max_polls=1)
+    out = [e async for e in h.stream(sid)]
+    assert out[0].type == EventType.STATUS and out[0].text == "attached"
+    texts = [e.text for e in out if e.type == EventType.ASSISTANT_TEXT]
+    assert texts == ["hello"]
+    assert any(e.type == EventType.STATUS and e.text == "turn complete" for e in out)
+
+
+@pytest.mark.asyncio
+async def test_stream_without_skcode_dir_still_screen_scrapes(tmp_path):
+    # A legacy / interactive session (no .skcode dir) keeps the capture-pane path.
+    wt_root = tmp_path / "wt"
+    sid = "lumina-abc12345"  # no worktree/.skcode created
+
+    captures = iter(["a\nb\n"])
+
+    def runner(argv):
+        if "capture-pane" in argv:
+            return next(captures)
+        return ""
+
+    h = ClaudeCodeHarness(runner=runner, worktree_root=wt_root, host=".158",
+                          poll_interval=0.0, max_polls=1)
+    out = [e async for e in h.stream(sid)]
+    texts = [e.text for e in out if e.type == EventType.ASSISTANT_TEXT]
+    assert texts == ["a", "b"]
 
 
 @pytest.mark.asyncio
