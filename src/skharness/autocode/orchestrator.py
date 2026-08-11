@@ -550,7 +550,7 @@ def phase1_triage(candidates, harness, *, repo_map, decisions,
 
 def phase2_swarm(selected, *, harness, board, caps: Caps, ledger: CapLedger,
                  decisions, run_id: str, state=None, enabled: bool = True,
-                 workers: int | None = None) -> dict:
+                 workers: int | None = None, session_registry=None) -> dict:
     """Run each routed item's produce-then-grade loop, write each round's score to
     the coord record, finalize cleared items and escalate non-converging ones.
 
@@ -561,7 +561,15 @@ def phase2_swarm(selected, *, harness, board, caps: Caps, ledger: CapLedger,
     the git repo + the "autopilot" agent file are serialized inside the executor
     (``_GIT_LOCK`` / ``_BOARD_LOCK``); the run's ledger/decisions/state/journal
     are serialized here by ``_lock``. The token/dollar ceiling is checked before
-    each item starts. max_concurrent<=1 keeps the exact old sequential behaviour."""
+    each item starts. max_concurrent<=1 keeps the exact old sequential behaviour.
+
+    ``session_registry`` (an ``AutocodeSessionRegistry``, spec 5.1 / card C-1
+    AC3): when given, each item's build registers itself as a skcode session
+    (source=autocode) around ``ex.run``, updates on finalize/escalate/error,
+    and ends when the item's processing is done, so hostd's GET /sessions
+    shows autocode runs on the same rail as interactive ones, "for free".
+    Defaults None -- no registration, the exact old behaviour -- so every
+    existing caller (and every test that does not pass one) is unaffected."""
     state = dict(state or {})
     _lock = threading.Lock()
     _budget_hit = [False]                           # append the budget decision ONCE
@@ -583,6 +591,29 @@ def phase2_swarm(selected, *, harness, board, caps: Caps, ledger: CapLedger,
                       mode=getattr(caps, "concurrency", "recommended"), items=len(selected))
         print(f"autopilot: {describe(getattr(caps, 'concurrency', 'recommended'), hard_cap)}")
 
+    def _register_session(sid: str, item) -> None:
+        # Best-effort by construction: a session-registry write failure must
+        # never break a build (same posture as the cleanup/audit writes
+        # elsewhere in this module), so it is recorded and swallowed, not
+        # raised.
+        if session_registry is None:
+            return
+        try:
+            session_registry.register(sid=sid, repo=item.repo or "",
+                                      last_message=f"{item.kind}:{item.ref}")
+        except Exception as exc:                    # noqa: BLE001 - never break a build
+            health.record("session_registry_error", sid=sid, phase="register",
+                          error=str(exc)[:120])
+
+    def _end_session(sid: str, last_message: str) -> None:
+        if session_registry is None:
+            return
+        try:
+            session_registry.end(sid, last_message=last_message)
+        except Exception as exc:                    # noqa: BLE001 - never break a build
+            health.record("session_registry_error", sid=sid, phase="end",
+                          error=str(exc)[:120])
+
     def _process(item, ex) -> None:
         if kill_switch_active(enabled):
             return
@@ -594,6 +625,12 @@ def phase2_swarm(selected, *, harness, board, caps: Caps, ledger: CapLedger,
                         prompt="Autopilot hit its budget ceiling (token/dollar limits); stopped early.",
                         options={"ok": "acknowledge"}, action_ref=run_id, priority="high"))
                 return
+        # Card C-1 AC3: register this item's build as a skcode session
+        # (source=autocode) so it appears on hostd's GET /sessions rail for
+        # the duration of the build, same identity every round of this item
+        # reuses (one sid per (run_id, item.ref), not per round).
+        sid = f"autocode-{run_id}-{item.ref}"
+        _register_session(sid, item)
         try:
             result = ex.run(item, harness)          # ISOLATED build -- unlocked
         except ClaimRaced as exc:
@@ -601,6 +638,7 @@ def phase2_swarm(selected, *, harness, board, caps: Caps, ledger: CapLedger,
                 state[item.ref] = {"state": "claim-raced", "detail": str(exc)}
                 journal.write_run(run_id, {"run_id": run_id, "phase": "swarm",
                                            "items": dict(state)})
+            _end_session(sid, "claim-raced")
             return
         with _lock:
             ledger.add(getattr(result, "tokens", 0), getattr(result, "cost_usd", 0.0))
@@ -631,6 +669,7 @@ def phase2_swarm(selected, *, harness, board, caps: Caps, ledger: CapLedger,
         with _lock:
             state[item.ref] = entry
             journal.write_run(run_id, {"run_id": run_id, "phase": "swarm", "items": dict(state)})
+        _end_session(sid, entry["state"])
 
     if workers <= 1:
         for item, ex in selected:                   # exact old sequential path
@@ -706,7 +745,7 @@ def run_once(*, board, harness, config, tasks_dir=None, run_id=None, dry_run=Non
              ledger: CapLedger | None = None, deepdive_proposals=None,
              executors=None, task: str | None = None,
              tasks=None, tag: str | None = None, placer=None,
-             triage_only: bool = False) -> dict:
+             triage_only: bool = False, session_registry=None) -> dict:
     """Execute one daily cycle: assess -> triage -> swarm -> report. Journals
     per-item state so a re-run resumes (see the resume task). Guardrails (kill
     switch, caps, dry-run) are layered in the following tasks."""
@@ -785,7 +824,8 @@ def run_once(*, board, harness, config, tasks_dir=None, run_id=None, dry_run=Non
                                "reason": decision.reason}
         state = phase2_swarm(selected, harness=harness, board=board, caps=caps,
                              ledger=ledger, decisions=decisions, run_id=run_id,
-                             state=state, enabled=config.enabled)
+                             state=state, enabled=config.enabled,
+                             session_registry=session_registry)
 
     report = phase3_report(decisions, dry_run=dry)
     journal.write_run(run_id, {"run_id": run_id, "phase": "report", "items": state,
@@ -854,5 +894,13 @@ def run_cli(*, dry_run: bool = True, canary: bool = False, task=None,
         return {"error": "a canary requires --task <id> (it targets one task)."}
     name = None if harness in ("stub", "", None) else harness
     h = build_harness(config, name)
+    # Card C-1 AC3: a real (live/canary) build registers its items as skcode
+    # sessions (source=autocode) so they show up on hostd's GET /sessions rail
+    # while they run. Wired only here at the CLI-level outer edge, the same
+    # place every other real dependency (board, harness) is constructed;
+    # run_once/phase2_swarm default session_registry=None so every direct
+    # caller (including the whole test suite) is unaffected.
+    from .sessions import AutocodeSessionRegistry
     return run_once(board=board, harness=h, config=config, dry_run=False,
-                    task=task, tasks=tasks, tag=tag)
+                    task=task, tasks=tasks, tag=tag,
+                    session_registry=AutocodeSessionRegistry())

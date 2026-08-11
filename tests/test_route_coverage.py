@@ -110,3 +110,15 @@ def test_the_three_write_and_rce_routes_are_gated_on_the_right_scopes():
     # discovery + client are public (no bearer)
     assert classify_route("GET", "/.well-known/skworld-module.json") == ("public", None)
     assert classify_route("GET", "/app") == ("public", None)
+
+
+def test_sessions_events_archive_route_is_gated_on_stream_scope():
+    """Card C-1 (SessionEvent v2 + archive paging): the new GET .../events route
+    is a READ route, same scope as the list/get/WS-stream routes, not a PDP-
+    decided one (no capauth rule row required for it)."""
+    from capauth.authz import DEFAULT_RULES
+
+    assert classify_route("GET", "/api/v1/sessions/{sid}/events") == ("gated", "skcode.stream")
+    assert ROUTE_SCOPES[("GET", "/api/v1/sessions/{sid}/events")] == "skcode.stream"
+    assert "skcode.stream" not in PDP_SCOPES
+    assert "skcode.stream" not in DEFAULT_RULES

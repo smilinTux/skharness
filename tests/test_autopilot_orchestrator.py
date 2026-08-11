@@ -587,6 +587,57 @@ def test_phase2_finalizes_and_scores_on_pass():
     assert state["t-1"]["state"] == "finalized" and decisions == []
 
 
+class _FakeSessionRegistry:
+    """Records register/end calls without touching disk (mirrors fake_journal's
+    role: proves the orchestrator wires the registry, without exercising the
+    real flat-file AutocodeSessionRegistry here -- that lives in
+    test_autocode_sessions.py)."""
+    def __init__(self):
+        self.registered: list[tuple[str, str]] = []   # (sid, repo)
+        self.ended: list[tuple[str, str]] = []         # (sid, last_message)
+
+    def register(self, *, sid, repo="", model="", last_message="", host=""):
+        self.registered.append((sid, repo))
+
+    def end(self, sid, *, last_message=None):
+        self.ended.append((sid, last_message))
+
+
+def test_phase2_registers_and_ends_an_autocode_session_around_the_build():
+    """Card C-1 AC3: a build with a session_registry configured registers the
+    item as a skcode session (source=autocode) before ex.run and ends it once
+    the item's outcome (finalized/escalated) is settled."""
+    ex = _RunExec(GateResult(score=5, passed=True, notes="ok", artifact="pr#1"))
+    board = MagicMock()
+    registry = _FakeSessionRegistry()
+    state = orch.phase2_swarm([(_wi("t-1"), ex)], harness=SimpleNamespace(name="h"),
+                              board=board, caps=Caps(), ledger=CapLedger(Caps()),
+                              decisions=[], run_id="r1", session_registry=registry)
+    assert state["t-1"]["state"] == "finalized"
+    assert registry.registered == [("autocode-r1-t-1", "skos")]
+    assert registry.ended == [("autocode-r1-t-1", "finalized")]
+
+
+def test_phase2_ends_the_session_on_escalate_too():
+    ex = _RunExec(GateResult(score=4, passed=False, notes="thin tests", artifact=None))
+    board = MagicMock()
+    registry = _FakeSessionRegistry()
+    orch.phase2_swarm([(_wi("t-2"), ex)], harness=SimpleNamespace(name="h"),
+                      board=board, caps=Caps(), ledger=CapLedger(Caps()),
+                      decisions=[], run_id="r1", session_registry=registry)
+    assert registry.ended == [("autocode-r1-t-2", "escalated")]
+
+
+def test_phase2_without_a_registry_is_unaffected():
+    # Default (session_registry=None) behaves exactly as before -- no error,
+    # no registry side channel touched.
+    ex = _RunExec(GateResult(score=5, passed=True, notes="ok", artifact="pr#1"))
+    state = orch.phase2_swarm([(_wi("t-1"), ex)], harness=SimpleNamespace(name="h"),
+                              board=MagicMock(), caps=Caps(), ledger=CapLedger(Caps()),
+                              decisions=[], run_id="r1")
+    assert state["t-1"]["state"] == "finalized"
+
+
 def test_phase2_surfaces_finalize_failure_as_decision():
     # A gate-PASSED item whose finalize raises (CI re-check / PR open / merge) must
     # not vanish: the branch may already be pushed. It becomes an operator decision.
