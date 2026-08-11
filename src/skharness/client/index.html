@@ -10,16 +10,30 @@
     --bg: #111; --panel: #1b1b1b; --line: #333; --line2: #222;
     --fg: #ddd; --muted: #888; --accent: #7cf; --good: #6a6;
     --warn: #fc6; --tool: #9ad; --diff: #b9a;
+    /* Type scale (density pass, spec 2026-08-11 section 7.2). Six rem tokens
+       anchored to the browser's 16px root so pinch/ctrl zoom keeps working;
+       px does not scale with zoom, rem does. Values reproduce, exactly, the
+       px literals they replace at a 16px root: 0.625 / 0.6875 / 0.75 /
+       0.8125 / 0.875 / 0.9375 rem times 16 = 10 / 11 / 12 / 13 / 14 / 15px.
+       The mobile media query below swaps --fs-body and --fs-emph to their
+       mobile targets in one place instead of re-declaring font-size on
+       every affected selector. */
+    --fs-badge: 0.625rem;
+    --fs-micro: 0.6875rem;
+    --fs-caption: 0.75rem;
+    --fs-body: 0.8125rem;
+    --fs-emph: 0.875rem;
+    --fs-title: 0.9375rem;
   }
   * { box-sizing: border-box; }
   body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0;
-         background: var(--bg); color: var(--fg); }
+         background: var(--bg); color: var(--fg); font-size: var(--fs-body); }
   header { padding: 10px 12px; background: var(--panel);
            display: flex; gap: 10px; align-items: center;
            border-bottom: 1px solid var(--line); }
   header strong { color: var(--accent); }
-  header .tag { color: var(--muted); font-size: 12px; }
-  header .host { color: var(--muted); font-size: 12px; margin-left: auto; }
+  header .tag { color: var(--muted); font-size: var(--fs-caption); }
+  header .host { color: var(--muted); font-size: var(--fs-caption); margin-left: auto; }
   button { background: #264; color: #fff; border: 0; padding: 6px 12px;
            border-radius: 4px; cursor: pointer; font: inherit; }
   button:hover { background: #375; }
@@ -30,9 +44,9 @@
   .row:hover { background: #1e1e1e; }
   .row.active { background: #24303a; }
   .row .name { color: var(--accent); }
-  .row .meta { color: var(--muted); font-size: 12px; margin-top: 3px; }
+  .row .meta { color: var(--muted); font-size: var(--fs-caption); margin-top: 3px; }
   .empty { padding: 24px; color: var(--muted); line-height: 1.6; }
-  .empty h2 { color: var(--fg); font-size: 15px; margin: 0 0 8px; }
+  .empty h2 { color: var(--fg); font-size: var(--fs-title); margin: 0 0 8px; }
   .empty code { color: var(--accent); }
   #convo { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   #transcript { flex: 1; overflow-y: auto; padding: 12px;
@@ -48,13 +62,13 @@
                       border: 1px solid var(--line); border-radius: 4px;
                       padding: 6px 8px; font: inherit; }
   #inject-bar input:disabled, #inject-bar button:disabled { opacity: 0.5; cursor: default; }
-  #inject-msg { font-size: 12px; }
+  #inject-msg { font-size: var(--fs-caption); }
   #inject-msg.err { color: var(--warn); }
   .ev { margin: 2px 0; }
   .ev.status { color: var(--good); }
   .ev.needs_input { color: var(--warn); }
   .ev.tool_call, .ev.tool_result { color: var(--tool); }
-  .ev.tool_call, .ev.tool_result { white-space: pre-wrap; font-size: 13px; }
+  .ev.tool_call, .ev.tool_result { white-space: pre-wrap; font-size: var(--fs-body); }
   .ev.tool_result.err { color: var(--warn); }
   .ev.diff { color: var(--diff); }
   /* Compose (New session) panel. This holds the ONLY write affordance in the
@@ -63,11 +77,11 @@
   #compose { display: none; padding: 12px; background: var(--panel);
              border-bottom: 1px solid var(--line); }
   #compose.open { display: block; }
-  #compose h2 { margin: 0 0 10px; font-size: 14px; color: var(--fg); }
+  #compose h2 { margin: 0 0 10px; font-size: var(--fs-emph); color: var(--fg); }
   #compose .grid { display: flex; flex-wrap: wrap; gap: 12px; }
   #compose .field { display: flex; flex-direction: column; gap: 4px; }
-  #compose label { color: var(--muted); font-size: 12px; }
-  #compose .hint { color: var(--muted); font-size: 11px; }
+  #compose label { color: var(--muted); font-size: var(--fs-caption); }
+  #compose .hint { color: var(--muted); font-size: var(--fs-micro); }
   #compose .hint.warn { color: var(--warn); }
   #compose select, #compose input, #compose textarea {
     background: #151515; color: var(--fg); border: 1px solid var(--line);
@@ -75,31 +89,43 @@
   #compose textarea { width: 100%; min-height: 70px; resize: vertical; }
   #compose .prompt-field { margin-top: 10px; }
   #compose .actions { margin-top: 10px; display: flex; gap: 10px; align-items: center; }
-  #compose .msg { font-size: 12px; }
+  #compose .msg { font-size: var(--fs-caption); }
   #compose .msg.err { color: var(--warn); }
   #compose .msg.ok { color: var(--good); }
   #compose button:disabled { opacity: 0.5; cursor: default; }
   /* Phone: shrink fonts + the session list so the transcript is not squeezed to
-     half the screen, and tighten the chrome. Layout is unchanged on desktop. */
+     half the screen, and tighten the chrome. Layout is unchanged on desktop.
+     Fonts shrink by swapping --fs-body and --fs-emph VALUES here once; every
+     selector above that reads var(--fs-body) or var(--fs-emph) (body itself,
+     .ev.tool_call/.tool_result, #compose h2, and everything that inherits
+     body's size: .row .name, #transcript, the compose form fields, the inject
+     bar input) picks up the new value automatically, no per-selector
+     re-declaration needed. .row .meta and #compose label are the two
+     exceptions: their desktop size shares --fs-caption with #inject-msg and
+     #compose .msg, which do NOT shrink on mobile, so they switch to a
+     different, already-declared token (--fs-badge / --fs-micro) instead of
+     a literal. */
   @media (max-width: 640px) {
-    body { font-size: 12px; }
+    :root {
+      --fs-body: 0.75rem;   /* 12px, was 13px */
+      --fs-emph: 0.8125rem; /* 13px, was 14px */
+    }
     header { padding: 6px 8px; gap: 6px; }
     header .tag, header .host { display: none; }
     button { padding: 5px 9px; }
     main { height: calc(100vh - 40px); }
     #list { width: 40%; min-width: 118px; }
     .row { padding: 6px 8px; }
-    .row .name { font-size: 12px; }
-    .row .meta { font-size: 10px; margin-top: 2px; }
-    #transcript { padding: 8px; font-size: 12px; }
+    .row .meta { font-size: var(--fs-badge); margin-top: 2px; }
+    #transcript { padding: 8px; }
     #compose { padding: 8px; }
     #compose .grid { gap: 8px; }
-    #compose h2 { font-size: 13px; margin-bottom: 6px; }
-    #compose label { font-size: 11px; }
-    #compose select, #compose input, #compose textarea { padding: 4px 6px; font-size: 12px; }
+    #compose h2 { margin-bottom: 6px; }
+    #compose label { font-size: var(--fs-micro); }
+    #compose select, #compose input, #compose textarea { padding: 4px 6px; }
     #compose textarea { min-height: 54px; }
     #inject-bar { padding: 6px 8px; gap: 6px; }
-    #inject-bar input { padding: 5px 7px; font-size: 12px; }
+    #inject-bar input { padding: 5px 7px; }
   }
 </style>
 </head>
