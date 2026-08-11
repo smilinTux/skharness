@@ -158,6 +158,117 @@ def test_ws_stream_delivers_events_with_token():
             ws.receive_json()   # server closes after the stream ends
 
 
+# ---- SessionEvent v2: seq/sid/source stamped at the one point every live -----
+# ---- event passes through the daemon (card C-1, spec 5.1) --------------------
+
+def test_ws_stream_stamps_seq_sid_source_on_every_event():
+    c = _client()
+    with c.websocket_connect(
+        "/api/v1/sessions/lumina-abc12345/stream?token=good"
+    ) as ws:
+        first = ws.receive_json()
+        second = ws.receive_json()
+        # seq is per-session monotonic, assigned in append order.
+        assert first["seq"] == 1
+        assert second["seq"] == 2
+        assert first["sid"] == "lumina-abc12345"
+        assert second["sid"] == "lumina-abc12345"
+        # this harness's sessions are the ordinary read-only session plane, so
+        # they carry the default source (interactive), never autocode.
+        assert first["source"] == "interactive"
+        assert second["source"] == "interactive"
+        # the original v1 fields are still exactly as before (additive only).
+        assert first["type"] == "status"
+        assert second["type"] == "assistant_text"
+        assert second["text"] == "hello world"
+
+
+def test_ws_stream_uses_autocode_source_when_session_is_registered_autocode():
+    autocode_sessions = [
+        SessionDescriptor(sid="lumina-abc12345", host=".158", harness="autocode",
+                          source="autocode"),
+    ]
+    app = build_daemon_app(harness=_harness(), verify_caller=lambda t: t == "good",
+                           list_autocode_sessions=lambda: autocode_sessions)
+    c = TestClient(app)
+    with c.websocket_connect(
+        "/api/v1/sessions/lumina-abc12345/stream?token=good"
+    ) as ws:
+        assert ws.receive_json()["source"] == "autocode"
+
+
+# ---- GET /sessions/{sid}/events : archive paging (spec 5.3) ------------------
+
+def test_sessions_events_route_requires_read_scope():
+    c = _client()
+    assert c.get("/api/v1/sessions/lumina-abc12345/events").status_code == 401
+    assert c.get("/api/v1/sessions/lumina-abc12345/events",
+                 headers={"authorization": "Bearer bad"}).status_code == 403
+
+
+def test_sessions_events_route_pages_the_archive(tmp_path):
+    from skharness.session_events import SessionEventStore
+
+    store = SessionEventStore(root=tmp_path)
+    for i in range(5):
+        store.append("lumina-abc12345", SessionEvent(type=EventType.ASSISTANT_TEXT,
+                                                      text=str(i)))
+    app = build_daemon_app(harness=_harness(), verify_caller=lambda t: t == "good",
+                           event_store=store)
+    c = TestClient(app)
+    h = {"authorization": "Bearer good"}
+
+    r = c.get("/api/v1/sessions/lumina-abc12345/events?limit=2", headers=h)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["sid"] == "lumina-abc12345"
+    assert [e["seq"] for e in body["events"]] == [4, 5]
+
+    r2 = c.get("/api/v1/sessions/lumina-abc12345/events?before_seq=4&limit=2",
+              headers=h)
+    assert [e["seq"] for e in r2.json()["events"]] == [2, 3]
+
+
+def test_sessions_events_route_empty_without_a_persisting_store():
+    # No event_store configured (the daemon default): archive paging is always
+    # an empty page, never an error, since nothing was ever archived.
+    c = _client()
+    r = c.get("/api/v1/sessions/lumina-abc12345/events",
+              headers={"authorization": "Bearer good"})
+    assert r.status_code == 200
+    assert r.json() == {"sid": "lumina-abc12345", "events": []}
+
+
+# ---- autocode runs register as sessions (source=autocode, spec 5.1 / AC3) ---
+
+def test_list_sessions_merges_registered_autocode_runs():
+    autocode_sessions = [
+        SessionDescriptor(sid="autocode-r1-t1", host=".158", harness="autocode",
+                          repo="skharness", state="running", source="autocode"),
+    ]
+    app = build_daemon_app(harness=_harness(), verify_caller=lambda t: t == "good",
+                           list_autocode_sessions=lambda: autocode_sessions)
+    c = TestClient(app)
+    r = c.get("/api/v1/sessions", headers={"authorization": "Bearer good"})
+    sids = {s["sid"] for s in r.json()["sessions"]}
+    assert sids == {"lumina-abc12345", "autocode-r1-t1"}
+    row = next(s for s in r.json()["sessions"] if s["sid"] == "autocode-r1-t1")
+    assert row["source"] == "autocode"
+
+
+def test_get_session_finds_a_registered_autocode_run():
+    autocode_sessions = [
+        SessionDescriptor(sid="autocode-r1-t1", host=".158", harness="autocode",
+                          source="autocode"),
+    ]
+    app = build_daemon_app(harness=_harness(), verify_caller=lambda t: t == "good",
+                           list_autocode_sessions=lambda: autocode_sessions)
+    c = TestClient(app)
+    r = c.get("/api/v1/sessions/autocode-r1-t1", headers={"authorization": "Bearer good"})
+    assert r.status_code == 200
+    assert r.json()["source"] == "autocode"
+
+
 def test_ws_stream_rejects_missing_or_bad_token():
     c = _client()
     with pytest.raises(WebSocketDisconnect):

@@ -118,6 +118,12 @@ class SessionDescriptor:
     quality: str = "sandbox"         # profile / quality tier: "full" | "sandbox"
     permission_mode: str = "manual"  # per-action approval posture: "manual" | "auto"
     mode: str = "direct"             # session mode: "direct" (print/one-shot) | "interactive" (stays open)
+    # Additive (skcode Code-section card C-1, spec 2026-08-11 section 5.1): the
+    # same source vocabulary as SessionEvent.source ("interactive" | "autocode"
+    # | "attach"), so a session shows its origin in the rail before any event
+    # has arrived. Defaults "interactive" (every session this plane produced
+    # before v2), so an old record round-trips unchanged.
+    source: str = "interactive"
 
     def to_dict(self) -> dict:
         return asdict(self)

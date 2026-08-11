@@ -15,8 +15,10 @@ import time
 from pathlib import Path
 
 from skharness.auth import AuthContext, Verifier
+from skharness.autocode.sessions import AutocodeSessionRegistry
 from skharness.daemon import build_daemon_app
 from skharness.harnesses.claude_code import ClaudeCodeHarness, parse_repo_allowlist
+from skharness.session_events import SessionEventStore
 
 DEFAULT_PORT = 9394
 
@@ -331,6 +333,15 @@ def _serve(argv: list[str]) -> None:
     )
     from skharness.operator_cli import dispatch_is_paused
 
+    # SessionEvent v2 (card C-1, spec 5.3): a real, persisting event store, and
+    # the autocode session registry merged into GET /sessions so orchestrator
+    # runs (source=autocode) appear on the same rail as this harness's
+    # interactive sessions. Both root under skcode_state_dir()/sessions, the
+    # SAME per-sid directory (events.jsonl + session.json side by side).
+    sessions_dir = skcode_state_dir() / "sessions"
+    event_store = SessionEventStore(root=sessions_dir)
+    autocode_registry = AutocodeSessionRegistry(root=sessions_dir)
+
     app = build_daemon_app(
         harness=harness,
         verify_caller=select_verifier(),
@@ -340,5 +351,7 @@ def _serve(argv: list[str]) -> None:
         authorize_inject=build_inject_authorizer(),
         dispatch_targets=build_dispatch_targets(),
         dispatch_paused=dispatch_is_paused,
+        event_store=event_store,
+        list_autocode_sessions=autocode_registry.list,
     )
     uvicorn.run(app, host=host, port=args.port)

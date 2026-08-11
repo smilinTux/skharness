@@ -28,6 +28,7 @@ from skharness.autocode.types import RepoSpec
 from skharness.events import EventType, SessionEvent
 from skharness.harness import Harness, SessionDescriptor, SpawnRejected
 from skharness.manifest import skcode_module_manifest
+from skharness.session_events import SessionEventStore
 
 # The dispatch authorization seam (spec 7.4): given the authenticated subject and
 # the request resource, return a decision exposing ``.allow`` (bool) and, ideally,
@@ -48,6 +49,13 @@ PausePredicate = Callable[[], bool]
 # ratify needs; None means the session has no gradable worktree. Injected so the
 # daemon stays free of any repo-map/worktree convention of its own.
 RatifyResolver = Callable[[SessionDescriptor], "tuple[RepoSpec, str, list[str]] | None"]
+
+# Autocode orchestrator runs registering themselves as sessions (source=autocode,
+# spec 5.1, card C-1 AC3): a provider of the CURRENT live/recent autocode-run
+# SessionDescriptors, merged into GET /sessions and GET /sessions/{sid} alongside
+# the harness's own (interactive) rows. None (the default) merges nothing, so a
+# bare test double sees exactly the harness's sessions, unchanged.
+AutocodeSessionsProvider = Callable[[], "list[SessionDescriptor]"]
 
 # Scope split on the remote-control surface (R2.4): a verified skcode token must
 # carry SCOPE_READ to view (list/get/stream), and SCOPE_WRITE to actuate
@@ -91,6 +99,7 @@ ROUTE_SCOPES: dict[tuple[str, str], str] = {
     ("GET", "/api/v1/hosts/self"): SCOPE_READ,
     ("GET", "/api/v1/sessions"): SCOPE_READ,
     ("GET", "/api/v1/sessions/{sid}"): SCOPE_READ,
+    ("GET", "/api/v1/sessions/{sid}/events"): SCOPE_READ,
     ("GET", "/api/v1/dispatch/targets"): SCOPE_DISPATCH,
     ("POST", "/api/v1/sessions/{sid}/ratify"): SCOPE_WRITE,
     ("POST", "/api/v1/sessions/{sid}/inject"): SCOPE_WRITE,
@@ -158,8 +167,30 @@ def build_daemon_app(
     authorize_inject: Authorizer | None = None,
     dispatch_targets: TargetsProvider | None = None,
     dispatch_paused: PausePredicate | None = None,
+    event_store: SessionEventStore | None = None,
+    list_autocode_sessions: AutocodeSessionsProvider | None = None,
 ) -> FastAPI:
     app = FastAPI(title="skcode-hostd")
+    # SessionEvent v2 (spec 5.1, card C-1): assigns seq/sid/source at append and
+    # (when the caller configures a persisting store) archives to the capped
+    # per-session JSONL. Defaults to an in-memory-only store (persist=False) so
+    # a bare test double, or a daemon nobody wired persistence for, still gets
+    # correct seq assignment without ever touching disk; serve.py wires a real
+    # persisting store for the live daemon.
+    store = event_store if event_store is not None else SessionEventStore(persist=False)
+
+    def _session_source(sid: str) -> str:
+        if list_autocode_sessions is not None:
+            for s in list_autocode_sessions():
+                if s.sid == sid:
+                    return s.source or "autocode"
+        return "interactive"
+
+    async def _all_sessions() -> list[SessionDescriptor]:
+        rows = list(await harness.list_sessions())
+        if list_autocode_sessions is not None:
+            rows = rows + list(list_autocode_sessions())
+        return rows
 
     def _auth(authorization: str | None, required_scope: str | None = None) -> None:
         require_bearer(authorization, verify_caller, required_scope)
@@ -230,16 +261,28 @@ def build_daemon_app(
     @app.get("/api/v1/sessions")
     async def list_sessions(authorization: str | None = Header(default=None)):
         _auth(authorization, SCOPE_READ)
-        rows = await harness.list_sessions()
+        rows = await _all_sessions()
         return JSONResponse({"sessions": [s.to_dict() for s in rows]})
 
     @app.get("/api/v1/sessions/{sid}")
     async def get_session(sid: str, authorization: str | None = Header(default=None)):
         _auth(authorization, SCOPE_READ)
-        for s in await harness.list_sessions():
+        for s in await _all_sessions():
             if s.sid == sid:
                 return JSONResponse(s.to_dict())
         raise HTTPException(404, "session not found")
+
+    @app.get("/api/v1/sessions/{sid}/events")
+    async def session_events(sid: str, before_seq: int | None = None, limit: int = 100,
+                             authorization: str | None = Header(default=None)):
+        # Archive paging over the capped per-session JSONL (spec 5.3): the client
+        # reconnect/scrollback path, same read scope as the live WS tail. When the
+        # daemon was built with no persisting event_store (persist=False, the
+        # default here), this is simply always empty -- there is nothing archived
+        # to page through, never an error.
+        _auth(authorization, SCOPE_READ)
+        rows = store.read_page(sid, before_seq=before_seq, limit=limit)
+        return JSONResponse({"sid": sid, "events": rows})
 
     @app.post("/api/v1/sessions/{sid}/ratify")
     async def ratify_session(sid: str, authorization: str | None = Header(default=None)):
@@ -407,9 +450,14 @@ def build_daemon_app(
             await websocket.close(code=1008)
             return
         await websocket.accept()
+        source = _session_source(sid)
         try:
             async for ev in harness.stream(sid):
-                await websocket.send_json(ev.to_dict())
+                # SessionEvent v2 (spec 5.1): assign seq/sid/source at append,
+                # here at the one point every live event actually passes through
+                # the daemon, then (when persistence is configured) archive it.
+                stamped = store.append(sid, ev, source=source)
+                await websocket.send_json(stamped.to_dict())
         except WebSocketDisconnect:
             return
         await websocket.close()
