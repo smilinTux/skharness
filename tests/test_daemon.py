@@ -239,6 +239,55 @@ def test_sessions_events_route_empty_without_a_persisting_store():
     assert r.json() == {"sid": "lumina-abc12345", "events": []}
 
 
+# ---- GET /jobs : cron ledger view (spec section 8, card C-8) -----------------
+
+def test_jobs_route_requires_read_scope():
+    c = _client()
+    assert c.get("/api/v1/jobs").status_code == 401
+    assert c.get("/api/v1/jobs", headers={"authorization": "Bearer bad"}).status_code == 403
+
+
+def test_jobs_route_empty_without_a_jobs_provider():
+    # No list_jobs configured (the daemon default): an empty list, never an
+    # error -- a host with no cron ledger known yet is a valid, unremarkable
+    # state, not a fault.
+    c = _client()
+    r = c.get("/api/v1/jobs", headers={"authorization": "Bearer good"})
+    assert r.status_code == 200
+    assert r.json() == {"jobs": []}
+
+
+def test_jobs_route_reports_rows_from_the_configured_provider():
+    from skharness.jobs import JobRun
+
+    rows = [
+        JobRun(job="drchiro-ingest", host="noroc2027", last_start="2026-08-11T22:30:01-04:00",
+              status="ok", dur_s=1.5, tail="0 new", staleness_s=120.0, stale=False,
+              stale_threshold_s=1800.0),
+    ]
+    app = build_daemon_app(harness=_harness(), verify_caller=lambda t: t == "good",
+                           list_jobs=lambda: rows)
+    c = TestClient(app)
+    r = c.get("/api/v1/jobs", headers={"authorization": "Bearer good"})
+    assert r.status_code == 200
+    body = r.json()["jobs"]
+    assert len(body) == 1
+    assert body[0]["job"] == "drchiro-ingest"
+    assert body[0]["status"] == "ok"
+    assert body[0]["stale"] is False
+
+
+def test_jobs_route_has_no_mutating_verb():
+    # Card C-8's hard rule: "no run-now, cancel, or any mutating job action
+    # exists in this card". Only GET is wired for /jobs; POST/PUT/DELETE are
+    # all Method Not Allowed (the route path exists only for GET).
+    c = _client()
+    h = {"authorization": "Bearer good"}
+    assert c.post("/api/v1/jobs", json={}, headers=h).status_code == 405
+    assert c.put("/api/v1/jobs", json={}, headers=h).status_code == 405
+    assert c.delete("/api/v1/jobs", headers=h).status_code == 405
+
+
 # ---- autocode runs register as sessions (source=autocode, spec 5.1 / AC3) ---
 
 def test_list_sessions_merges_registered_autocode_runs():

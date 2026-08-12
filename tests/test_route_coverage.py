@@ -136,3 +136,21 @@ def test_sessions_events_archive_route_is_gated_on_stream_scope():
     assert ROUTE_SCOPES[("GET", "/api/v1/sessions/{sid}/events")] == "skcode.stream"
     assert "skcode.stream" not in PDP_SCOPES
     assert "skcode.stream" not in DEFAULT_RULES
+
+
+def test_jobs_route_is_gated_on_stream_scope_and_read_only():
+    """Card C-8 (jobs view over the cron ledger, spec section 8): GET /jobs is a
+    READ-only view, same scope as the sessions/events routes, and is NOT one of
+    the PDP-decided scopes -- it decides nothing, it only reports. There is no
+    mutating jobs route (no run-now/cancel/retry) anywhere in ROUTE_SCOPES."""
+    from capauth.authz import DEFAULT_RULES
+
+    assert classify_route("GET", "/api/v1/jobs") == ("gated", "skcode.stream")
+    assert ROUTE_SCOPES[("GET", "/api/v1/jobs")] == "skcode.stream"
+    assert "skcode.stream" not in PDP_SCOPES
+    assert "skcode.stream" not in DEFAULT_RULES
+    # Card C-8's hard rule: "no run-now, cancel, or any mutating job action
+    # exists in this card". Pin it: no declared route path contains "jobs"
+    # other than this one GET.
+    jobs_routes = [key for key in ROUTE_SCOPES if "jobs" in key[1]]
+    assert jobs_routes == [("GET", "/api/v1/jobs")]

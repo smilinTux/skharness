@@ -18,6 +18,7 @@ from skharness.auth import AuthContext, Verifier
 from skharness.autocode.sessions import AutocodeSessionRegistry
 from skharness.daemon import build_daemon_app
 from skharness.harnesses.claude_code import ClaudeCodeHarness, parse_repo_allowlist
+from skharness.jobs import read_job_runs
 from skharness.session_events import SessionEventStore
 
 DEFAULT_PORT = 9394
@@ -270,6 +271,24 @@ def build_dispatch_targets():
     return _targets
 
 
+def build_jobs_provider():
+    """Wire ``GET /api/v1/jobs`` (spec section 8, card C-8) to the REAL cron
+    ledger at its default path (``~/.skcapstone/logs/cron-ledger.jsonl``, or
+    ``$SKCODE_CRON_LEDGER_PATH`` when set).
+
+    Reads fresh on every call (:func:`skharness.jobs.read_job_runs` opens the
+    ledger file itself); this daemon caches nothing about jobs, matching the
+    "the Code section is a view, never a store" rule. Fails safe by
+    construction: a missing/empty/malformed ledger degrades to an empty or
+    partial list, never an exception, so this callable can never make the
+    route 500.
+    """
+    def _jobs():
+        return read_job_runs()
+
+    return _jobs
+
+
 def select_verifier() -> Verifier:
     """Pick the verifier the daemon runs with (CR-3.2: real capauth by default).
 
@@ -353,5 +372,6 @@ def _serve(argv: list[str]) -> None:
         dispatch_paused=dispatch_is_paused,
         event_store=event_store,
         list_autocode_sessions=autocode_registry.list,
+        list_jobs=build_jobs_provider(),
     )
     uvicorn.run(app, host=host, port=args.port)
