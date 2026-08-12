@@ -479,6 +479,47 @@ class ClaudeCodeHarness(Harness):
         self._runner(["tmux", "kill-window", "-t", target])
         return {"sid": sid, "archived": True, "transcript_path": str(path)}
 
+    async def cancel(self, sid: str) -> dict:
+        """Cancel a live session: kill its process group, then drop the window.
+
+        A HARD stop (skcode C-6), not the graceful stop-and-persist of
+        :meth:`archive`: no transcript is captured or written. Every tmux pane
+        this harness spawns is its own session/process-group leader (`tmux
+        new-window` execs the launch argv directly, no intervening shell, see
+        :meth:`spawn`), so the pane's PID IS the process group id; sending the
+        kill to the NEGATIVE pid reaches that leader AND every child process it
+        started (a tool call, a background job), so nothing is left running as
+        an orphan. The tmux window is then removed so the session drops off
+        :meth:`list_sessions`.
+
+        Idempotent + safe: an invalid sid, or a sid with no live tmux window
+        (already ended / never running), returns a clean ``cancelled: False``
+        no-op rather than raising, and never touches tmux or a process.
+        """
+        if not _SID_RE.match(sid):
+            return {"sid": sid, "cancelled": False, "reason": "invalid session id"}
+
+        live_ids = {s.sid for s in self._list_windows()}
+        if sid not in live_ids:
+            return {
+                "sid": sid,
+                "cancelled": False,
+                "reason": "no live session (already ended or never running)",
+            }
+
+        target = f"{self.tmux_session}:{sid}"
+        pid_out = self._runner(["tmux", "list-panes", "-t", target, "-F", "#{pane_pid}"])
+        pid = ""
+        stripped = (pid_out or "").strip()
+        if stripped:
+            pid = stripped.splitlines()[0].strip()
+        if pid.isdigit():
+            # Negative pid == kill(2) targets the whole process GROUP, not just
+            # this one process, so a child the session started dies with it.
+            self._runner(["kill", "-KILL", f"-{pid}"])
+        self._runner(["tmux", "kill-window", "-t", target])
+        return {"sid": sid, "cancelled": True}
+
     def _inject_target_allowed(self, sid: str) -> bool:
         """CR-6.2 C2: may inject reach ``sid``?
 

@@ -255,3 +255,120 @@ def test_dispatch_targets_requires_dispatch_scope():
 def test_dispatch_targets_no_token_is_401():
     c = TestClient(_app(targets=lambda: {"repos": []}))
     assert c.get("/api/v1/dispatch/targets").status_code == 401
+
+
+# --- POST /sessions/{sid}/cancel : rides the SAME dispatch scope + PDP path --
+# (card C-6, spec section 8: "it rides the dispatch scope through the same PDP
+# decision path as dispatch and inject"). Proves the route is PDP-GATED, not
+# merely present: no token -> 401, wrong scope -> 403, deny -> 403 (audited,
+# harness.cancel never reached), allow -> harness.cancel called + audited, and
+# cancelling an unknown/already-finished session is a clean 200 no-op.
+
+
+class _CancellingHarness(FakeHarness):
+    """FakeHarness plus a cancel() that RECORDS the sid and returns a canned
+    idempotent-shaped result, so the daemon cancel route is driven with no real
+    tmux/process. (FakeHarness leaves cancel at the base gated raise; the
+    cancel path is proven here on a subclass, mirroring the dispatch/inject
+    doubles.)"""
+
+    def __init__(self, *, live=None):
+        super().__init__(sessions=[], events={})
+        self.cancelled: list[str] = []
+        self._live = set(live) if live else set()
+
+    async def cancel(self, sid):
+        self.cancelled.append(sid)
+        if sid not in self._live:
+            return {"sid": sid, "cancelled": False,
+                    "reason": "no live session (already ended or never running)"}
+        self._live.discard(sid)
+        return {"sid": sid, "cancelled": True}
+
+
+def test_cancel_no_token_is_401():
+    harness = _CancellingHarness(live=["lumina-abc12345"])
+    c = TestClient(_app(harness=harness, authorize=_allow_authorizer(), audit=lambda s: None))
+    r = c.post("/api/v1/sessions/lumina-abc12345/cancel")
+    assert r.status_code == 401
+    assert harness.cancelled == []
+
+
+def test_cancel_stream_only_token_is_403_insufficient_scope():
+    harness = _CancellingHarness(live=["lumina-abc12345"])
+    c = TestClient(_app(harness=harness, verify=_verifier("skcode.stream"),
+                        authorize=_allow_authorizer(), audit=lambda s: None))
+    r = c.post("/api/v1/sessions/lumina-abc12345/cancel",
+               headers={"authorization": "Bearer t"})
+    assert r.status_code == 403
+    assert harness.cancelled == []          # never reached harness.cancel
+
+
+def test_cancel_scope_but_authz_deny_is_403_and_audited():
+    harness = _CancellingHarness(live=["lumina-abc12345"])
+    audits, authz_calls = [], []
+    c = TestClient(_app(harness=harness, authorize=_deny_authorizer(authz_calls),
+                        audit=audits.append))
+    r = c.post("/api/v1/sessions/lumina-abc12345/cancel",
+               headers={"authorization": "Bearer t"})
+    assert r.status_code == 403
+    assert authz_calls and authz_calls[0][0] == "phone@chef.skworld"
+    assert authz_calls[0][1]["sid"] == "lumina-abc12345"
+    assert harness.cancelled == []
+    blob = " ".join(audits)
+    assert "deny" in blob
+
+
+def test_cancel_scope_and_authz_allow_calls_harness_and_audits():
+    harness = _CancellingHarness(live=["lumina-abc12345"])
+    audits, authz_calls = [], []
+    c = TestClient(_app(harness=harness, authorize=_allow_authorizer(authz_calls),
+                        audit=audits.append))
+    r = c.post("/api/v1/sessions/lumina-abc12345/cancel",
+               headers={"authorization": "Bearer t"})
+    assert r.status_code == 200
+    assert r.json() == {"sid": "lumina-abc12345", "cancelled": True}
+    assert harness.cancelled == ["lumina-abc12345"]
+    blob = " ".join(audits)
+    assert "allow" in blob and "skcode.cancel" in blob
+
+
+def test_cancel_unknown_session_is_a_clean_200_noop():
+    """Idempotent + safe: cancelling an unknown/already-finished session never
+    raises; it is a clean 200 with cancelled: False, not a 404/500."""
+    harness = _CancellingHarness(live=[])
+    c = TestClient(_app(harness=harness, authorize=_allow_authorizer(), audit=lambda s: None))
+    r = c.post("/api/v1/sessions/never-existed/cancel",
+               headers={"authorization": "Bearer t"})
+    assert r.status_code == 200
+    assert r.json() == {"sid": "never-existed", "cancelled": False,
+                        "reason": "no live session (already ended or never running)"}
+    assert harness.cancelled == ["never-existed"]
+
+
+def test_cancel_without_audit_sink_fails_closed_501():
+    harness = _CancellingHarness(live=["lumina-abc12345"])
+    c = TestClient(_app(harness=harness, authorize=_allow_authorizer(), audit=None))
+    r = c.post("/api/v1/sessions/lumina-abc12345/cancel",
+               headers={"authorization": "Bearer t"})
+    assert r.status_code == 501
+    assert harness.cancelled == []
+
+
+def test_cancel_without_authz_pdp_fails_closed_501():
+    harness = _CancellingHarness(live=["lumina-abc12345"])
+    c = TestClient(_app(harness=harness, authorize=None, audit=lambda s: None))
+    r = c.post("/api/v1/sessions/lumina-abc12345/cancel",
+               headers={"authorization": "Bearer t"})
+    assert r.status_code == 501
+    assert harness.cancelled == []
+
+
+def test_cancel_deny_all_verifier_403_default_preserved():
+    harness = _CancellingHarness(live=["lumina-abc12345"])
+    c = TestClient(_app(harness=harness, verify=lambda t: False,
+                        authorize=_allow_authorizer(), audit=lambda s: None))
+    r = c.post("/api/v1/sessions/lumina-abc12345/cancel",
+               headers={"authorization": "Bearer t"})
+    assert r.status_code == 403
+    assert harness.cancelled == []

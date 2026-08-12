@@ -352,6 +352,122 @@ async def test_archive_is_idempotent(tmp_path):
     assert second["archived"] is False
 
 
+# --- cancel: a HARD stop, kills the process group (card C-6) -----------------
+
+
+@pytest.mark.asyncio
+async def test_cancel_kills_process_group_then_the_window(tmp_path):
+    root = tmp_path / "agents"
+    sid = "lumina-abc12345"
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        if "list-windows" in argv:
+            return "monitor\t1\nlumina-abc12345\t1700000100\n"
+        if "list-panes" in argv:
+            return "54321\n"
+        if "kill" == argv[0]:
+            return ""
+        if "kill-window" in argv:
+            return ""
+        raise AssertionError(f"unexpected tmux call: {argv}")
+
+    h = ClaudeCodeHarness(runner=runner, sessions_root=root, host=".158")
+    result = await h.cancel(sid)
+
+    assert result == {"sid": sid, "cancelled": True}
+    # the process GROUP (negative pid) was killed, not just the leader pid
+    kill_calls = [c for c in calls if c and c[0] == "kill"]
+    assert kill_calls == [["kill", "-KILL", "-54321"]]
+    # ordering: the process group died BEFORE the tmux window was torn down
+    verbs = [c[0] if c[0] != "tmux" else c[1] for c in calls]
+    assert verbs.index("kill") < verbs.index("kill-window")
+
+
+@pytest.mark.asyncio
+async def test_cancel_unknown_sid_is_a_clean_noop(tmp_path):
+    root = tmp_path / "agents"
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        if "list-windows" in argv:
+            return "monitor\t1\nlumina-abc12345\t1700000100\n"
+        raise AssertionError(f"must not touch tmux beyond list-windows: {argv}")
+
+    h = ClaudeCodeHarness(runner=runner, sessions_root=root, host=".158")
+    result = await h.cancel("opus-deadbeef")  # not a live window
+
+    assert result == {"sid": "opus-deadbeef", "cancelled": False,
+                      "reason": "no live session (already ended or never running)"}
+    assert all("list-panes" not in c and "kill-window" not in c
+               and not (c and c[0] == "kill") for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_cancel_invalid_sid_never_touches_tmux(tmp_path):
+    def runner(argv):
+        raise AssertionError(f"invalid sid must not reach tmux: {argv}")
+
+    h = ClaudeCodeHarness(runner=runner, sessions_root=tmp_path, host=".158")
+    result = await h.cancel("bad;name$(x)")
+    assert result == {"sid": "bad;name$(x)", "cancelled": False,
+                      "reason": "invalid session id"}
+
+
+@pytest.mark.asyncio
+async def test_cancel_is_idempotent(tmp_path):
+    """A second cancel of the same sid (now gone) is a clean no-op, not a raise."""
+    root = tmp_path / "agents"
+    sid = "lumina-abc12345"
+    state = {"alive": True}
+
+    def runner(argv):
+        if "list-windows" in argv:
+            return ("monitor\t1\nlumina-abc12345\t1700000100\n"
+                    if state["alive"] else "monitor\t1\n")
+        if "list-panes" in argv:
+            return "54321\n"
+        if "kill" == argv[0]:
+            return ""
+        if "kill-window" in argv:
+            state["alive"] = False
+            return ""
+        raise AssertionError(f"unexpected tmux call: {argv}")
+
+    h = ClaudeCodeHarness(runner=runner, sessions_root=root, host=".158")
+    first = await h.cancel(sid)
+    second = await h.cancel(sid)
+    assert first == {"sid": sid, "cancelled": True}
+    assert second["cancelled"] is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_never_leaks_process_when_pane_pid_is_missing(tmp_path):
+    """No pane_pid available (blank list-panes output): still tears down the
+    tmux window rather than getting stuck, and never sends a malformed kill."""
+    root = tmp_path / "agents"
+    sid = "lumina-abc12345"
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        if "list-windows" in argv:
+            return "monitor\t1\nlumina-abc12345\t1700000100\n"
+        if "list-panes" in argv:
+            return ""
+        if "kill-window" in argv:
+            return ""
+        raise AssertionError(f"unexpected tmux call: {argv}")
+
+    h = ClaudeCodeHarness(runner=runner, sessions_root=root, host=".158")
+    result = await h.cancel(sid)
+    assert result == {"sid": sid, "cancelled": True}
+    assert not any(c and c[0] == "kill" for c in calls)
+    assert any("kill-window" in c for c in calls)
+
+
 # --- inject: send operator text into a running session (P1 write surface) -----
 
 
