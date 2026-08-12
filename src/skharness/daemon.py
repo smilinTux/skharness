@@ -27,6 +27,7 @@ from skharness.autocode import ratify as _ratify
 from skharness.autocode.types import RepoSpec
 from skharness.events import EventType, SessionEvent
 from skharness.harness import Harness, SessionDescriptor, SpawnRejected
+from skharness.jobs import JobRun
 from skharness.manifest import skcode_module_manifest
 from skharness.session_events import SessionEventStore
 
@@ -56,6 +57,12 @@ RatifyResolver = Callable[[SessionDescriptor], "tuple[RepoSpec, str, list[str]] 
 # the harness's own (interactive) rows. None (the default) merges nothing, so a
 # bare test double sees exactly the harness's sessions, unchanged.
 AutocodeSessionsProvider = Callable[[], "list[SessionDescriptor]"]
+
+# Cron/scheduler ledger view (spec section 8, card C-8): a provider of the CURRENT
+# JobRun rows, read fresh on every call (the ledger is a live, append-only file
+# owned by the scheduler, not something this daemon caches). None (the default)
+# reports no jobs known, so a bare test double never touches any real ledger path.
+JobsProvider = Callable[[], "list[JobRun]"]
 
 # Scope split on the remote-control surface (R2.4): a verified skcode token must
 # carry SCOPE_READ to view (list/get/stream), and SCOPE_WRITE to actuate
@@ -100,6 +107,7 @@ ROUTE_SCOPES: dict[tuple[str, str], str] = {
     ("GET", "/api/v1/sessions"): SCOPE_READ,
     ("GET", "/api/v1/sessions/{sid}"): SCOPE_READ,
     ("GET", "/api/v1/sessions/{sid}/events"): SCOPE_READ,
+    ("GET", "/api/v1/jobs"): SCOPE_READ,
     ("GET", "/api/v1/dispatch/targets"): SCOPE_DISPATCH,
     ("POST", "/api/v1/sessions/{sid}/ratify"): SCOPE_WRITE,
     ("POST", "/api/v1/sessions/{sid}/inject"): SCOPE_WRITE,
@@ -170,6 +178,7 @@ def build_daemon_app(
     dispatch_paused: PausePredicate | None = None,
     event_store: SessionEventStore | None = None,
     list_autocode_sessions: AutocodeSessionsProvider | None = None,
+    list_jobs: JobsProvider | None = None,
 ) -> FastAPI:
     app = FastAPI(title="skcode-hostd")
     # SessionEvent v2 (spec 5.1, card C-1): assigns seq/sid/source at append and
@@ -284,6 +293,20 @@ def build_daemon_app(
         _auth(authorization, SCOPE_READ)
         rows = store.read_page(sid, before_seq=before_seq, limit=limit)
         return JSONResponse({"sid": sid, "events": rows})
+
+    @app.get("/api/v1/jobs")
+    async def list_jobs_route(authorization: str | None = Header(default=None)):
+        # Read-only view over the cron/scheduler ledger (spec section 8, card
+        # C-8). Same read scope as sessions/events: it is a VIEW, never a store,
+        # so it needs no write scope and no PDP decision. hostd owns none of this
+        # data -- the scheduler does -- and no run-now/cancel/retry action exists
+        # here or anywhere else in this daemon (deliberately deferred). When no
+        # jobs provider is wired (bare test doubles, or a host with no cron
+        # ledger yet), this reports an empty list rather than 404/500: "no jobs
+        # known yet" is a valid, unremarkable state.
+        _auth(authorization, SCOPE_READ)
+        rows: list[JobRun] = list_jobs() if list_jobs is not None else []
+        return JSONResponse({"jobs": [r.to_dict() for r in rows]})
 
     @app.post("/api/v1/sessions/{sid}/ratify")
     async def ratify_session(sid: str, authorization: str | None = Header(default=None)):
