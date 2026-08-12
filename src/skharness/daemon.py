@@ -104,6 +104,7 @@ ROUTE_SCOPES: dict[tuple[str, str], str] = {
     ("POST", "/api/v1/sessions/{sid}/ratify"): SCOPE_WRITE,
     ("POST", "/api/v1/sessions/{sid}/inject"): SCOPE_WRITE,
     ("POST", "/api/v1/dispatch"): SCOPE_DISPATCH,
+    ("POST", "/api/v1/sessions/{sid}/cancel"): SCOPE_DISPATCH,
     ("WS", "/api/v1/sessions/{sid}/stream"): SCOPE_READ,
 }
 
@@ -440,6 +441,39 @@ def build_daemon_app(
                      "sid": session.sid, "resource": resource})
         return JSONResponse({"sid": session.sid, "status": session.status,
                              "branch": session.branch, "profile": profile, "mode": mode})
+
+    @app.post("/api/v1/sessions/{sid}/cancel")
+    async def cancel_session(sid: str, authorization: str | None = Header(default=None)):
+        # Cancel a LIVE session (spec section 8). It rides the DISPATCH scope
+        # through the SAME PDP decision path as POST /dispatch: a caller needs
+        # skcode.dispatch AND an authz allow, exactly like spawning a new
+        # session, so a read-only or inject-only token can never cancel. Fail
+        # closed like dispatch: no audit sink or no authz PDP configured => 501,
+        # never a silent allow.
+        auth = _authed_context(authorization, SCOPE_DISPATCH)
+        if audit_log is None:
+            raise HTTPException(501, "audit sink not configured; cancel denied")
+        if authorize_dispatch is None:
+            raise HTTPException(501, "authz PDP not configured; cancel denied")
+        subject = _subject(auth)
+        resource = {"host": host_id, "sid": sid, "action": "cancel"}
+        decision = authorize_dispatch(subject, resource, {})
+        _emit_decision_obligations(decision)
+        allow = bool(getattr(decision, "allow", False))
+        _emit_audit({
+            "event": "skcode.cancel",
+            "subject": subject,
+            "sid": sid,
+            "decision": "allow" if allow else "deny",
+            "reason": getattr(decision, "reason", ""),
+        })
+        if not allow:
+            raise HTTPException(403, "cancel not authorized")
+        # Idempotent + safe by construction: harness.cancel returns a clean
+        # {"cancelled": False, "reason": ...} for an unknown/already-finished
+        # session rather than raising, so this route never 500s on a stale sid.
+        result = await harness.cancel(sid)
+        return JSONResponse(result)
 
     @app.websocket("/api/v1/sessions/{sid}/stream")
     async def stream(websocket: WebSocket, sid: str):

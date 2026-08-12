@@ -258,6 +258,24 @@ class Harness(ABC):
         raise NotImplementedError(
             f"harness {self.name!r} does not implement the session plane (archive)")
 
+    async def cancel(self, sid: str) -> dict:
+        """Cancel a LIVE session: a hard stop (skcode Code-section card C-6).
+
+        Unlike :meth:`archive` (stop + persist), cancel is a genuine abort: no
+        transcript is guaranteed to be persisted. Implementations MUST terminate
+        the session's WHOLE process group, not only its leader process, so a
+        child subprocess the session started (a tool call, a background job) is
+        never left running as an orphan.
+
+        Returns a small result dict, e.g. ``{"sid": sid, "cancelled": True}`` on
+        success, or ``{"sid": sid, "cancelled": False, "reason": ...}`` when the
+        session is unknown/already gone (a clean no-op, never a raise). This is a
+        WRITE verb; the daemon route that drives it stays behind the capauth
+        bearer + PDP gate (see daemon.py).
+        """
+        raise NotImplementedError(
+            f"harness {self.name!r} does not implement the session plane (cancel)")
+
 
 # ---------------------------------------------------------------------------
 # FakeHarness: the session-plane CI double (read-only).

@@ -112,6 +112,20 @@ def test_the_three_write_and_rce_routes_are_gated_on_the_right_scopes():
     assert classify_route("GET", "/app") == ("public", None)
 
 
+def test_cancel_route_is_gated_on_dispatch_scope():
+    """Card C-6: POST /sessions/{sid}/cancel rides the SAME scope as dispatch
+    (spec section 8: "it rides the dispatch scope through the same PDP decision
+    path as dispatch"), not a new/unclassified scope."""
+    from capauth.authz import DEFAULT_RULES
+
+    assert classify_route("POST", "/api/v1/sessions/{sid}/cancel") == ("gated", "skcode.dispatch")
+    assert ROUTE_SCOPES[("POST", "/api/v1/sessions/{sid}/cancel")] == "skcode.dispatch"
+    # skcode.dispatch is a PDP-decided scope with an existing rule row (shared
+    # with dispatch/dispatch-targets); cancel needs no NEW capauth rule.
+    assert "skcode.dispatch" in PDP_SCOPES
+    assert "skcode.dispatch" in DEFAULT_RULES
+
+
 def test_sessions_events_archive_route_is_gated_on_stream_scope():
     """Card C-1 (SessionEvent v2 + archive paging): the new GET .../events route
     is a READ route, same scope as the list/get/WS-stream routes, not a PDP-
