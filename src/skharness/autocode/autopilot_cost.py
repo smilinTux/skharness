@@ -76,13 +76,17 @@ def _today() -> str:
 
 
 def record_run(*, card_id: str, repo: str, tokens: int, cost_usd: float,
-               passed: bool, pr: str, ts: str) -> None:
+               passed: bool, pr: str, ts: str, run_id: str = "") -> None:
     """Append one run to the ledger. Never raises -- a cost-tracking bug must
-    never turn a successful (or a well-formed failed) run into a crash."""
+    never turn a successful (or a well-formed failed) run into a crash.
+
+    ``run_id`` (default "" for back-compat) is the bridge's own journal handle
+    stamp (``airun-<card_id>-<YYYYmmddTHHMMSSZ>``), so ledger rows join cleanly
+    against the run journal and the settlement journal (design doc section 6)."""
     row = {
         "ts": ts, "date": ts[:10], "card_id": card_id, "repo": repo,
         "tokens": tokens, "cost_usd": cost_usd, "joules": _joules(cost_usd),
-        "passed": bool(passed), "pr": pr,
+        "passed": bool(passed), "pr": pr, "run_id": run_id,
     }
     try:
         path = ledger_path()
@@ -113,6 +117,80 @@ def _read_ledger() -> list[dict]:
         log.exception("autopilot_cost._read_ledger: failed to read ledger")
         return []
     return rows
+
+
+# --------------------------------------------------------------------------- #
+# Settlement journal (design doc section 6): the dedupe guard in front of the #
+# JouleWallet. A distinct file from the ledger -- the ledger prices every run #
+# (pass or fail), this journal records only wallet settlements (pass only).   #
+# --------------------------------------------------------------------------- #
+
+
+def settlements_path() -> Path:
+    return cost_dir() / "settlements.jsonl"
+
+
+def _read_settlements() -> list[dict]:
+    """Read every row in the settlement journal, tolerating a missing file and
+    skipping any malformed line rather than failing the whole read (mirrors
+    ``_read_ledger``)."""
+    path = settlements_path()
+    if not path.exists():
+        return []
+    rows: list[dict] = []
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        log.exception("autopilot_cost._read_settlements: failed to read settlements")
+        return []
+    return rows
+
+
+def already_settled(card_id: str) -> bool:
+    """True if ANY settlement row already exists for *card_id*.
+
+    This is the design doc's J1 hardening rule (section 6): a full
+    re-dispatch of the same card produces a fresh worktree and a fresh commit
+    sha, so the ``(card_id, commit_sha)`` key alone cannot catch a semantic
+    duplicate. The cheap journal-local rule is "one settlement per card_id
+    until an operator clears it" -- start with that, no ``gh`` call needed.
+
+    Never raises: a corrupted/unreadable journal reads as "not settled", the
+    same fail-open discipline as the rest of this module -- a broken journal
+    must never turn an otherwise-legitimate run into a crash."""
+    try:
+        return any(r.get("card_id") == card_id for r in _read_settlements())
+    except Exception:  # noqa: BLE001 -- the dedup guard must never raise
+        log.exception("autopilot_cost.already_settled: failed to check settlements")
+        return False
+
+
+def record_settlement(*, card_id: str, commit_sha: str, agent: str, minted: int,
+                      spent: int, net: int, balance_after: int | None,
+                      ts: str) -> None:
+    """Append one row to the settlement journal: one row per WALLET
+    settlement, keyed (for the dedupe guard above) by ``card_id``. Never
+    raises -- a journal-write bug must never turn a shipped, settled build
+    into a crash."""
+    row = {
+        "ts": ts, "card_id": card_id, "commit_sha": commit_sha, "agent": agent,
+        "minted": minted, "spent_joules": spent, "net_joules": net,
+        "balance_after": balance_after, "state": "settled",
+    }
+    try:
+        path = settlements_path()
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+    except Exception:  # noqa: BLE001 -- settlement-journal writes are best-effort
+        log.exception("autopilot_cost.record_settlement: failed to append settlement row")
 
 
 def _aggregate(rows: list[dict]) -> dict:

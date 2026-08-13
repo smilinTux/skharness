@@ -328,3 +328,101 @@ def test_check_and_alert_caps_never_raises_when_alert_blows_up(mocker):
     fired = autopilot_cost.check_and_alert_caps(
         cfg=cfg, today="2026-08-13", day_cost=5.0, this_run_tokens=0)
     assert fired == []          # swallowed, never raised
+
+
+# --------------------------------------------------------------------------- #
+# record_run: run_id back-compat field                                        #
+# --------------------------------------------------------------------------- #
+
+
+def test_record_run_defaults_run_id_to_empty_string():
+    autopilot_cost.record_run(card_id="task-1", repo="skrender", tokens=1,
+                              cost_usd=0.1, passed=True, pr="",
+                              ts="2026-08-13T00:00:00+00:00")
+    row = autopilot_cost._read_ledger()[0]
+    assert row["run_id"] == ""
+
+
+def test_record_run_carries_run_id_when_given():
+    autopilot_cost.record_run(card_id="task-1", repo="skrender", tokens=1,
+                              cost_usd=0.1, passed=True, pr="",
+                              ts="2026-08-13T00:00:00+00:00",
+                              run_id="airun-task-1-20260813T000000Z")
+    row = autopilot_cost._read_ledger()[0]
+    assert row["run_id"] == "airun-task-1-20260813T000000Z"
+
+
+# --------------------------------------------------------------------------- #
+# settlements.jsonl: already_settled / record_settlement                      #
+# --------------------------------------------------------------------------- #
+
+
+def test_settlements_path_is_under_cost_dir():
+    assert autopilot_cost.settlements_path() == autopilot_cost.cost_dir() / "settlements.jsonl"
+
+
+def test_already_settled_false_when_no_settlements_file():
+    assert autopilot_cost.already_settled("task-1") is False
+
+
+def test_already_settled_true_after_record_settlement():
+    assert autopilot_cost.already_settled("task-1") is False
+    autopilot_cost.record_settlement(
+        card_id="task-1", commit_sha="deadbeef", agent="lumina",
+        minted=100, spent=25, net=75, balance_after=575,
+        ts="2026-08-13T00:00:00+00:00")
+    assert autopilot_cost.already_settled("task-1") is True
+
+
+def test_already_settled_scoped_by_card_id():
+    autopilot_cost.record_settlement(
+        card_id="task-1", commit_sha="deadbeef", agent="lumina",
+        minted=100, spent=25, net=75, balance_after=575,
+        ts="2026-08-13T00:00:00+00:00")
+    assert autopilot_cost.already_settled("task-2") is False
+
+
+def test_already_settled_true_even_for_a_different_commit_sha():
+    # J1 hardening rule (design doc section 6): dedupe is by card_id ALONE, not
+    # (card_id, commit_sha) -- a re-dispatch produces a fresh commit sha, and the
+    # rule is "one settlement per card_id until an operator clears it".
+    autopilot_cost.record_settlement(
+        card_id="task-1", commit_sha="aaaa111", agent="lumina",
+        minted=100, spent=25, net=75, balance_after=575,
+        ts="2026-08-13T00:00:00+00:00")
+    assert autopilot_cost.already_settled("task-1") is True
+
+
+def test_record_settlement_row_shape():
+    autopilot_cost.record_settlement(
+        card_id="task-1", commit_sha="deadbeef", agent="lumina",
+        minted=100, spent=25, net=75, balance_after=575,
+        ts="2026-08-13T00:00:00+00:00")
+    rows = autopilot_cost._read_settlements()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row == {
+        "ts": "2026-08-13T00:00:00+00:00", "card_id": "task-1",
+        "commit_sha": "deadbeef", "agent": "lumina", "minted": 100,
+        "spent_joules": 25, "net_joules": 75, "balance_after": 575,
+        "state": "settled",
+    }
+
+
+def test_record_settlement_never_raises_on_unwritable_dir(monkeypatch, tmp_path):
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a dir")
+    monkeypatch.setenv("SKAI_COST_DIR", str(blocker / "nested"))
+    # Must not raise.
+    autopilot_cost.record_settlement(
+        card_id="task-1", commit_sha="deadbeef", agent="lumina",
+        minted=100, spent=25, net=75, balance_after=575,
+        ts="2026-08-13T00:00:00+00:00")
+
+
+def test_already_settled_never_raises_on_malformed_journal_line(tmp_path):
+    path = autopilot_cost.settlements_path()
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write("not valid json\n")
+    # Malformed line is skipped, not fatal -- reads as "not settled".
+    assert autopilot_cost.already_settled("task-1") is False

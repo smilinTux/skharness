@@ -30,7 +30,7 @@ import subprocess
 from datetime import datetime, timezone
 from typing import Callable
 
-from . import autopilot_cost
+from . import autopilot_cost, joules
 from .config import Config
 from .direct import DirectExecutor
 from .harness import build_harness
@@ -234,28 +234,40 @@ def execute_dispatch(context: dict) -> dict:
                 "acceptance": acceptance,
                 "tags": [f"repo:{repo.name}"],
                 "unblocked": True, "verdict": "valid",
+                "priority": getattr(card, "priority", None),
             })
 
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        run_journal = journal_handle(f"airun-{card_id}-{stamp}")
+        run_id = f"airun-{card_id}-{stamp}"
+        run_journal = journal_handle(run_id)
         digest = _ActivityDigestShim(activity)
         ex = AgentRunDirectExecutor(cfg, board=None, journal=run_journal, digest=digest)
 
         # Cost capture: wrap harness.run_task (DirectExecutor.run's own call
         # site, one level down) with a closure that records the HarnessResult's
-        # cost/tokens into `captured`, and restore the real callable no matter
-        # what. Guarded: a mocked/incomplete harness (unit tests) with no
-        # run_task attribute is left untouched, never AttributeError'd.
-        captured = {"cost_usd": 0.0, "tokens": 0}
+        # cost/tokens into `captured` ADDITIVELY, and restore the real callable
+        # no matter what. Guarded: a mocked/incomplete harness (unit tests) with
+        # no run_task attribute is left untouched, never AttributeError'd.
+        # `captured["raw"]` keeps the run_task result's claude-code JSON (when
+        # present) so settlement usage can recover the input/output token split
+        # via BuildUsage.from_claude_json (design doc J1 step 1).
+        captured = {"cost_usd": 0.0, "tokens": 0, "raw": None}
+
+        def _accrue(res) -> None:
+            try:
+                captured["cost_usd"] += float(getattr(res, "cost_usd", 0.0) or 0.0)
+                captured["tokens"] += int(getattr(res, "tokens", 0) or 0)
+                raw = getattr(res, "raw", None)
+                if raw:
+                    captured["raw"] = raw
+            except Exception:  # noqa: BLE001 -- never let capture break a real result
+                pass
+
         _real_run_task = getattr(harness, "run_task", None)
         if _real_run_task is not None:
             def _cost_capturing_run_task(brief, _real=_real_run_task):
                 res = _real(brief)
-                try:
-                    captured["cost_usd"] = getattr(res, "cost_usd", 0.0)
-                    captured["tokens"] = getattr(res, "tokens", 0)
-                except Exception:  # noqa: BLE001 -- never let capture break a real result
-                    pass
+                _accrue(res)
                 return res
             harness.run_task = _cost_capturing_run_task
         try:
@@ -267,7 +279,22 @@ def execute_dispatch(context: dict) -> dict:
                           "text": f"sandboxed run: passed={gr.passed} notes={gr.notes}"})
 
         wt = run_journal.worktree_for(item.ref)
-        rr = ratify(repo, wt, item.payload["acceptance"], harness)   # grade only
+        # Close the grade-cost gap (design doc J1 step 2): ratify() calls
+        # harness.grade, an LLM call whose cost is otherwise captured nowhere.
+        # Wrap it with the same accrue-and-restore closure so the run's true
+        # joule cost (ledger row AND settled usage) includes the grade.
+        _real_grade = getattr(harness, "grade", None)
+        if _real_grade is not None:
+            def _cost_capturing_grade(brief, _real=_real_grade):
+                res = _real(brief)
+                _accrue(res)
+                return res
+            harness.grade = _cost_capturing_grade
+        try:
+            rr = ratify(repo, wt, item.payload["acceptance"], harness)   # grade only
+        finally:
+            if _real_grade is not None:
+                harness.grade = _real_grade
         activity.append({
             "atype": "action",
             "text": (f"independent grade: score={rr.score} "
@@ -289,7 +316,7 @@ def execute_dispatch(context: dict) -> dict:
                 autopilot_cost.record_run(
                     card_id=card_id, repo=repo.name, tokens=captured["tokens"],
                     cost_usd=captured["cost_usd"], passed=bool(gr.passed),
-                    pr=pr_url_for_record, ts=_now_iso())
+                    pr=pr_url_for_record, ts=_now_iso(), run_id=run_id)
                 autopilot_cost.check_and_alert_caps(
                     cfg=cfg, today=today, day_cost=day_after,
                     this_run_tokens=captured["tokens"])
@@ -311,6 +338,66 @@ def execute_dispatch(context: dict) -> dict:
                 f"branch {branch} pushed but the PR could not be opened "
                 "(gh pr create failed); open it by hand",
                 activity, links={"branch": branch})
+
+        # Wallet settlement (design doc J1 section 3, step 3): settle to the
+        # JouleWallet only on the REAL ratify twin-gate verdict, never the
+        # ungated direct-mode gr.passed. AgentRunDirectExecutor._settle_economics
+        # stays a permanent no-op; this is the one place that holds `rr` in
+        # hand. Deduped by card_id (section 6's J1 hardening rule) and wrapped
+        # end-to-end in try/except so a wallet failure never turns a shipped
+        # draft PR into a refusal.
+        if rr.passed:
+            try:
+                if autopilot_cost.already_settled(card_id):
+                    activity.append({"atype": "action",
+                                      "text": "joules already settled for this card"})
+                else:
+                    try:
+                        head_sha = ex._head_sha(wt)
+                    except Exception:  # noqa: BLE001 -- a sha lookup failure must
+                        head_sha = ""  # never block settlement; proof_hash falls
+                        # back to task_ref inside joules.settle.
+
+                    # Usage: fold BOTH run_task's and grade's captured cost into
+                    # one BuildUsage whose cost_usd equals captured["cost_usd"]
+                    # exactly (the run's true joule cost), while still recovering
+                    # the input/output token split from run_task's raw JSON when
+                    # available, for UsageTracker fidelity.
+                    usage = joules.BuildUsage()
+                    if captured.get("raw"):
+                        from_raw = joules.BuildUsage.from_claude_json(captured["raw"])
+                        usage.add(cost_usd=captured["cost_usd"],
+                                  input_tokens=from_raw.input_tokens,
+                                  output_tokens=from_raw.output_tokens,
+                                  turns=from_raw.turns, model=from_raw.model)
+                    else:
+                        usage.add(cost_usd=captured["cost_usd"],
+                                  output_tokens=captured["tokens"], turns=1)
+
+                    # Q4: charge/credit the REQUESTING agent (context["agent"],
+                    # the R1 seam identity), never the runner node's own env
+                    # agent -- the economy is a per-agent P&L, not a per-node one.
+                    settle_agent = context.get("agent") or "lumina"
+                    econ = joules.settle(
+                        agent=settle_agent, task_ref=f"airun-{card_id}",
+                        priority=getattr(card, "priority", None), score=rr.score,
+                        usage=usage, commit_sha=head_sha, home=home)
+                    autopilot_cost.record_settlement(
+                        card_id=card_id, commit_sha=head_sha, agent=settle_agent,
+                        minted=econ.minted, spent=econ.spent_joules,
+                        net=econ.net_joules, balance_after=econ.balance_after,
+                        ts=_now_iso())
+                    activity.append({
+                        "atype": "action",
+                        "text": (f"joules settled: +{econ.minted} "
+                                 f"-{econ.spent_joules} = net {econ.net_joules} "
+                                 f"(balance {econ.balance_after})")})
+            except Exception as exc:  # noqa: BLE001 -- a settlement failure must
+                # never turn a shipped draft PR into a refusal.
+                activity.append({
+                    "atype": "action",
+                    "text": f"joule settlement failed (build unaffected): {exc}"})
+
         summary = (f"draft PR {pr_url}; independent grade "
                    f"{rr.score if rr.score is not None else 'n/a'}/5, "
                    f"twin gate {'PASS' if rr.passed else 'not passed'}; "
