@@ -78,6 +78,10 @@ class RepoSpec:                       # one entry of repo_map (autopilot.yaml)
     min_quality: QualityMode | None = None   # per-repo quality FLOOR (toggle spec G6):
     #   e.g. min_quality=gated on a deployed-service repo upgrades any direct/none
     #   request against it to gated. None means no floor (current behavior preserved).
+    deploy_cmd: str | None = None     # change-mgmt P3.2: optional per-repo deploy step run by
+    #   change_deploy_bridge AFTER a successful merge, when publish-on-main alone is not enough
+    #   (design doc 2026-08-13-change-management-cab-ai-arch.md section 5.2 step 5). None means
+    #   merge == deploy (the common case).
 
 
 @dataclass
