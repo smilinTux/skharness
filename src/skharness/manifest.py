@@ -41,8 +41,15 @@ def skcode_module_manifest(base_url: str) -> dict:
         # UI facet: starts Grade B (the existing read-only web client at /app),
         # promotes to Grade A (a Flutter skcode_client package) at R4 by flipping
         # grade + adding entry.flutter_package, never a contract change.
-        "grade": "B",
-        "entry": {"url": f"{base}/app"},
+        # Promoted to Grade A (card C-18) now that packages/skcode_client in
+        # skworld-app is the real native module and the shell registry mounts it
+        # at /code. entry.url is KEPT so the legacy web client stays reachable at
+        # /code/legacy: C-10's parity check found two capabilities the native pane
+        # does not yet cover (a repo-less "direct" session, cards C-16, and the
+        # attach-mode TUI chrome filter, C-17), so the iframe is still the
+        # fallback until those land.
+        "grade": "A",
+        "entry": {"url": f"{base}/app", "flutter_package": "skcode_client"},
         "nav": {"icon": "terminal", "order": 30, "label": "Code"},
         "deeplinkPrefix": "skworld://skcode/",
         "auth": {
