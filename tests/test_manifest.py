@@ -7,7 +7,15 @@ def test_manifest_ui_facet_shape():
     m = skcode_module_manifest("http://100.64.0.1:9394/")
     assert m["schemaVersion"] == SCHEMA_VERSION
     assert m["id"] == "skcode"
-    assert m["grade"] == "B"
+    # Grade A since card C-18: packages/skcode_client in skworld-app is the real
+    # native module and the shell registry mounts it at /code.
+    assert m["grade"] == "A"
+    assert m["entry"]["flutter_package"] == "skcode_client"
+    # entry.url is deliberately KEPT alongside flutter_package so the legacy web
+    # client stays reachable at /code/legacy. C-10's parity check found two
+    # capabilities the native pane does not cover yet (C-16, C-17), so removing
+    # this would strand the operator with no fallback.
+    assert m["entry"]["url"].endswith("/app")
     assert m["nav"] == {"icon": "terminal", "order": 30, "label": "Code"}
     assert m["deeplinkPrefix"] == "skworld://skcode/"
     assert m["memory"] == {"opt_in": False}
