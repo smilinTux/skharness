@@ -30,6 +30,7 @@ import subprocess
 from datetime import datetime, timezone
 from typing import Callable
 
+from . import autopilot_cost
 from .config import Config
 from .direct import DirectExecutor
 from .harness import build_harness
@@ -196,6 +197,26 @@ def execute_dispatch(context: dict) -> dict:
                 "crown-jewel engine; P1 does not provide it (see P3)",
                 activity)
 
+        # Fail-closed daily cost cap (autopilot_cost): the ONE place `now()`
+        # is read for cost tracking. A read failure on the ledger must never
+        # block an otherwise-legitimate run, so it is treated as "no prior
+        # spend today" rather than propagated.
+        today = datetime.now(timezone.utc).date().isoformat()
+        try:
+            pre = autopilot_cost.day_total(today)["cost_usd"]
+        except Exception:  # noqa: BLE001 -- cost tracking must never break the bridge
+            pre = 0.0
+        if pre >= cfg.caps.max_usd_per_day:
+            try:
+                autopilot_cost.check_and_alert_caps(
+                    cfg=cfg, today=today, day_cost=pre, this_run_tokens=0)
+            except Exception:  # noqa: BLE001
+                pass
+            return _refuse(
+                f"daily cost cap ${cfg.caps.max_usd_per_day:.2f} reached "
+                f"(spent ${pre:.2f} today); raise max_usd_per_day to continue",
+                activity)
+
         harness = build_harness(cfg)
 
         instruction = context.get("instruction", "")
@@ -220,7 +241,28 @@ def execute_dispatch(context: dict) -> dict:
         digest = _ActivityDigestShim(activity)
         ex = AgentRunDirectExecutor(cfg, board=None, journal=run_journal, digest=digest)
 
-        gr: GateResult = ex.run(item, harness)      # ONE sandboxed round, no grade
+        # Cost capture: wrap harness.run_task (DirectExecutor.run's own call
+        # site, one level down) with a closure that records the HarnessResult's
+        # cost/tokens into `captured`, and restore the real callable no matter
+        # what. Guarded: a mocked/incomplete harness (unit tests) with no
+        # run_task attribute is left untouched, never AttributeError'd.
+        captured = {"cost_usd": 0.0, "tokens": 0}
+        _real_run_task = getattr(harness, "run_task", None)
+        if _real_run_task is not None:
+            def _cost_capturing_run_task(brief, _real=_real_run_task):
+                res = _real(brief)
+                try:
+                    captured["cost_usd"] = getattr(res, "cost_usd", 0.0)
+                    captured["tokens"] = getattr(res, "tokens", 0)
+                except Exception:  # noqa: BLE001 -- never let capture break a real result
+                    pass
+                return res
+            harness.run_task = _cost_capturing_run_task
+        try:
+            gr: GateResult = ex.run(item, harness)      # ONE sandboxed round, no grade
+        finally:
+            if _real_run_task is not None:
+                harness.run_task = _real_run_task
         activity.append({"atype": "action",
                           "text": f"sandboxed run: passed={gr.passed} notes={gr.notes}"})
 
@@ -232,14 +274,38 @@ def execute_dispatch(context: dict) -> dict:
                      f"twin gate {'PASS' if rr.passed else 'not passed'}: {rr.notes}"),
         })
 
+        def _record_cost_and_check_caps(pr_url_for_record: str) -> None:
+            """Ledger write + activity line + cap alert. Wrapped defensively so
+            a cost-tracking bug can NEVER turn this run's real outcome
+            (pass/refuse, PR opened or not) into a crash."""
+            try:
+                day_after = pre + captured["cost_usd"]
+                activity.append({
+                    "atype": "action",
+                    "text": (f"run cost ${captured['cost_usd']:.4f}, "
+                             f"{captured['tokens']} tokens; today "
+                             f"${day_after:.2f}/${cfg.caps.max_usd_per_day:.0f}"),
+                })
+                autopilot_cost.record_run(
+                    card_id=card_id, repo=repo.name, tokens=captured["tokens"],
+                    cost_usd=captured["cost_usd"], passed=bool(gr.passed),
+                    pr=pr_url_for_record, ts=_now_iso())
+                autopilot_cost.check_and_alert_caps(
+                    cfg=cfg, today=today, day_cost=day_after,
+                    this_run_tokens=captured["tokens"])
+            except Exception:  # noqa: BLE001 -- cost tracking must never break the bridge
+                pass
+
         if not gr.passed:
             if wt:
                 ex.prune_worktree(repo, wt)
+            _record_cost_and_check_caps("")
             return _refuse(f"sandboxed run did not pass: {gr.notes}", activity)
 
         ex.finalize(item, gr)          # commit + push + DRAFT PR; gr.mode == "direct"
         branch = f"autopilot/{item.ref}"
         pr_url = getattr(ex, "pr_url", "")
+        _record_cost_and_check_caps(pr_url)
         if not pr_url:
             return _refuse(
                 f"branch {branch} pushed but the PR could not be opened "
