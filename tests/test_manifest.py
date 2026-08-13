@@ -4,7 +4,7 @@ from skharness.manifest import AUDIENCE, SCHEMA_VERSION, skcode_module_manifest
 
 
 def test_manifest_ui_facet_shape():
-    m = skcode_module_manifest("http://100.108.59.57:9394/")
+    m = skcode_module_manifest("http://100.64.0.1:9394/")
     assert m["schemaVersion"] == SCHEMA_VERSION
     assert m["id"] == "skcode"
     assert m["grade"] == "B"

@@ -1251,7 +1251,7 @@ def test_default_port_is_9390():
 
 
 def test_resolve_bind_accepts_a_concrete_ip():
-    assert resolve_bind("100.108.59.57") == "100.108.59.57"
+    assert resolve_bind("100.64.0.1") == "100.64.0.1"
 
 
 @pytest.mark.parametrize("bad", ["0.0.0.0", "::", "", None])

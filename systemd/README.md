@@ -23,7 +23,7 @@ capauth-gated read routes plus the static client. There is **no write surface**.
    in the env file. `serve.py`'s `resolve_bind()` **refuses** a wildcard/public
    address (`0.0.0.0`, `::`, or blank), so a misconfigured or empty value fails
    the unit closed instead of exposing a public port. Always point it at a real
-   Tailscale IP (e.g. `100.86.156.5`), never a public/wildcard value.
+   Tailscale IP (e.g. `100.64.0.2`), never a public/wildcard value.
 
 2. **Deny-all verifier by default.** The unit deliberately does **not** set
    `SKCODE_REAL_VERIFIER`. `serve.py`'s `select_verifier()` then runs the P0
