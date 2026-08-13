@@ -188,6 +188,125 @@ def test_summary_empty_ledger_is_all_zero():
 
 
 # --------------------------------------------------------------------------- #
+# daily_series                                                                #
+# --------------------------------------------------------------------------- #
+
+
+def test_daily_series_length_matches_days_and_is_continuous():
+    today = "2026-08-13"
+    series = autopilot_cost.daily_series(today=today, days=30)
+    assert len(series) == 30
+    dates = [row["date"] for row in series]
+    assert dates == sorted(dates)               # oldest first
+    assert dates[-1] == today                    # today is the last entry
+    assert dates[0] == "2026-07-15"               # 29 days before today
+
+
+def test_daily_series_zero_fills_days_with_no_runs():
+    today = "2026-08-13"
+    series = autopilot_cost.daily_series(today=today, days=5)
+    assert len(series) == 5
+    for row in series:
+        assert row == {"date": row["date"], "cost_usd": 0.0, "joules": 0,
+                        "tokens": 0, "runs": 0}
+
+
+def test_daily_series_sums_per_day_and_zero_fills_the_rest():
+    today = "2026-08-13"
+    _write_rows([
+        _row(today, "skrender", 1.0, 100, card_id="a"),
+        _row(today, "skchat", 2.0, 200, card_id="b"),         # same day, second repo
+        _row("2026-08-11", "skrender", 5.0, 500, card_id="c"),  # 2 days ago
+        _row("2026-07-01", "skchat", 9.0, 900, card_id="d"),    # outside the 5-day window
+    ])
+    series = autopilot_cost.daily_series(today=today, days=5)
+    by_date = {row["date"]: row for row in series}
+
+    assert by_date[today] == {"date": today, "cost_usd": 3.0, "joules": 150,
+                               "tokens": 300, "runs": 2}
+    assert by_date["2026-08-11"] == {"date": "2026-08-11", "cost_usd": 5.0,
+                                      "joules": 250, "tokens": 500, "runs": 1}
+    assert by_date["2026-08-12"] == {"date": "2026-08-12", "cost_usd": 0.0,
+                                      "joules": 0, "tokens": 0, "runs": 0}
+    assert "2026-07-01" not in by_date            # outside the requested window
+
+
+def test_daily_series_empty_ledger_is_all_zero():
+    series = autopilot_cost.daily_series(today="2026-08-13", days=7)
+    assert len(series) == 7
+    assert all(row["cost_usd"] == 0.0 and row["joules"] == 0 for row in series)
+
+
+def test_daily_series_never_raises_on_malformed_today(monkeypatch):
+    # A bad "today" string must degrade to [] rather than propagate ValueError.
+    assert autopilot_cost.daily_series(today="not-a-date", days=30) == []
+
+
+# --------------------------------------------------------------------------- #
+# recent_settlements                                                          #
+# --------------------------------------------------------------------------- #
+
+
+def test_recent_settlements_empty_on_missing_file():
+    assert autopilot_cost.recent_settlements(limit=20) == []
+
+
+def test_recent_settlements_newest_first():
+    autopilot_cost.record_settlement(
+        card_id="task-1", commit_sha="aaa", agent="lumina",
+        minted=100, spent=0, net=100, balance_after=100,
+        ts="2026-08-11T00:00:00+00:00")
+    autopilot_cost.record_settlement(
+        card_id="task-2", commit_sha="bbb", agent="opus",
+        minted=50, spent=10, net=40, balance_after=140,
+        ts="2026-08-12T00:00:00+00:00")
+    autopilot_cost.record_settlement(
+        card_id="task-3", commit_sha="ccc", agent="lumina",
+        minted=25, spent=0, net=25, balance_after=165,
+        ts="2026-08-13T00:00:00+00:00")
+
+    rows = autopilot_cost.recent_settlements(limit=20)
+    assert [r["card_id"] for r in rows] == ["task-3", "task-2", "task-1"]
+
+
+def test_recent_settlements_respects_limit():
+    for i in range(5):
+        autopilot_cost.record_settlement(
+            card_id=f"task-{i}", commit_sha="x", agent="lumina",
+            minted=10, spent=0, net=10, balance_after=10 * (i + 1),
+            ts=f"2026-08-{10 + i:02d}T00:00:00+00:00")
+
+    rows = autopilot_cost.recent_settlements(limit=2)
+    assert len(rows) == 2
+    assert [r["card_id"] for r in rows] == ["task-4", "task-3"]
+
+
+def test_recent_settlements_row_shape():
+    autopilot_cost.record_settlement(
+        card_id="task-1", commit_sha="deadbeef", agent="lumina",
+        minted=100, spent=25, net=75, balance_after=575,
+        ts="2026-08-13T00:00:00+00:00")
+    rows = autopilot_cost.recent_settlements(limit=20)
+    assert len(rows) == 1
+    row = rows[0]
+    for key in ("ts", "card_id", "commit_sha", "agent", "minted",
+                "spent_joules", "net_joules", "balance_after"):
+        assert key in row
+    assert row["card_id"] == "task-1"
+    assert row["minted"] == 100
+    assert row["spent_joules"] == 25
+    assert row["net_joules"] == 75
+    assert row["balance_after"] == 575
+
+
+def test_recent_settlements_never_raises_on_malformed_journal_line(tmp_path):
+    path = autopilot_cost.settlements_path()
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write("not valid json\n")
+    assert autopilot_cost.recent_settlements(limit=20) == []
+
+
+# --------------------------------------------------------------------------- #
 # alert (never call the real sk-alert)                                       #
 # --------------------------------------------------------------------------- #
 

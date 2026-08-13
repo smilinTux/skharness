@@ -258,6 +258,56 @@ def summary(*, today: str, cap_usd: float | None = None) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Dashboard read helpers (skdashboard's fleet-wide Economy view)              #
+# --------------------------------------------------------------------------- #
+
+
+def daily_series(*, today: str, days: int = 30) -> list[dict]:
+    """One ``{date, cost_usd, joules, tokens, runs}`` row per calendar day for
+    the ``days`` days ending at (and including) ``today``, oldest first.
+
+    Dates with no ledger rows are zero-filled so a chart gets a continuous
+    x-axis instead of gaps. Deterministic: the only "now" is the ``today``
+    string the caller supplies. Never raises -- an empty list on any read
+    error, the same fail-open discipline as the rest of this module.
+    """
+    try:
+        rows = _read_ledger()
+        today_date = _date_cls.fromisoformat(today)
+        by_date: dict[str, list[dict]] = {}
+        for r in rows:
+            d = r.get("date")
+            if d:
+                by_date.setdefault(d, []).append(r)
+
+        series: list[dict] = []
+        for offset in range(days - 1, -1, -1):
+            d = (today_date - timedelta(days=offset)).isoformat()
+            agg = _aggregate(by_date.get(d, []))
+            series.append({"date": d, **agg})
+        return series
+    except Exception:  # noqa: BLE001 -- a chart-read bug must never break the page
+        log.exception("autopilot_cost.daily_series: failed")
+        return []
+
+
+def recent_settlements(limit: int = 20) -> list[dict]:
+    """The most recent ``limit`` settlement rows, newest-first.
+
+    Reads ``settlements.jsonl`` (append-only, oldest-first on disk) and
+    reverses it. Never raises -- an empty list on a missing/unreadable file
+    or malformed lines (``_read_settlements`` already tolerates those).
+    """
+    try:
+        rows = _read_settlements()
+        rows.reverse()
+        return rows[:limit]
+    except Exception:  # noqa: BLE001 -- a dashboard-read bug must never raise
+        log.exception("autopilot_cost.recent_settlements: failed")
+        return []
+
+
+# --------------------------------------------------------------------------- #
 # Alerting                                                                    #
 # --------------------------------------------------------------------------- #
 
