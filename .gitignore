@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.egg-info/
+
+# Agent worktrees and session scratch: local only, never publishable.
+# These accumulate stale copies of the whole tree (a dozen of them here), which
+# is how a repo-wide grep for internal addresses looks far worse than it is.
+.claude/worktrees/
