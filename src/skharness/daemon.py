@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from skharness.auth import Verifier, check_token, require_bearer
 from skharness.autocode import ratify as _ratify
@@ -63,6 +63,15 @@ AutocodeSessionsProvider = Callable[[], "list[SessionDescriptor]"]
 # owned by the scheduler, not something this daemon caches). None (the default)
 # reports no jobs known, so a bare test double never touches any real ledger path.
 JobsProvider = Callable[[], "list[JobRun]"]
+
+# Published skwatchdog digest artifact (card C-14a): a provider of the CURRENT
+# raw digest.json bytes, or None when nothing has been published yet. Read fresh
+# on every call (the artifact is a file owned by skos, not something this daemon
+# caches). None (the default) means "nothing published", so a bare test double
+# never touches a real path. The bytes are served exactly as read: this daemon
+# never parses or reformats the digest JSON, so it can never fabricate or "fix" a
+# quiet day out of a missing or malformed artifact.
+DigestProvider = Callable[[], "bytes | None"]
 
 # Scope split on the remote-control surface (R2.4): a verified skcode token must
 # carry SCOPE_READ to view (list/get/stream), and SCOPE_WRITE to actuate
@@ -108,6 +117,7 @@ ROUTE_SCOPES: dict[tuple[str, str], str] = {
     ("GET", "/api/v1/sessions/{sid}"): SCOPE_READ,
     ("GET", "/api/v1/sessions/{sid}/events"): SCOPE_READ,
     ("GET", "/api/v1/jobs"): SCOPE_READ,
+    ("GET", "/api/v1/watchdog/digest"): SCOPE_READ,
     ("GET", "/api/v1/dispatch/targets"): SCOPE_DISPATCH,
     ("POST", "/api/v1/sessions/{sid}/ratify"): SCOPE_WRITE,
     ("POST", "/api/v1/sessions/{sid}/inject"): SCOPE_WRITE,
@@ -179,6 +189,7 @@ def build_daemon_app(
     event_store: SessionEventStore | None = None,
     list_autocode_sessions: AutocodeSessionsProvider | None = None,
     list_jobs: JobsProvider | None = None,
+    read_digest: DigestProvider | None = None,
 ) -> FastAPI:
     app = FastAPI(title="skcode-hostd")
     # SessionEvent v2 (spec 5.1, card C-1): assigns seq/sid/source at append and
@@ -307,6 +318,32 @@ def build_daemon_app(
         _auth(authorization, SCOPE_READ)
         rows: list[JobRun] = list_jobs() if list_jobs is not None else []
         return JSONResponse({"jobs": [r.to_dict() for r in rows]})
+
+    @app.get("/api/v1/watchdog/digest")
+    async def digest_route(authorization: str | None = Header(default=None)):
+        # Read-only view over the published skwatchdog digest artifact (card
+        # C-14a, answering C-14). Same read scope as sessions/jobs: it is a
+        # VIEW, never a store, so it needs no write scope and no PDP decision.
+        # hostd owns none of this data -- skos does -- and there is no
+        # publish/regenerate/delete route here or anywhere else in this daemon.
+        #
+        # Fail safe and honest (card C-14a's hard rule): "no digest published
+        # yet" and "today was quiet" are DIFFERENT facts, so they must never
+        # collapse into the same response. When no provider is wired, or the
+        # provider reports nothing to read (missing directory, missing file,
+        # a permission error), this is a 404: an honest "nothing published
+        # yet", never a 200 with a fabricated empty digest that would look
+        # exactly like a real quiet day. When something WAS published, the
+        # raw bytes are served exactly as read (never parsed, never
+        # reformatted) with a 200 -- including when the file on disk is not
+        # valid JSON, so a corrupt artifact degrades to a body the client
+        # cannot parse (a third, distinguishable, honest state) rather than
+        # a 500 or a silently "fixed" digest.
+        _auth(authorization, SCOPE_READ)
+        raw = read_digest() if read_digest is not None else None
+        if raw is None:
+            raise HTTPException(404, "no digest has been published yet")
+        return Response(content=raw, media_type="application/json")
 
     @app.post("/api/v1/sessions/{sid}/ratify")
     async def ratify_session(sid: str, authorization: str | None = Header(default=None)):
