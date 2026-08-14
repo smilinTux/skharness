@@ -402,6 +402,13 @@ class ClaudeCodeHarness(Harness):
         # so inject's destructive respawn-pane can ONLY target a session THIS daemon
         # started as resumable. In-memory (same lifetime as _spawned_sids).
         self._resume_ctx: dict[str, dict] = {}
+        # C-13: sessions an operator has REFUSED via :meth:`deny`. The latch is
+        # what makes a deny mean something after the fact: a refused session is
+        # never resumed again by this daemon (:meth:`inject` checks it first), so
+        # the refusal outlives the single moment the button was pressed. In-memory
+        # (same lifetime as _spawned_sids), so a daemon restart forgets it exactly
+        # as it forgets which sessions it spawned.
+        self._denied_sids: set[str] = set()
 
     def capabilities(self) -> HarnessCapabilities:
         # Session plane over a PTY (tmux): reads + P1 inject/archive + P2 spawn.
@@ -520,6 +527,94 @@ class ClaudeCodeHarness(Harness):
         self._runner(["tmux", "kill-window", "-t", target])
         return {"sid": sid, "cancelled": True}
 
+    async def deny(self, sid: str) -> dict:
+        """Refuse a session: stop what it is doing and stop it being resumed (C-13).
+
+        This is the operator-refusal verb, and it is deliberately NOT built on
+        :meth:`inject`. Two facts about this harness make an inject-based "Deny"
+        a fiction: every session is launched with
+        ``--dangerously-skip-permissions`` (so no permission prompt is ever
+        waiting on the far side for a keystroke to answer), and inject is not a
+        keystroke at all (it respawns the pane with ``claude -p --resume`` and
+        the text as a NEW turn). Sending "n" through that path does not refuse
+        anything; it asks the agent to do something with the letter n.
+
+        A real refusal here is made of the two things this harness can actually
+        actuate, and it reports both honestly:
+
+        1. INTERRUPT the in-flight turn. SIGINT to the NEGATIVE pane pid reaches
+           the whole process group (every pane this harness spawns is its own
+           process-group leader, see :meth:`spawn`), so a tool call or child job
+           the session started stops too. Unlike :meth:`cancel` this is not a
+           SIGKILL and the tmux window survives (``remain-on-exit``), so the
+           refusal stops the WORK without destroying the record of it.
+        2. LATCH the refusal. The sid goes into ``_denied_sids``, and
+           :meth:`inject` refuses a denied session from then on, so the session
+           cannot be quietly resumed past the operator's "no".
+
+        The result distinguishes REFUSED from COULD-NOT-REFUSE, which is the
+        whole point of the card:
+
+        * ``denied: False`` (+ a reason) for an invalid sid, a window this daemon
+           did not spawn, or a session with no live window: nothing was refused
+           and nothing is claimed. Never a raise, never a fake success.
+        * ``denied: True`` with ``interrupted: True`` when a live turn was
+           actually signalled, or ``interrupted: False`` when the turn had already
+           finished (nothing in flight to stop) and only the latch took effect.
+
+        Idempotent: denying an already-denied session returns ``denied: True``
+        again (it is still refused) and re-interrupts only if something is
+        somehow running again.
+        """
+        if not _SID_RE.match(sid):
+            return {"sid": sid, "denied": False, "reason": "invalid session id"}
+
+        # Same blast-radius gate as inject (CR-6.2 C2): a deny signals a process
+        # group, so it must never reach an arbitrary window of the shared
+        # `skchat-agents` tmux (a full-privilege lumina/jarvis runtime).
+        if not self._inject_target_allowed(sid):
+            return {
+                "sid": sid,
+                "denied": False,
+                "reason": ("not a daemon-spawned session (deny is scoped to "
+                           "sessions this daemon spawned)"),
+            }
+
+        live_ids = {s.sid for s in self._list_windows()}
+        if sid not in live_ids:
+            return {
+                "sid": sid,
+                "denied": False,
+                "reason": "no live session (already ended or never running)",
+            }
+
+        target = f"{self.tmux_session}:{sid}"
+        # pane_dead is tmux's own answer to "has this pane's process exited?" (the
+        # window outlives it because spawn sets remain-on-exit). Ask BEFORE
+        # signalling so "interrupted" reports what really happened rather than
+        # whether a kill command was issued.
+        pane_out = self._runner(
+            ["tmux", "list-panes", "-t", target, "-F", "#{pane_pid} #{pane_dead}"])
+        fields = ((pane_out or "").strip().splitlines() or [""])[0].split()
+        pid = fields[0] if fields else ""
+        dead = fields[1] if len(fields) > 1 else ""
+        interrupted = False
+        if pid.isdigit() and dead != "1":
+            # Negative pid == kill(2) targets the process GROUP. SIGINT, not
+            # SIGKILL: the turn is refused, the window and its scrollback stay.
+            self._runner(["kill", "-INT", f"-{pid}"])
+            interrupted = True
+
+        self._denied_sids.add(sid)
+        return {
+            "sid": sid,
+            "denied": True,
+            "interrupted": interrupted,
+            "reason": ("in-flight turn interrupted; session refused (not resumable)"
+                       if interrupted else
+                       "nothing in flight to interrupt; session refused (not resumable)"),
+        }
+
     def _inject_target_allowed(self, sid: str) -> bool:
         """CR-6.2 C2: may inject reach ``sid``?
 
@@ -559,6 +654,16 @@ class ClaudeCodeHarness(Harness):
         """
         if not _SID_RE.match(sid):
             return {"sid": sid, "injected": False, "reason": "invalid session id"}
+
+        # C-13: a session an operator DENIED is not resumable. Checked first and
+        # by construction, so the refusal is enforced here rather than being a
+        # thing the UI is trusted to remember.
+        if sid in self._denied_sids:
+            return {
+                "sid": sid,
+                "injected": False,
+                "reason": "session was denied by an operator (refused; not resumable)",
+            }
 
         if not self._inject_target_allowed(sid):
             return {

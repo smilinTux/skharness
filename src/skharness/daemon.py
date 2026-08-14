@@ -121,6 +121,7 @@ ROUTE_SCOPES: dict[tuple[str, str], str] = {
     ("GET", "/api/v1/dispatch/targets"): SCOPE_DISPATCH,
     ("POST", "/api/v1/sessions/{sid}/ratify"): SCOPE_WRITE,
     ("POST", "/api/v1/sessions/{sid}/inject"): SCOPE_WRITE,
+    ("POST", "/api/v1/sessions/{sid}/deny"): SCOPE_WRITE,
     ("POST", "/api/v1/dispatch"): SCOPE_DISPATCH,
     ("POST", "/api/v1/sessions/{sid}/cancel"): SCOPE_DISPATCH,
     ("WS", "/api/v1/sessions/{sid}/stream"): SCOPE_READ,
@@ -415,6 +416,47 @@ def build_daemon_app(
             "reason": result.get("reason", ""),
             "content_sha256": _content_hash(text),
             "content_len": len(text or ""),
+        })
+        return JSONResponse(result)
+
+    @app.post("/api/v1/sessions/{sid}/deny")
+    async def deny_session(sid: str, authorization: str | None = Header(default=None)):
+        # The REFUSAL half of the needs_input banner (card C-13). Approve calls
+        # ratify; before this route existed, Deny was a POST to /inject carrying a
+        # literal "n", which is not a refusal: it is a fresh message to the
+        # session, and a 200 told the operator nothing about whether anything was
+        # actually refused. This route actuates ``harness.deny`` instead, which
+        # interrupts the in-flight turn and latches the session as refused.
+        #
+        # Gated EXACTLY like ratify (its Approve twin), not like cancel: the same
+        # SCOPE_WRITE bearer scope and the same PDP mode floor over the same
+        # skcode.inject capability, so refusing costs the caller precisely what
+        # approving costs and no operator who can Approve is left unable to Deny.
+        # A read-only (skcode.stream) token is 403 here, and with the PDP wired a
+        # below-floor subject is 403 (audited) with the harness never reached.
+        auth = _authed_context(authorization, SCOPE_WRITE)
+        subject = _subject(auth)
+        _enforce_inject_floor(subject, {"host": host_id, "sid": sid, "action": "deny"})
+        # Idempotent + honest by construction: harness.deny returns a clean
+        # {"denied": False, "reason": ...} for an unknown / already-finished /
+        # out-of-scope session rather than raising, so this route never 500s on a
+        # stale sid AND never reports a refusal that did not take effect as a
+        # success. The client reads ``denied`` (was it refused at all) and
+        # ``interrupted`` (was in-flight work really stopped); a 200 alone is
+        # never the answer.
+        result = await harness.deny(sid)
+        _emit_audit({
+            "event": "skcode.deny",
+            "subject": subject,
+            "sid": sid,
+            # "decision" is the AUTHORIZATION outcome (the PDP let this caller
+            # refuse); "denied" is the REFUSAL outcome (the harness actually
+            # refused something). They are different questions and both belong
+            # in the record.
+            "decision": "allow",
+            "denied": bool(result.get("denied")),
+            "interrupted": bool(result.get("interrupted")),
+            "reason": result.get("reason", ""),
         })
         return JSONResponse(result)
 

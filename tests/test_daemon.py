@@ -749,3 +749,147 @@ def test_ratify_below_the_verified_floor_is_refused_403(mocker):
     r = TestClient(app).post("/api/v1/sessions/lumina-abc12345/ratify", json={},
                              headers=_H)
     assert r.status_code == 403
+
+
+# ---- card C-13: POST /sessions/{sid}/deny, the honest refusal route ----------
+# The needs_input banner's Approve calls the real ratify route; Deny used to be a
+# POST to /inject carrying a literal "n", which actuates nothing reliable while
+# returning 200. This route gives Deny the SAME standing as Approve: the same
+# SCOPE_WRITE bearer scope and the same skcode.inject PDP floor, and a response
+# that distinguishes "refused" from "could not refuse".
+
+
+class _DenyingHarness(FakeHarness):
+    """FakeHarness plus a deny() that RECORDS the sid and returns the honest,
+    idempotent-shaped result the contract requires, so the daemon deny route is
+    driven with no real tmux/process. (FakeHarness leaves deny at the base gated
+    raise; the deny path is proven here on a subclass, mirroring the
+    inject/cancel/grade doubles.)"""
+
+    def __init__(self, *, live=None, running=True):
+        super().__init__(sessions=[
+            SessionDescriptor(sid="lumina-abc12345", host=".158", harness="fake"),
+        ], events={})
+        self.denied: list[str] = []
+        self._live = set(live) if live is not None else {"lumina-abc12345"}
+        self._running = running
+
+    async def deny(self, sid):
+        self.denied.append(sid)
+        if sid not in self._live:
+            return {"sid": sid, "denied": False,
+                    "reason": "no live session (already ended or never running)"}
+        return {"sid": sid, "denied": True, "interrupted": self._running,
+                "reason": ("in-flight turn interrupted; session refused (not resumable)"
+                           if self._running else
+                           "nothing in flight to interrupt; session refused (not resumable)")}
+
+
+def test_deny_requires_auth_and_never_actuates_under_deny_all():
+    harness = _DenyingHarness()
+    c = TestClient(build_daemon_app(harness=harness, verify_caller=lambda t: False))
+    assert c.post("/api/v1/sessions/lumina-abc12345/deny").status_code == 401
+    assert c.post("/api/v1/sessions/lumina-abc12345/deny",
+                  headers={"authorization": "Bearer bad"}).status_code == 403
+    assert harness.denied == []             # nothing actuated
+
+
+def test_deny_read_only_token_is_403_insufficient_scope():
+    # Deny is a WRITE action: viewing a session never arms refusing it.
+    harness = _DenyingHarness()
+    app = build_daemon_app(harness=harness, verify_caller=_ctx_verifier("skcode.stream"))
+    r = TestClient(app).post("/api/v1/sessions/lumina-abc12345/deny", headers=_H)
+    assert r.status_code == 403
+    assert harness.denied == []
+
+
+def test_deny_below_the_verified_floor_is_refused_403_and_audited():
+    """PDP-GATED, not merely present: a subject that passes the scope gate but
+    sits below the verified enrollment floor is 403, audited, and the harness is
+    never reached. This is the same floor ratify (Approve) carries."""
+    harness = _DenyingHarness()
+    audits, calls = [], []
+    write = _ctx_verifier("skcode.stream", "skcode.inject")
+    app = build_daemon_app(harness=harness, verify_caller=write,
+                           authorize_inject=_deny_inject(calls), audit_log=audits.append)
+    r = TestClient(app).post("/api/v1/sessions/lumina-abc12345/deny", headers=_H)
+    assert r.status_code == 403
+    assert r.json()["detail"] == "inject not authorized"
+    assert harness.denied == []                                 # never actuated
+    assert calls and calls[0][1]["sid"] == "lumina-abc12345"    # PDP consulted
+    assert calls[0][1]["action"] == "deny"                      # on the deny action
+    assert any("deny" in a for a in audits)
+
+
+def test_deny_with_the_verified_capability_actuates_and_audits():
+    harness = _DenyingHarness()
+    audits, calls = [], []
+    write = _ctx_verifier("skcode.stream", "skcode.inject")
+    app = build_daemon_app(harness=harness, verify_caller=write,
+                           authorize_inject=_allow_inject(calls), audit_log=audits.append)
+    r = TestClient(app).post("/api/v1/sessions/lumina-abc12345/deny", headers=_H)
+    assert r.status_code == 200
+    assert r.json()["denied"] is True
+    assert r.json()["interrupted"] is True
+    assert harness.denied == ["lumina-abc12345"]
+    blob = " ".join(audits)
+    assert "skcode.deny" in blob and "allow" in blob
+
+
+def test_deny_that_did_not_take_effect_is_not_reported_as_success():
+    """THE rule of card C-13. An unknown / already-finished session is a clean
+    200 no-op that says denied: FALSE with a reason, never a bare success the
+    operator would read as "refused"."""
+    harness = _DenyingHarness(live=[])
+    write = _ctx_verifier("skcode.stream", "skcode.inject")
+    app = build_daemon_app(harness=harness, verify_caller=write,
+                           authorize_inject=_allow_inject(), audit_log=lambda s: None)
+    r = TestClient(app).post("/api/v1/sessions/never-existed/deny", headers=_H)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["denied"] is False
+    assert "no live session" in body["reason"]
+    assert harness.denied == ["never-existed"]
+
+
+def test_deny_reports_refused_but_not_interrupted_distinctly():
+    """Refused-and-stopped and refused-with-nothing-left-to-stop are different
+    facts; the client can tell them apart without guessing."""
+    harness = _DenyingHarness(running=False)
+    write = _ctx_verifier("skcode.stream", "skcode.inject")
+    app = build_daemon_app(harness=harness, verify_caller=write,
+                           authorize_inject=_allow_inject(), audit_log=lambda s: None)
+    body = TestClient(app).post("/api/v1/sessions/lumina-abc12345/deny",
+                                headers=_H).json()
+    assert body["denied"] is True
+    assert body["interrupted"] is False
+    assert "nothing in flight" in body["reason"]
+
+
+def test_deny_audit_records_the_refusal_outcome_not_just_the_decision():
+    """The audit must answer BOTH questions: was the caller allowed to refuse
+    (decision) and did the refusal take effect (denied/interrupted). A record
+    carrying only "allow" would hide exactly the failure this card is about."""
+    import json as _json
+
+    harness = _DenyingHarness(live=[])
+    audits = []
+    write = _ctx_verifier("skcode.stream", "skcode.inject")
+    app = build_daemon_app(harness=harness, verify_caller=write,
+                           authorize_inject=_allow_inject(), audit_log=audits.append)
+    TestClient(app).post("/api/v1/sessions/gone-forever/deny", headers=_H)
+    records = [_json.loads(a) for a in audits if "skcode.deny" in a]
+    assert records and records[0]["decision"] == "allow"     # authorization outcome
+    assert records[0]["denied"] is False                     # refusal outcome
+    assert records[0]["sid"] == "gone-forever"
+
+
+def test_deny_floor_absent_falls_back_to_scope_only():
+    # No inject authorizer wired (a test double / legacy build): the shipped scope
+    # gate stands alone and a scoped token still denies (no PDP regression).
+    harness = _DenyingHarness()
+    write = _ctx_verifier("skcode.stream", "skcode.inject")
+    app = build_daemon_app(harness=harness, verify_caller=write)
+    r = TestClient(app).post("/api/v1/sessions/lumina-abc12345/deny", headers=_H)
+    assert r.status_code == 200
+    assert harness.denied == ["lumina-abc12345"]

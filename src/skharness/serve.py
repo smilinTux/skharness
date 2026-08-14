@@ -201,11 +201,11 @@ def build_dispatch_authorizer(home: Path | None = None):
 
 
 def build_inject_authorizer(home: Path | None = None):
-    """Wire the real capauth authz PDP for the inject/ratify write surface
-    (CR-6.2 C2/C8).
+    """Wire the real capauth authz PDP for the inject/ratify/deny write surface
+    (CR-6.2 C2/C8; card C-13 added deny).
 
     Mirrors :func:`build_dispatch_authorizer` but for ``skcode.inject`` at the
-    VERIFIED floor, so inject/ratify enforce the enrollment-mode floor in CODE (a
+    VERIFIED floor, so inject/ratify/deny enforce the enrollment-mode floor in CODE (a
     ``decide`` allow), not only at token issuance. Returns a callable
     ``(subject, resource, context) -> Decision``.
 

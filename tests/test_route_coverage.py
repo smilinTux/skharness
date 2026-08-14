@@ -126,6 +126,25 @@ def test_cancel_route_is_gated_on_dispatch_scope():
     assert "skcode.dispatch" in DEFAULT_RULES
 
 
+def test_deny_route_is_gated_on_the_inject_scope_like_its_approve_twin():
+    """Card C-13: POST /sessions/{sid}/deny is the REFUSAL half of the
+    needs_input banner, so it rides the SAME scope and the SAME PDP capability
+    as its Approve twin (ratify) and as inject: skcode.inject, PDP-decided.
+    Refusing must never cost the caller more than approving, and it must never
+    cost less either."""
+    from capauth.authz import DEFAULT_RULES
+
+    assert classify_route("POST", "/api/v1/sessions/{sid}/deny") == ("gated", "skcode.inject")
+    assert ROUTE_SCOPES[("POST", "/api/v1/sessions/{sid}/deny")] == "skcode.inject"
+    # exactly the classification ratify carries (the symmetry the card is about)
+    assert (ROUTE_SCOPES[("POST", "/api/v1/sessions/{sid}/deny")]
+            == ROUTE_SCOPES[("POST", "/api/v1/sessions/{sid}/ratify")])
+    # skcode.inject is a PDP-decided scope with an existing rule row; deny needs
+    # no NEW capauth rule and is never a scope-only (undecided) route.
+    assert "skcode.inject" in PDP_SCOPES
+    assert "skcode.inject" in DEFAULT_RULES
+
+
 def test_sessions_events_archive_route_is_gated_on_stream_scope():
     """Card C-1 (SessionEvent v2 + archive paging): the new GET .../events route
     is a READ route, same scope as the list/get/WS-stream routes, not a PDP-
