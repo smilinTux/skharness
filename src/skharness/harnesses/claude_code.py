@@ -215,8 +215,26 @@ def scan_historical(sessions_root, *, host: str, limit: int = 20) -> list[Sessio
                 mtime = f.stat().st_mtime
             except OSError:
                 mtime = 0.0
+            # Flat sid, joined with "-" not "/". A slash here is fatal in three
+            # ways and it silently broke every per-session route: Starlette's
+            # {sid} never matches a "/", so GET /sessions/{sid}, its /events
+            # archive, the WS tail, inject, ratify, deny and cancel all missed
+            # their route entirely (404 before any auth ran, which surfaced to
+            # the operator as a bogus 1008 "unauthorized"). It also violated
+            # this module's own _SID_RE contract, enforced at seven call sites
+            # including stream(). And SessionEventStore._path() is
+            # root / sid / events.jsonl with no validation, so admitting "/"
+            # into a sid turns it into a path-traversal sink.
+            #
+            # Fixing this by declaring the routes as {sid:path} would be wrong:
+            # GET /sessions/{sid} is declared before /events and /stream, so a
+            # greedy match swallows them, and it would leave the traversal sink
+            # open. The producer is the right place.
+            sid = f"{agent_dir.name}-{f.stem}"
+            if not _SID_RE.match(sid):
+                continue
             found.append((mtime, SessionDescriptor(
-                sid=f"{agent_dir.name}/{f.stem}", host=host, harness=_HARNESS,
+                sid=sid, host=host, harness=_HARNESS,
                 state="ended", last_activity=mtime,
             )))
     found.sort(key=lambda t: t[0], reverse=True)

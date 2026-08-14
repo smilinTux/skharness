@@ -21,6 +21,7 @@ from skharness.harnesses.claude_code import (
     parse_windows,
     sandbox_cloud_token_allowed,
     scan_historical,
+    _SID_RE,
 )
 
 
@@ -156,7 +157,7 @@ def test_scan_historical_reads_agent_session_dirs(tmp_path):
     (sdir / "sess-001.json").write_text(json.dumps({"id": "sess-001"}))
     (sdir / "sess-002.json").write_text(json.dumps({"id": "sess-002"}))
     got = scan_historical(root, host=".158")
-    assert {s.sid for s in got} == {"lumina/sess-001", "lumina/sess-002"}
+    assert {s.sid for s in got} == {"lumina-sess-001", "lumina-sess-002"}
     assert all(s.state == "ended" for s in got)
     assert all(s.harness == "claude-code" for s in got)
 
@@ -192,7 +193,7 @@ async def test_list_sessions_merges_live_then_historical(tmp_path):
     got = await h.list_sessions()
     ids = [s.sid for s in got]
     assert ids[0] == "lumina-abc12345"          # live first
-    assert "lumina/old" in ids                   # historical after
+    assert "lumina-old" in ids                   # historical after
     assert got[0].state == "running"
 
 
@@ -324,7 +325,7 @@ async def test_archive_removes_session_from_running_set_and_keeps_record(tmp_pat
     ended = [s.sid for s in sessions if s.state == "ended"]
     # left the running set, survives as an ended historical record
     assert sid not in running
-    assert "lumina/lumina-abc12345" in ended
+    assert "lumina-lumina-abc12345" in ended
 
 
 @pytest.mark.asyncio
@@ -1510,3 +1511,29 @@ async def test_model_is_always_passed_even_when_unset(tmp_path):
     launch = _launch_argv(_new_window_argv(tcalls))
     assert "--model" in launch
     assert launch[launch.index("--model") + 1] == "sonnet"
+
+
+def test_historical_sids_are_path_safe_and_never_contain_a_slash(tmp_path, monkeypatch):
+    """A slash in a sid silently kills every per-session route.
+
+    Starlette's {sid} never matches a "/", so a slashed sid missed GET
+    /sessions/{sid}, its /events archive, the WS tail, inject, ratify, deny and
+    cancel. The route never matched, so the request 404'd before any auth ran,
+    and the operator saw a bogus 1008 "unauthorized" instead of a routing miss.
+    It also violated _SID_RE, and SessionEventStore._path() is
+    root / sid / events.jsonl with no validation, which makes "/" a traversal
+    sink. This pins the producer.
+    """
+    root = tmp_path / "agents"
+    for agent in ("opus", "lumina"):
+        sdir = root / agent / "sessions"
+        sdir.mkdir(parents=True)
+        # opus uses bare uuids, lumina uses timestamped stems; both must stay flat
+        (sdir / "461c113f-a409-4a1b-9c2d-000000000001.json").write_text("{}")
+
+    got = scan_historical(root, host="testhost")
+
+    assert got, "expected historical sessions to be discovered"
+    for sd in got:
+        assert "/" not in sd.sid, f"sid {sd.sid!r} would miss every per-session route"
+        assert _SID_RE.match(sd.sid), f"sid {sd.sid!r} violates the _SID_RE contract"
