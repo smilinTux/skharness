@@ -1,0 +1,17 @@
+name: docs-check
+
+# DOCS_FRESHNESS_STANDARD gate. Tiers 1 and 2 today (required docs present, and a
+# code change carries a CHANGELOG entry). SOP.md already ships a docs-evidence
+# block, so moving this to tiers "1,2,3" is a follow-up once this gate has run
+# clean for a while. Tier 3 executes the evidence checks and is what catches an
+# SOP that is present, confident, and wrong.
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  docs:
+    uses: smilinTux/sk-standards/.github/workflows/docs-check.yml@main
+    with:
+      tiers: "1,2"

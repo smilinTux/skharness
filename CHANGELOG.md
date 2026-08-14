@@ -11,6 +11,55 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ### Added
 - `secret-scan` CI gate running the **gitleaks binary** over the full history.
+- **`LICENSE` (GPL-3.0-or-later)** and a matching `license` field plus OSI
+  classifier in `pyproject.toml`. The project previously declared no license at
+  all, in the repo or in package metadata.
+- `SOP.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, completing the seven files
+  `SK_REPO_DOC_STANDARD` requires. `SOP.md` carries a `docs-evidence` block of 10
+  hermetic checks pinning the entry point, port 9394, the wildcard-bind refusal,
+  the shipped `ExecStart`, the inject/dispatch routes, the three scope names, the
+  deny-all dispatch default, the fail-closed carve-out manifest, the absence of a
+  health route, and the CI anti-skip gate.
+- `.github/workflows/docs-check.yml` (tiers 1 and 2 for now; tier 3 is a
+  follow-up once the gate has run clean).
+
+### Fixed
+- **`README.md` no longer claims the daemon has no write surface.** It asserted
+  "There is NO write surface: no spawn, inject, kill, dispatch, rename, archive,
+  or model switch" and cited `tests/test_daemon.py::test_no_write_surface` as
+  proof that POST/DELETE returned 405 and `/inject` and `/dispatch` returned 404.
+  That test no longer exists, and `daemon.py` has shipped `POST
+  /sessions/{sid}/inject`, `/ratify`, `/deny`, `/cancel` and `POST /dispatch`
+  for some time. A stale security claim on the fleet's sandboxed execution
+  bridge is the most dangerous kind of stale doc, because it is trusted. The
+  README now documents the real routes, the four fail-closed gates in front of
+  them, and the `skcode.stream` / `skcode.inject` / `skcode.dispatch` scope
+  split. The same false claim was propagated into
+  `systemd/skcode-hostd.service`, `systemd/README.md`, and `systemd/install.sh`,
+  and is corrected there too (comments and docs only; no unit directive changed).
+- `README.md` no longer reports "Status: v0.1.0" (the version is derived by
+  setuptools-scm from the git tag) or "Mirror: smilinTux (private)" (the repo is
+  public as of 2026-08-13).
+- `systemd/skcode-hostd.env.example` and `systemd/README.md` no longer say the
+  daemon runs the deny-all placeholder by default. Since CR-3.2
+  `serve.select_verifier()` runs the **real** capauth verifier by default and
+  falls back to deny-all only when capauth cannot be imported or when
+  `SKCODE_FORCE_DENY_ALL` is set.
+
+### Documented (no behaviour change)
+- **`SKCODE_DISPATCH_REPOS` unset means DENY ALL**, and the shipped env template
+  deliberately omits the key, so a fresh install can dispatch nothing. The
+  template now carries a commented, annotated entry explaining this, plus
+  `SKCODE_FORCE_DENY_ALL`.
+- **`skos` and `skharness` must never appear on a dispatch allowlist**: the
+  self-modification hazard. The enforcement today is the deployed env value
+  alone, with no code-level exclusion list, so the rule is now written down in
+  `SOP.md`, `README.md`, `CONTRIBUTING.md`, and the env template.
+- The `autocode/protected.py` carve-out detector: `_FAIL_CLOSED` protecting `**`
+  on any manifest load failure, and the hardcoded `_ALWAYS_PROTECTED` floor.
+- `skcode-hostd operator observe` **fails safe**, reporting all conditions
+  healthy when hostd is unreachable. It is not a liveness probe, and there is no
+  `/health` route.
 
 ## [0.3.14] - 2026-08-14
 
