@@ -447,7 +447,11 @@ def test_module_manifest_served_unauthenticated_with_operator_facet():
         "archive-stale-session",
     ]
     # URLs resolve against the request origin (the TestClient base).
-    assert body["entry"]["url"].endswith("/app")
+    assert body["health"].endswith("/api/v1/hosts/self")
+    # entry.url is gone: the shell mounts the native skcode_client package and
+    # no longer routes a legacy embed, so the manifest must not advertise one.
+    assert "url" not in body["entry"]
+    assert body["entry"]["flutter_package"] == "skcode_client"
 
 
 # ---- POST /sessions/{sid}/ratify : grade-only, capauth-gated, never merges ---
