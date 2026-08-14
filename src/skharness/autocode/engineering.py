@@ -16,6 +16,7 @@ from pathlib import Path
 
 from . import health
 from .ci import external_ci_verdict, diff_coverage
+from .failure_memory import build_prior_feedback, distill_failure
 from .types import DecisionItem, GateResult, GradeBrief, RepoSpec, TaskBrief, WorkItem
 
 
@@ -268,6 +269,47 @@ class EngineeringExecutor:
                               capture_output=True, text=True)
         return proc.stdout.strip()
 
+    # -- cross-run failure memory -------------------------------------------
+    # A terminal non-pass used to die with the run: in-run `feedback` is threaded
+    # round to round but never leaves run(), and direct.py started from None, so
+    # the next run of the same card rebuilt into the identical wall. These two
+    # helpers persist ONE distilled line per terminal failure to the card and
+    # archive it back off on a pass. Both are best-effort by design: failure
+    # memory is an optimization, and it must never be the reason a build dies.
+
+    def _record_attempt(self, item: WorkItem, *, round: int, outcome: str,
+                        tried: str, why_failed: str,
+                        replacement_hint: str = "") -> None:
+        """Record one terminal non-pass on the card (meta.autopilot.attempts[]).
+
+        Call ONLY from a genuine terminal-failure return. Notably NOT from
+        escalate() (the orchestrator calls it for every non-passed result, so a
+        write there double-records) and NOT from the salvage return (CI-green
+        human-review PR: a success).
+        """
+        try:
+            self.board.record_attempt(
+                item.ref, run_id=getattr(self.journal, "run_id", "") or "",
+                round=round, outcome=outcome, tried=tried,
+                why_failed=why_failed, replacement_hint=replacement_hint)
+        except Exception as exc:      # noqa: BLE001 - never break a build
+            health.record("record_attempt_error", task=item.ref,
+                          outcome=outcome, error=str(exc)[:120])
+
+    def _archive_attempts(self, item: WorkItem) -> None:
+        """On a pass, clear the card's failure memory and keep it in the journal.
+
+        skcoord clears and hands the entries back; skharness archives them. A
+        flake therefore haunts a card at most until its next pass.
+        """
+        try:
+            removed = self.board.clear_attempts(item.ref)
+            if removed:
+                self.journal.archive_attempts(item.ref, removed)
+                health.record("attempts_cleared", task=item.ref, count=len(removed))
+        except Exception as exc:      # noqa: BLE001 - never break a finalize
+            health.record("clear_attempts_error", task=item.ref, error=str(exc)[:120])
+
     def escalate(self, item: WorkItem, reason: str) -> DecisionItem:
         """Queue a decision for a non-converging item (mirrors the stub shape)."""
         qid = hashlib.sha1(f"engineering:{item.ref}:{reason}".encode()).hexdigest()[:12]
@@ -283,7 +325,11 @@ class EngineeringExecutor:
         wt = self.make_worktree(item, repo)
         self.journal.set_worktree(item.ref, wt)   # so finalize() can find this worktree
         pr_branch = f"autopilot/{item.ref}"
-        feedback: str | None = None
+        # Round 1 starts from what previous RUNS of this card learned, not blind.
+        # None when the card has no memory, which is byte-identical to the old
+        # fresh-start behaviour. The in-run grade feedback below overwrites this
+        # round to round exactly as before.
+        feedback: str | None = build_prior_feedback(p)
         last: GateResult | None = None
         empty_rounds = 0
         for rnd in range(1, self._MAX_ROUNDS + 1):
@@ -308,6 +354,15 @@ class EngineeringExecutor:
                 health.record("empty_diff_round", task=item.ref, round=rnd,
                               consecutive=empty_rounds)
                 if empty_rounds >= 2:
+                    self._record_attempt(
+                        item, round=rnd, outcome="no_op",
+                        tried=f"gated build of {p.get('title', item.ref)!r}: "
+                              "the harness produced no changes",
+                        why_failed=("no diff in 2 rounds; acceptance likely already "
+                                    "satisfied on the base branch, or the harness "
+                                    "cannot write"),
+                        replacement_hint=("verify against the base branch before "
+                                          "re-implementing"))
                     return GateResult(
                         score=None, passed=False, artifact=None,
                         notes=("no-op: the agent produced no diff in 2 rounds. The "
@@ -353,6 +408,14 @@ class EngineeringExecutor:
                     notes=(f"grade inconclusive but CI green + coverage met; opened "
                            f"PR {pr_url} for human review (NOT auto-merged)."))
             feedback = strip_promise(gr.notes)
+        # Terminal: the rounds are spent and the gate never closed. Distil the
+        # cause (failing test id + assertion) rather than carrying the grader's
+        # prose wholesale; the raw notes stay in the run journal.
+        self._record_attempt(
+            item, round=rnd, outcome="ci_red",
+            tried=f"gated build of {p.get('title', item.ref)!r}, "
+                  f"{self._MAX_ROUNDS} rounds",
+            why_failed=distill_failure(strip_promise(last.notes) if last else ""))
         return GateResult(score=(last.score if last else None), passed=False,
                           notes=f"did not converge in {self._MAX_ROUNDS} rounds: "
                                 f"{strip_promise(last.notes) if last else ''}",
@@ -431,6 +494,11 @@ class EngineeringExecutor:
                 "EngineeringExecutor cannot finalize a non-gated result; "
                 "non-gated work is finalized by its own executor "
                 "(toggle spec G1/G2/G4).")
+        # The twin gate closed, so whatever this card failed for before is stale.
+        # Clear it here (not after the PR mechanics) so the memory is dropped on
+        # the strength of the PASS itself, independent of how the PR lands.
+        if result.passed:
+            self._archive_attempts(item)
         repo = self.resolve_repo(item)
         wt = self.journal.worktree_for(item.ref)
         # The worktree can be missing (None) or already pruned off disk if a

@@ -17,6 +17,7 @@ a loosened gate.
 from __future__ import annotations
 
 from .engineering import EngineeringExecutor
+from .failure_memory import build_prior_feedback
 from .types import GateResult, QualityMode, TaskBrief, WorkItem
 
 
@@ -49,13 +50,25 @@ class DirectExecutor(EngineeringExecutor):
         p = item.payload
         wt = self.make_worktree(item, repo)     # isolated autopilot/<ref> worktree
         self.journal.set_worktree(item.ref, wt)  # so finalize() finds this worktree
+        # Direct mode has no rounds, so this card's ONLY prior context is what
+        # previous runs recorded. It used to start from None unconditionally,
+        # which is what made a failed direct build repeat itself verbatim.
         tb = TaskBrief(task_id=item.ref, repo=repo, worktree=wt,
                        title=p.get("title", ""), description=p.get("description", ""),
                        acceptance=p.get("acceptance", []),
-                       prior_feedback=None, round=1)
+                       prior_feedback=build_prior_feedback(p), round=1)
         res = harness.run_task(tb)              # ONE round; no harness.grade() ever
         diff = self._diff(repo, wt)            # same staging (new files in, byproducts out)
-        passed = bool(getattr(res, "ok", False)) and bool(diff.strip())
+        ok = bool(getattr(res, "ok", False))
+        passed = ok and bool(diff.strip())
+        if not passed:
+            self._record_attempt(
+                item, round=1, outcome="direct_fail",
+                tried=f"ungated single run of {p.get('title', item.ref)!r}",
+                why_failed=("the harness produced an empty diff" if ok else
+                            "the harness run reported not-ok"),
+                replacement_hint=("check the acceptance is not already satisfied "
+                                  "on the base branch" if ok else ""))
         return GateResult(score=None, passed=passed,
                           notes="direct mode: UNGATED single run; review required",
                           artifact=wt, mode=QualityMode.DIRECT.value)

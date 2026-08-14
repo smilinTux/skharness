@@ -129,6 +129,19 @@ class RunHandle:
     def set_item(self, ref: str, state: str, **extra) -> None:
         self._mutate(ref, {"state": state, **extra})
 
+    def archive_attempts(self, ref: str, entries: list[dict]) -> None:
+        """Keep the failure memory a passing card just dropped.
+
+        Cross-run failure memory is cleared off the card on a final PASS so a
+        flaky-CI false failure cannot haunt every future run. The raw history is
+        still worth having, so it lands here, in the run that cleared it.
+        Deliberately does NOT touch `state`: the orchestrator owns that field and
+        writes it after finalize returns.
+        """
+        if not entries:
+            return
+        self._mutate(ref, {"cleared_attempts": list(entries)})
+
 
 def handle(run_id: str) -> RunHandle:
     """Return a RunHandle for mutating a run's items."""
