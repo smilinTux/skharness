@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+# Consistent SKWorld CI pattern (CR-4.6): lint (blocking, this repo is clean) +
+# test (clean targeted venv) + build. Companion publish.yml handles tagged
+# releases and deliberately does NOT gate on tests, so this is the ONLY place the
+# suite runs. Until this existed, skharness -- the repo holding the autopilot twin
+# gate -- had no automated test gate at all: every PR check was GitGuardian, which
+# scans for secrets and says nothing about whether the code works.
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # setuptools-scm derives the version from the git tag, so a shallow
+          # checkout would yield a placeholder like 0.1.dev1 and break dependency
+          # resolution against pinned siblings.
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check src/ tests/
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install in a clean venv
+        run: pip install -e ".[dev]"
+      - name: Test
+        # Hermetic on purpose: no optional siblings installed, so the
+        # cross-repo tests skip here and a sibling repo's breakage can never
+        # redden this matrix. The integration job below covers that contract.
+        run: python -m pytest tests/ -q
+
+  integration:
+    # The autocode failure-memory feature spans two repos: skcoord owns the card
+    # writer, skharness owns the reader and the call sites. Neither suite alone
+    # can prove the loop closes, so this job installs the real sibling and runs
+    # the cross-repo tests against it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install with the real skcoord sibling
+        # From git main, not PyPI: skcoord publishes only on a pushed v* tag, so
+        # its released wheel can lag main by an arbitrary amount. Testing the
+        # contract against a stale wheel would prove nothing about the code that
+        # is actually merged.
+        run: |
+          pip install -e ".[dev]"
+          pip install "skcoord @ git+https://github.com/smilinTux/skcoord@main"
+      - name: Cross-repo round trip must RUN, not skip
+        # A skipped test reports green without checking anything. These tests
+        # self-skip when the sibling is missing or too old, which is correct
+        # locally and WRONG here: this job exists to run them. Fail loudly if
+        # they did not.
+        run: |
+          set -euo pipefail
+          out="$(python -m pytest tests/test_autopilot_failure_memory_roundtrip.py -q -rs 2>&1)"
+          echo "$out"
+          if grep -qi "skipped" <<<"$out"; then
+            echo "::error::the cross-repo round trip SKIPPED instead of running; a skipped gate reports green without checking"
+            exit 1
+          fi
+      - name: Full suite against the sibling
+        run: python -m pytest tests/ -q
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - run: python -m build
+      - run: python -m twine check dist/*

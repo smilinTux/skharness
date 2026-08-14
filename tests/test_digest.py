@@ -10,7 +10,6 @@ from pathlib import Path
 
 from skharness.digest import default_digest_path, read_latest_digest
 
-
 # ---- read_latest_digest: fail-safe reads ----------------------------------
 
 def test_missing_file_returns_none_not_an_error(tmp_path):

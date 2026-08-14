@@ -1,4 +1,4 @@
-from skharness.events import EventType, SessionEvent, SOURCE_AUTOCODE, SOURCE_INTERACTIVE
+from skharness.events import SOURCE_AUTOCODE, SOURCE_INTERACTIVE, EventType, SessionEvent
 
 
 def test_event_defaults():

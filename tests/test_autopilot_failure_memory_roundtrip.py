@@ -10,6 +10,7 @@ pass clears it. Nothing here reimplements the renderer or the writer.
 """
 from __future__ import annotations
 
+import importlib
 import json
 
 import pytest
@@ -19,15 +20,28 @@ from skharness.autocode.engineering import EngineeringExecutor
 from skharness.autocode.failure_memory import build_prior_feedback
 from skharness.autocode.types import GateResult, HarnessResult, RepoSpec, WorkItem
 
-pytestmark = pytest.mark.needs_skcapstone
-
-
 @pytest.fixture
 def board_cls():
-    coordination = pytest.importorskip("skcapstone.coordination")
-    if not hasattr(coordination.Board, "record_attempt"):
-        pytest.skip("needs a skcoord carrying record_attempt/clear_attempts (FM-1, FM-2)")
-    return coordination
+    """The card store, resolved from whichever sibling is installed.
+
+    Production reaches the Board through the `skcapstone.coordination` shim, but
+    that shim IS skcoord, and skcoord alone is a far lighter dependency for CI to
+    install. Prefer it, and fall back to the shim for an environment that only
+    carries skcapstone.
+
+    The skips below are correct locally (a dev box need not have the sibling) and
+    WRONG in CI, where this contract is the whole point. The integration job
+    fails the build if these tests skip instead of running.
+    """
+    for name in ("skcoord.coordination", "skcapstone.coordination"):
+        try:
+            coordination = importlib.import_module(name)
+        except ImportError:
+            continue
+        if not hasattr(coordination.Board, "record_attempt"):
+            pytest.skip(f"{name} predates record_attempt/clear_attempts (FM-1, FM-2)")
+        return coordination
+    pytest.skip("neither skcoord nor skcapstone is installed")
 
 
 def _payload_from_board(board, task_id: str) -> dict:
