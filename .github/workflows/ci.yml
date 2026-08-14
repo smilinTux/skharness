@@ -52,13 +52,24 @@ jobs:
         # so a released wheel can lag main by an arbitrary amount. Testing
         # against a stale wheel would prove nothing about the merged code.
         run: |
+          set -euo pipefail
           pip install -e ".[dev]"
-          pip install "skcoord @ git+https://github.com/smilinTux/skcoord@main"
           # NB: the DISTRIBUTION is skos-sovereign; only the import package is
           # `skos`. Naming it `skos` here fails pip's name check with a
-          # misleading "No matching distribution found".
+          # misleading "No matching distribution found for skos (unavailable)",
+          # which reads like a missing or private repo. It is neither.
           pip install "skos-sovereign @ git+https://github.com/smilinTux/skos@main"
           pip install "capauth @ git+https://github.com/smilinTux/capauth@main"
+          # The autocode orchestrator reaches the board through the
+          # `skcapstone.coordination` shim, so the suite needs skcapstone itself,
+          # not only skcoord.
+          pip install "skcapstone @ git+https://github.com/smilinTux/skcapstone@main"
+          # skcoord LAST, and --upgrade: skcapstone depends on `skcoord>=0.1.0`,
+          # so the line above pulls the RELEASED wheel from PyPI. That wheel lags
+          # main (skcoord publishes only on a pushed v* tag) and can be missing
+          # the very API under test. Installing it last is what makes this job
+          # test merged code rather than a stale release.
+          pip install --upgrade "skcoord @ git+https://github.com/smilinTux/skcoord@main"
       - name: Cross-repo round trip must RUN, not skip
         # The autocode failure-memory feature spans two repos: skcoord owns the
         # card writer, skharness owns the reader and the call sites. Neither
