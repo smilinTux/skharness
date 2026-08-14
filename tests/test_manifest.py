@@ -11,11 +11,11 @@ def test_manifest_ui_facet_shape():
     # native module and the shell registry mounts it at /code.
     assert m["grade"] == "A"
     assert m["entry"]["flutter_package"] == "skcode_client"
-    # entry.url is deliberately KEPT alongside flutter_package so the legacy web
-    # client stays reachable at /code/legacy. C-10's parity check found two
-    # capabilities the native pane does not cover yet (C-16, C-17), so removing
-    # this would strand the operator with no fallback.
-    assert m["entry"]["url"].endswith("/app")
+    # entry.url is GONE. C-10's deletion half removed the legacy web client and
+    # the /code/legacy route from the app once C-16 and C-17 closed the parity
+    # gaps, so advertising a url the shell no longer routes would point clients
+    # at a surface that does not exist.
+    assert "url" not in m["entry"]
     assert m["nav"] == {"icon": "terminal", "order": 30, "label": "Code"}
     assert m["deeplinkPrefix"] == "skworld://skcode/"
     assert m["memory"] == {"opt_in": False}
@@ -23,11 +23,10 @@ def test_manifest_ui_facet_shape():
 
 def test_urls_are_origin_relative_and_not_double_slashed():
     m = skcode_module_manifest("http://host:9394/")
-    assert m["entry"]["url"] == "http://host:9394/app"
     assert m["health"] == "http://host:9394/api/v1/hosts/self"
     # A base without a trailing slash yields the same (no missing/extra slash).
     m2 = skcode_module_manifest("http://host:9394")
-    assert m2["entry"]["url"] == "http://host:9394/app"
+    assert m2["health"] == "http://host:9394/api/v1/hosts/self"
 
 
 def test_auth_facet_declares_audience_and_scopes():
