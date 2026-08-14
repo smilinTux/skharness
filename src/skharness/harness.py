@@ -276,6 +276,36 @@ class Harness(ABC):
         raise NotImplementedError(
             f"harness {self.name!r} does not implement the session plane (cancel)")
 
+    async def deny(self, sid: str) -> dict:
+        """REFUSE what a session is doing / has done (skcode Code-section card C-13).
+
+        The operator-refusal counterpart of :meth:`inject`'s "answer the session".
+        It exists because a Deny built out of ``inject`` is not a refusal at all:
+        it is a fresh message to the session, and the caller cannot tell whether
+        anything was actually refused. This verb must therefore report the TRUTH
+        of what it achieved, never a bare success.
+
+        Implementations MUST return a result dict carrying at least ``denied``:
+
+          * ``{"sid": sid, "denied": True, "interrupted": bool, "reason": ...}``
+            when a refusal was actually actuated. ``interrupted`` says whether
+            in-flight work was really stopped, so "I stopped it mid-flight" and
+            "there was nothing left to stop, but the session is now refused" stay
+            distinguishable facts.
+          * ``{"sid": sid, "denied": False, "reason": ...}`` when NOTHING could be
+            refused (unknown / invalid / already-finished / out-of-scope session).
+            This is a clean no-op, never a raise, and never a claimed success.
+
+        HARD RULE (card C-13): a denial that did not take effect must never be
+        reported as success. ``denied: True`` is a promise that the harness
+        actuated something real, not that an HTTP call returned 200.
+
+        This is a WRITE verb; the daemon route that drives it stays behind the
+        capauth bearer + PDP gate on ``skcode.inject`` (see daemon.py).
+        """
+        raise NotImplementedError(
+            f"harness {self.name!r} does not implement the session plane (deny)")
+
 
 # ---------------------------------------------------------------------------
 # FakeHarness: the session-plane CI double (read-only).

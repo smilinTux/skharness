@@ -658,6 +658,204 @@ async def test_inject_invalid_sid_never_touches_tmux(tmp_path):
     assert "invalid" in result["reason"].lower()
 
 
+# --- deny: the honest refusal verb (card C-13) -------------------------------
+# Deny is NOT inject with a nicer name. Every session here launches with
+# --dangerously-skip-permissions (nothing is ever waiting on a keystroke) and
+# inject is not a keystroke at all (it respawns the pane with `claude -p
+# --resume` and the text as a NEW turn), so a "Deny" built on inject refuses
+# nothing while returning success. deny actuates the two things this harness can
+# really do -- SIGINT the in-flight turn's process group, and latch the session
+# as refused so it is never resumed -- and reports honestly which of them
+# happened.
+
+
+@pytest.mark.asyncio
+async def test_deny_interrupts_the_process_group_without_killing_the_window(tmp_path):
+    sid = "sandbox-abc12345"
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        if "list-windows" in argv:
+            return "monitor\t1\nsandbox-abc12345\t1700000100\n"
+        if "list-panes" in argv:
+            return "54321 0\n"
+        if argv and argv[0] == "kill":
+            return ""
+        raise AssertionError(f"unexpected tmux call: {argv}")
+
+    h = ClaudeCodeHarness(runner=runner, sessions_root=tmp_path, host=".158")
+    h._spawned_sids.add(sid)
+    result = await h.deny(sid)
+
+    assert result["denied"] is True
+    assert result["interrupted"] is True
+    # SIGINT (refuse the turn), to the NEGATIVE pid (the whole process group, so
+    # a tool call the session started stops too). NOT SIGKILL: that is cancel.
+    kills = [c for c in calls if c and c[0] == "kill"]
+    assert kills == [["kill", "-INT", "-54321"]]
+    # the window (and its scrollback) survives: deny refuses the WORK, it does
+    # not destroy the record of it. That is what makes it distinct from cancel.
+    assert all("kill-window" not in c for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_deny_of_a_finished_turn_is_refused_but_reports_not_interrupted(tmp_path):
+    """pane_dead=1: the turn already ended, so there was nothing in flight to
+    stop. The latch still takes effect, and the result says so plainly rather
+    than implying work was interrupted."""
+    sid = "sandbox-abc12345"
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        if "list-windows" in argv:
+            return "monitor\t1\nsandbox-abc12345\t1700000100\n"
+        if "list-panes" in argv:
+            return "54321 1\n"
+        raise AssertionError(f"must not signal a dead pane: {argv}")
+
+    h = ClaudeCodeHarness(runner=runner, sessions_root=tmp_path, host=".158")
+    h._spawned_sids.add(sid)
+    result = await h.deny(sid)
+
+    assert result["denied"] is True
+    assert result["interrupted"] is False
+    assert "nothing in flight" in result["reason"]
+    assert not any(c and c[0] == "kill" for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_deny_latches_the_session_so_inject_can_never_resume_it(tmp_path):
+    """The latch is what makes deny mean something after the moment it is
+    pressed: a refused session is not resumable, enforced in the harness rather
+    than remembered by the UI."""
+    wt_root = tmp_path / "wt"
+    sid = "sandbox-abc12345"
+    _seed_resumable_session(wt_root, sid, model="sk-default", session_id="sess-1")
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        if "list-windows" in argv:
+            return "monitor\t1\nsandbox-abc12345\t1700000100\n"
+        if "list-panes" in argv:
+            return "54321 0\n"
+        return ""
+
+    h = ClaudeCodeHarness(runner=runner, worktree_root=wt_root, host=".158")
+    h._spawned_sids.add(sid)
+    h._resume_ctx[sid] = {"profile": "sandbox", "model": "sk-default", "agent": "sandbox"}
+
+    # before the deny this session IS injectable (proving the refusal, not a
+    # pre-existing block, is what stops it afterwards)
+    assert (await h.inject(sid, "carry on"))["injected"] is True
+
+    assert (await h.deny(sid))["denied"] is True
+
+    calls.clear()
+    after = await h.inject(sid, "carry on anyway")
+    assert after["injected"] is False
+    assert "denied" in after["reason"]
+    assert all("respawn-pane" not in c for c in calls)   # never resumed
+
+
+@pytest.mark.asyncio
+async def test_deny_unknown_sid_is_a_clean_noop_not_a_claimed_refusal(tmp_path):
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        if "list-windows" in argv:
+            return "monitor\t1\nsandbox-abc12345\t1700000100\n"
+        raise AssertionError(f"must not touch tmux beyond list-windows: {argv}")
+
+    h = ClaudeCodeHarness(runner=runner, sessions_root=tmp_path, host=".158")
+    h._spawned_sids.add("opus-deadbeef")
+    result = await h.deny("opus-deadbeef")      # spawned, but no live window
+
+    assert result["denied"] is False
+    assert "no live session" in result["reason"]
+    assert not any(c and c[0] == "kill" for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_deny_invalid_sid_never_touches_tmux(tmp_path):
+    def runner(argv):
+        raise AssertionError(f"invalid sid must not reach tmux: {argv}")
+
+    h = ClaudeCodeHarness(runner=runner, sessions_root=tmp_path, host=".158")
+    result = await h.deny("bad;name$(x)")
+    assert result["denied"] is False
+    assert "invalid" in result["reason"].lower()
+
+
+@pytest.mark.asyncio
+async def test_deny_refuses_a_window_this_daemon_did_not_spawn(tmp_path):
+    """Same blast-radius gate as inject (CR-6.2 C2): deny signals a process
+    group, so it must never reach a full-privilege agent window that merely
+    shares the skchat-agents tmux."""
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        if "list-windows" in argv:
+            return "monitor\t1\nlumina-abc12345\t1700000100\n"
+        raise AssertionError(f"must not reach a foreign window: {argv}")
+
+    h = ClaudeCodeHarness(runner=runner, sessions_root=tmp_path, host=".158")
+    result = await h.deny("lumina-abc12345")    # live, but not daemon-spawned
+
+    assert result["denied"] is False
+    assert "not a daemon-spawned session" in result["reason"]
+    assert not any(c and c[0] == "kill" for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_deny_is_idempotent(tmp_path):
+    """A second deny of a still-refused session is still a refusal, not a raise
+    and not a sudden denied: False."""
+    sid = "sandbox-abc12345"
+
+    def runner(argv):
+        if "list-windows" in argv:
+            return "monitor\t1\nsandbox-abc12345\t1700000100\n"
+        if "list-panes" in argv:
+            return "54321 1\n"
+        return ""
+
+    h = ClaudeCodeHarness(runner=runner, sessions_root=tmp_path, host=".158")
+    h._spawned_sids.add(sid)
+    first = await h.deny(sid)
+    second = await h.deny(sid)
+    assert first["denied"] is True
+    assert second["denied"] is True
+
+
+@pytest.mark.asyncio
+async def test_deny_with_no_pane_pid_reports_not_interrupted_and_sends_no_signal(tmp_path):
+    """Blank list-panes output (no pid to signal): never a malformed kill, and
+    interrupted is False because nothing was actually stopped."""
+    sid = "sandbox-abc12345"
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        if "list-windows" in argv:
+            return "monitor\t1\nsandbox-abc12345\t1700000100\n"
+        if "list-panes" in argv:
+            return ""
+        raise AssertionError(f"unexpected tmux call: {argv}")
+
+    h = ClaudeCodeHarness(runner=runner, sessions_root=tmp_path, host=".158")
+    h._spawned_sids.add(sid)
+    result = await h.deny(sid)
+
+    assert result["denied"] is True
+    assert result["interrupted"] is False
+    assert not any(c and c[0] == "kill" for c in calls)
+
+
 # --- parse_repo_allowlist ----------------------------------------------------
 
 
