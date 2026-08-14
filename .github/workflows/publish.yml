@@ -149,6 +149,17 @@ jobs:
 
   pypi-publish:
     needs: build
+    # Same `always()` guard the build job needs, and for the same reason one
+    # level further down. GitHub propagates a skip THROUGH a job: `tag` is
+    # skipped on the tag-push path, `build` survives it with always(), but a
+    # bare `needs: build` here still evaluates to skipped. The trigger is
+    # tags-only, so `tag` can never run on that path, so this job could never
+    # run either: v0.3.13 built cleanly, passed every guard, uploaded NOTHING,
+    # and the run still reported success because a skipped job does not fail a
+    # run. A green publish that shipped no artifact is the worst kind of green.
+    # This is skcoord's PR #6 fix, ported verbatim.
+    if: >-
+      always() && !cancelled() && needs.build.result == 'success'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
