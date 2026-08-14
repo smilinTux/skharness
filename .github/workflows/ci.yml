@@ -54,7 +54,10 @@ jobs:
         run: |
           pip install -e ".[dev]"
           pip install "skcoord @ git+https://github.com/smilinTux/skcoord@main"
-          pip install "skos @ git+https://github.com/smilinTux/skos@main"
+          # NB: the DISTRIBUTION is skos-sovereign; only the import package is
+          # `skos`. Naming it `skos` here fails pip's name check with a
+          # misleading "No matching distribution found".
+          pip install "skos-sovereign @ git+https://github.com/smilinTux/skos@main"
           pip install "capauth @ git+https://github.com/smilinTux/capauth@main"
       - name: Cross-repo round trip must RUN, not skip
         # The autocode failure-memory feature spans two repos: skcoord owns the
