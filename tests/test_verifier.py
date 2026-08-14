@@ -24,14 +24,18 @@ import json
 from pathlib import Path
 
 import pytest
-from capauth.tokens import (
-    export_token,
-    issue_token,
-    mint_audience_token,
-)
 
-from skharness import serve
-from skharness.serve import (
+# capauth is an optional sibling, not a declared skharness dependency (same policy
+# as the needs_skcapstone hook in conftest.py). A module-level `from capauth...`
+# turned its absence into a COLLECTION error, which took the whole suite down in
+# any clean environment. Skip this module instead.
+_tokens = pytest.importorskip("capauth.tokens")
+export_token = _tokens.export_token
+issue_token = _tokens.issue_token
+mint_audience_token = _tokens.mint_audience_token
+
+from skharness import serve  # noqa: E402  (must follow the optional-sibling guard)
+from skharness.serve import (  # noqa: E402  (must follow the optional-sibling guard)
     FORCE_DENY_ENV,
     REAL_VERIFIER_ENV,
     build_capauth_verifier,

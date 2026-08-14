@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from skharness.auth import AuthContext
 from skharness.autocode.types import GateResult, RepoSpec
 from skharness.daemon import build_daemon_app
 from skharness.events import EventType, SessionEvent
@@ -557,8 +558,6 @@ def test_ratify_unknown_session_404(mocker):
 # ---- WITHOUT arming keystroke-inject. Driven with a scope-carrying AuthContext,
 # ---- exactly what the real capauth verifier returns. --------------------------
 
-from skharness.auth import AuthContext
-
 _H = {"authorization": "Bearer tok"}
 
 
@@ -635,7 +634,8 @@ def test_scope_split_write_token_injects_and_reads():
 def test_scope_split_deny_all_denies_read_and_write():
     # Flag off == deny-all verifier: it carries no scopes and returns False, so
     # EVERY route is 403 regardless of the scope the route asks for.
-    deny_all = lambda token: False
+    def deny_all(token):
+        return False
 
     harness = _inject_harness()
     c = TestClient(build_daemon_app(harness=harness, verify_caller=deny_all))

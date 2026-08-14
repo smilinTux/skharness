@@ -3,8 +3,15 @@ import json
 
 import pytest
 
-from skos import gtd_ingest
-from skharness.autocode import resolver
+# skos is an optional sibling, not a declared skharness dependency (same policy as
+# the needs_skcapstone hook in conftest.py). Its absence used to be a COLLECTION
+# error, which took the WHOLE suite down in any clean environment. Skip instead.
+#
+# This guard must precede the resolver import: skharness.autocode.resolver itself
+# imports skos at module level, so importing it first reintroduces the error.
+gtd_ingest = pytest.importorskip("skos.gtd_ingest")
+
+from skharness.autocode import resolver  # noqa: E402  (must follow the guard above)
 
 
 @pytest.fixture(autouse=True)

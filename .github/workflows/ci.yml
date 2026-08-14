@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+# The SKWorld CI pattern (CR-4.6) adapted to what skharness actually is.
+# publish.yml deliberately does not gate on tests, so this is the ONLY place the
+# suite runs. Until it existed, every PR check on this repo was GitGuardian,
+# which scans for secrets and says nothing about whether the code works.
+#
+# Shape note: skharness is NOT hermetically testable, and pretending otherwise
+# would produce a permanently red job. 74 of its tests exercise code paths that
+# reach optional siblings (skos, capauth) and the autocode engine spans repos
+# with skcoord. In the fleet those siblings are always present, so the honest
+# gate installs them. skos requires Python >=3.12, which is why the full suite
+# runs on 3.12 only; the 3.10 job below keeps the declared floor honest instead.
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # setuptools-scm derives the version from the git tag, so a shallow
+          # checkout would yield a placeholder like 0.1.dev1 and break dependency
+          # resolution against pinned siblings.
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check src/ tests/
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install with the real siblings
+        # From git main, not PyPI: these repos publish only on a pushed v* tag,
+        # so a released wheel can lag main by an arbitrary amount. Testing
+        # against a stale wheel would prove nothing about the merged code.
+        run: |
+          set -euo pipefail
+          pip install -e ".[dev]"
+          # NB: the DISTRIBUTION is skos-sovereign; only the import package is
+          # `skos`. Naming it `skos` here fails pip's name check with a
+          # misleading "No matching distribution found for skos (unavailable)",
+          # which reads like a missing or private repo. It is neither.
+          pip install "skos-sovereign @ git+https://github.com/smilinTux/skos@main"
+          pip install "capauth @ git+https://github.com/smilinTux/capauth@main"
+          # The autocode orchestrator reaches the board through the
+          # `skcapstone.coordination` shim, so the suite needs skcapstone itself,
+          # not only skcoord.
+          pip install "skcapstone @ git+https://github.com/smilinTux/skcapstone@main"
+          # skcoord LAST, and --upgrade: skcapstone depends on `skcoord>=0.1.0`,
+          # so the line above pulls the RELEASED wheel from PyPI. That wheel lags
+          # main (skcoord publishes only on a pushed v* tag) and can be missing
+          # the very API under test. Installing it last is what makes this job
+          # test merged code rather than a stale release.
+          pip install --upgrade "skcoord @ git+https://github.com/smilinTux/skcoord@main"
+      - name: Cross-repo round trip must RUN, not skip
+        # The autocode failure-memory feature spans two repos: skcoord owns the
+        # card writer, skharness owns the reader and the call sites. Neither
+        # suite alone proves the loop closes. These tests self-skip when the
+        # sibling is missing, which is right on a dev box and WRONG here, where
+        # running them is the entire point. A skipped gate reports green without
+        # checking anything, so fail loudly rather than pass quietly.
+        run: |
+          set -euo pipefail
+          out="$(python -m pytest tests/test_autopilot_failure_memory_roundtrip.py -q -rs 2>&1)"
+          echo "$out"
+          if grep -qi "skipped" <<<"$out"; then
+            echo "::error::the cross-repo round trip SKIPPED instead of running"
+            exit 1
+          fi
+      - name: Full suite
+        run: python -m pytest tests/ -q
+
+  compat-3-10:
+    # pyproject claims requires-python >=3.10, but the full suite cannot run
+    # there (skos, a sibling several tests reach, is >=3.12). Rather than drop
+    # the claim or fake a green suite, prove the narrower thing that is actually
+    # true: the package and its autocode core import cleanly on the declared
+    # floor. If someone uses 3.12-only syntax, this job catches it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install -e ".[dev]"
+      - name: Import the core on the declared floor
+        run: |
+          python - <<'PY'
+          import importlib
+          mods = ["skharness", "skharness.serve",
+                  "skharness.autocode.engineering", "skharness.autocode.direct",
+                  "skharness.autocode.failure_memory",
+                  "skharness.autocode.orchestrator", "skharness.autocode.journal"]
+          for m in mods:
+              importlib.import_module(m)
+              print("ok", m)
+          PY
+      - name: Run the sibling-free unit tests
+        run: python -m pytest tests/test_autopilot_failure_memory.py -q
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - run: python -m build
+      - run: python -m twine check dist/*

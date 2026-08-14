@@ -90,7 +90,8 @@ def test_require_bearer_deny_all_wins_over_required_scope():
 def test_require_bearer_truthy_scope_opaque_fails_closed_on_scoped_route():
     # A truthy result that is NOT a scope carrier and NOT bare True is denied on a
     # scoped route (fail closed), but still allowed when no scope is required.
-    v = lambda token: "yes"
+    def v(token):
+        return "yes"
     assert require_bearer("Bearer t", v) == "t"          # no scope required -> ok
     with pytest.raises(HTTPException) as ei:
         require_bearer("Bearer t", v, "skcode.stream")

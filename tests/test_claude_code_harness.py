@@ -12,6 +12,7 @@ import pytest
 from skharness.events import EventType
 from skharness.harness import Harness, HarnessSession, SessionDescriptor, SpawnRejected
 from skharness.harnesses.claude_code import (
+    _SID_RE,
     ClaudeCodeHarness,
     is_gateway_model,
     map_model,
@@ -21,7 +22,6 @@ from skharness.harnesses.claude_code import (
     parse_windows,
     sandbox_cloud_token_allowed,
     scan_historical,
-    _SID_RE,
 )
 
 

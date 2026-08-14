@@ -145,7 +145,9 @@ def test_run_retries_past_api_error_and_empty_then_returns_usable(monkeypatch):
     ]
     calls = {"n": 0}
     def fake_spawn(spec, **kw):
-        r = seq[calls["n"]]; calls["n"] += 1; return r
+        r = seq[calls["n"]]
+        calls["n"] += 1
+        return r
     monkeypatch.setattr(sb, "spawn", fake_spawn)
     a = _Fake(sb, egress_hosts=[])
     out = a._run("instr", "data", worktree="/tmp/wt", repo=None)
@@ -159,7 +161,8 @@ def test_run_gives_up_after_bounded_attempts(monkeypatch):
     sb = Sandbox(live_execution=True)
     calls = {"n": 0}
     def fake_spawn(spec, **kw):
-        calls["n"] += 1; return {"is_error": True, "result": "still down"}
+        calls["n"] += 1
+        return {"is_error": True, "result": "still down"}
     monkeypatch.setattr(sb, "spawn", fake_spawn)
     a = _Fake(sb, egress_hosts=[])
     out = a._run("instr", "data", worktree="/tmp/wt", repo=None)
