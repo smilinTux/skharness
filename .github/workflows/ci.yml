@@ -54,11 +54,15 @@ jobs:
         run: |
           set -euo pipefail
           pip install -e ".[dev]"
-          # NB: the DISTRIBUTION is skos-sovereign; only the import package is
-          # `skos`. Naming it `skos` here fails pip's name check with a
-          # misleading "No matching distribution found for skos (unavailable)",
-          # which reads like a missing or private repo. It is neither.
-          pip install "skos-sovereign @ git+https://github.com/smilinTux/skos@main"
+          # No `name @ ` prefix on purpose. A direct reference asserts the
+          # DISTRIBUTION name, and skos's has differed from its import package
+          # (`skos-sovereign` vs `import skos`) and is being renamed. A wrong
+          # assertion fails with "No matching distribution found for X
+          # (unavailable)", which reads like a missing or private repo rather
+          # than a naming mismatch. A bare URL takes whatever name the project
+          # declares, so this line is correct before, during, and after the
+          # rename, and cannot rot again.
+          pip install "git+https://github.com/smilinTux/skos@main"
           pip install "capauth @ git+https://github.com/smilinTux/capauth@main"
           # The autocode orchestrator reaches the board through the
           # `skcapstone.coordination` shim, so the suite needs skcapstone itself,
