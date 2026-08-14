@@ -288,6 +288,68 @@ def test_jobs_route_has_no_mutating_verb():
     assert c.delete("/api/v1/jobs", headers=h).status_code == 405
 
 
+# ---- GET /watchdog/digest : published skwatchdog digest (card C-14a) --------
+
+def test_digest_route_requires_read_scope():
+    c = _client()
+    assert c.get("/api/v1/watchdog/digest").status_code == 401
+    assert c.get("/api/v1/watchdog/digest",
+                 headers={"authorization": "Bearer bad"}).status_code == 403
+
+
+def test_digest_route_404_without_a_digest_provider():
+    # No read_digest configured (the daemon default): a clean 404, "no digest
+    # has been published yet" -- never a 200 with a fabricated empty digest
+    # that would look exactly like a real quiet day.
+    c = _client()
+    r = c.get("/api/v1/watchdog/digest", headers={"authorization": "Bearer good"})
+    assert r.status_code == 404
+
+
+def test_digest_route_404_when_the_provider_reports_nothing_published():
+    app = build_daemon_app(harness=_harness(), verify_caller=lambda t: t == "good",
+                           read_digest=lambda: None)
+    c = TestClient(app)
+    r = c.get("/api/v1/watchdog/digest", headers={"authorization": "Bearer good"})
+    assert r.status_code == 404
+
+
+def test_digest_route_serves_the_provider_bytes_byte_for_byte():
+    payload = (b'{"date": "2026-08-14", "headline": "quiet day", "problems": [], '
+               b'"notable": [], "info_counts": {}}')
+    app = build_daemon_app(harness=_harness(), verify_caller=lambda t: t == "good",
+                           read_digest=lambda: payload)
+    c = TestClient(app)
+    r = c.get("/api/v1/watchdog/digest", headers={"authorization": "Bearer good"})
+    assert r.status_code == 200
+    assert r.content == payload
+    assert r.json()["date"] == "2026-08-14"
+
+
+def test_digest_route_serves_malformed_bytes_as_is_never_a_500():
+    # A corrupt on-disk artifact is a DIFFERENT fact than "not published yet"
+    # (card C-14a's hard rule): served with 200, unexamined, so the client's
+    # own JSON parse fails distinctly rather than the server ever 500ing or
+    # silently substituting a fake empty digest.
+    broken = b"{not valid json"
+    app = build_daemon_app(harness=_harness(), verify_caller=lambda t: t == "good",
+                           read_digest=lambda: broken)
+    c = TestClient(app)
+    r = c.get("/api/v1/watchdog/digest", headers={"authorization": "Bearer good"})
+    assert r.status_code == 200
+    assert r.content == broken
+
+
+def test_digest_route_has_no_mutating_verb():
+    # Read-only surface, mirroring /jobs: only GET is wired, POST/PUT/DELETE
+    # are all Method Not Allowed.
+    c = _client()
+    h = {"authorization": "Bearer good"}
+    assert c.post("/api/v1/watchdog/digest", json={}, headers=h).status_code == 405
+    assert c.put("/api/v1/watchdog/digest", json={}, headers=h).status_code == 405
+    assert c.delete("/api/v1/watchdog/digest", headers=h).status_code == 405
+
+
 # ---- autocode runs register as sessions (source=autocode, spec 5.1 / AC3) ---
 
 def test_list_sessions_merges_registered_autocode_runs():

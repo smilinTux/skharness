@@ -17,6 +17,7 @@ from pathlib import Path
 from skharness.auth import AuthContext, Verifier
 from skharness.autocode.sessions import AutocodeSessionRegistry
 from skharness.daemon import build_daemon_app
+from skharness.digest import read_latest_digest
 from skharness.harnesses.claude_code import ClaudeCodeHarness, parse_repo_allowlist
 from skharness.jobs import read_job_runs
 from skharness.session_events import SessionEventStore
@@ -289,6 +290,27 @@ def build_jobs_provider():
     return _jobs
 
 
+def build_digest_provider():
+    """Wire ``GET /api/v1/watchdog/digest`` (card C-14a) to the REAL published
+    digest artifact at its default path
+    (``~/.skcapstone/watchdog/digests/latest/digest.json``, or
+    ``$SKCODE_WATCHDOG_DIGEST_PATH`` when set) -- the exact file
+    ``skos.watchdog.publish.publish_digest`` writes.
+
+    Reads fresh on every call (:func:`skharness.digest.read_latest_digest`
+    opens the file itself); this daemon caches nothing about the digest,
+    matching the "the Code section is a view, never a store" rule. Fails
+    safe by construction: a missing directory, a missing file, or a
+    permission error all degrade to ``None`` (served as 404, "no digest
+    published yet"), never an exception, so this callable can never make
+    the route 500.
+    """
+    def _digest():
+        return read_latest_digest()
+
+    return _digest
+
+
 def select_verifier() -> Verifier:
     """Pick the verifier the daemon runs with (CR-3.2: real capauth by default).
 
@@ -373,5 +395,6 @@ def _serve(argv: list[str]) -> None:
         event_store=event_store,
         list_autocode_sessions=autocode_registry.list,
         list_jobs=build_jobs_provider(),
+        read_digest=build_digest_provider(),
     )
     uvicorn.run(app, host=host, port=args.port)

@@ -6,6 +6,7 @@ from skharness.serve import (
     DEFAULT_PORT,
     build_audit_log,
     build_default_verifier,
+    build_digest_provider,
     build_dispatch_targets,
     full_profile_allowed,
     resolve_bind,
@@ -79,3 +80,17 @@ def test_build_dispatch_targets_empty_when_no_allowlist(monkeypatch):
 def test_skcode_state_dir_honors_env(tmp_path, monkeypatch):
     monkeypatch.setenv("SKCODE_STATE_DIR", str(tmp_path))
     assert skcode_state_dir() == tmp_path
+
+
+def test_build_digest_provider_reads_the_real_default_path(tmp_path, monkeypatch):
+    fake = tmp_path / "digest.json"
+    fake.write_text('{"date": "2026-08-14"}', encoding="utf-8")
+    monkeypatch.setenv("SKCODE_WATCHDOG_DIGEST_PATH", str(fake))
+    provider = build_digest_provider()
+    assert provider() == b'{"date": "2026-08-14"}'
+
+
+def test_build_digest_provider_none_when_nothing_published(tmp_path, monkeypatch):
+    monkeypatch.setenv("SKCODE_WATCHDOG_DIGEST_PATH", str(tmp_path / "does-not-exist.json"))
+    provider = build_digest_provider()
+    assert provider() is None

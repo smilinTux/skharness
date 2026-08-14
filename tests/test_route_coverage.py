@@ -154,3 +154,19 @@ def test_jobs_route_is_gated_on_stream_scope_and_read_only():
     # other than this one GET.
     jobs_routes = [key for key in ROUTE_SCOPES if "jobs" in key[1]]
     assert jobs_routes == [("GET", "/api/v1/jobs")]
+
+
+def test_digest_route_is_gated_on_stream_scope_and_read_only():
+    """Card C-14a (skwatchdog digest view, answering C-14): GET
+    /watchdog/digest is a READ-only view, same scope as sessions/jobs, and is
+    NOT one of the PDP-decided scopes -- it decides nothing, it only reports.
+    There is no mutating digest route (no publish/regenerate/delete) anywhere
+    in ROUTE_SCOPES."""
+    from capauth.authz import DEFAULT_RULES
+
+    assert classify_route("GET", "/api/v1/watchdog/digest") == ("gated", "skcode.stream")
+    assert ROUTE_SCOPES[("GET", "/api/v1/watchdog/digest")] == "skcode.stream"
+    assert "skcode.stream" not in PDP_SCOPES
+    assert "skcode.stream" not in DEFAULT_RULES
+    digest_routes = [key for key in ROUTE_SCOPES if "digest" in key[1]]
+    assert digest_routes == [("GET", "/api/v1/watchdog/digest")]
