@@ -8,10 +8,10 @@
 # or auto-starts the service. Enabling/starting is left to the operator: the
 # script PRINTS the exact next-step commands instead of running them.
 #
-# WHY it does not start: skcode-hostd exposes a remote-control surface. It ships
-# tailnet-only (serve.py refuses a wildcard bind) and deny-all (SKCODE_REAL_VERIFIER
-# unset), but bringing it up is a deliberate operator decision, not an install
-# side effect.
+# WHY it does not start: skcode-hostd exposes a remote-control surface with real
+# write routes (inject/dispatch). It ships tailnet-only (serve.py refuses a
+# wildcard bind) with an empty dispatch allowlist (deny all), but bringing it up
+# is a deliberate operator decision, not an install side effect.
 #
 # Usage:
 #   ./systemd/install.sh                 install + daemon-reload (no enable/start)
@@ -20,8 +20,8 @@
 #   ./systemd/install.sh --enable        also `systemctl --user enable` (no start)
 #   ./systemd/install.sh --enable --start  also enable + start the unit
 #
-# Even with --enable/--start the deny-all + tailnet-only defaults are unchanged:
-# those flags only toggle systemd enablement, never the daemon's security posture.
+# Even with --enable/--start the tailnet-only bind + empty dispatch allowlist are
+# unchanged: those flags only toggle systemd enablement, never the security posture.
 
 set -euo pipefail
 

@@ -1,25 +1,34 @@
-# skcode-hostd.service: read-only skcode remote-control daemon (P0).
+# skcode-hostd.service: the skcode remote-control daemon.
 #
 # systemd USER unit (systemctl --user). Runs the skcode-hostd daemon from
 # src/skharness/serve.py, which binds a Tailscale IP ONLY (never 0.0.0.0) on
-# port 9394 and exposes exactly the three capauth-gated read routes plus the
-# static client. There is NO write surface.
+# port 9394.
+#
+# THIS DAEMON HAS A WRITE SURFACE. It serves capauth-gated read routes AND
+# POST /sessions/{sid}/inject, /ratify, /deny, /cancel and POST /dispatch (which
+# spawns a NEW agent session: RCE). Do not treat it as read-only. The full route
+# and scope table lives in ../SOP.md section 7.
 #
 # SHIPPED SAFE BY DEFAULT:
 #   - The bind host comes from ${SKCODE_HOSTD_TAILSCALE_IP} (the EnvironmentFile
 #     below). serve.py's resolve_bind() REFUSES a wildcard/public address, so a
 #     blank or 0.0.0.0 value fails the unit closed rather than exposing a port.
-#   - SKCODE_REAL_VERIFIER is deliberately NOT set here. serve.py's
-#     select_verifier() then defaults to the P0 deny-all placeholder, so the RCE
-#     surface stays gated. Enabling the real capauth verifier is a DELIBERATE
-#     opt-in (see skcode-hostd.env.example and README.md); do it only after the
-#     pairing/verifier is provisioned.
+#   - SKCODE_DISPATCH_REPOS is NOT set here or in the env template, so the
+#     dispatch repo allowlist is EMPTY, which spawn() treats as DENY ALL. A fresh
+#     install can dispatch nothing until an operator lists a repo explicitly.
+#     Never list skos or skharness: that is the self-modification hazard.
+#   - Every gated route fails closed on the capauth bearer: no token, an invalid
+#     token, a wrong-audience token, or an unreachable capauth all deny. Since
+#     CR-3.2 serve.py's select_verifier() runs the REAL capauth verifier by
+#     default and falls back to deny-all only when capauth cannot be imported or
+#     when SKCODE_FORCE_DENY_ALL is set. SKCODE_REAL_VERIFIER is therefore no
+#     longer required and is deliberately NOT set here.
 #
 # This unit is installed but NOT auto-enabled or auto-started. The operator
 # decides when to `systemctl --user enable/start` it (see systemd/README.md).
 
 [Unit]
-Description=skcode-hostd read-only remote-control daemon (tailnet-only, deny-all default)
+Description=skcode-hostd remote-control daemon (tailnet-only, capauth-gated, dispatch deny-all by default)
 Documentation=https://github.com/smilinTux/skharness
 After=network-online.target
 Wants=network-online.target
@@ -28,7 +37,6 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h
 # --host is sourced from the env file; serve.py refuses a wildcard/public bind.
-# SKCODE_REAL_VERIFIER is intentionally NOT set, so the daemon runs deny-all.
 ExecStart=%h/.skenv/bin/python -m skharness --host ${SKCODE_HOSTD_TAILSCALE_IP} --port 9394 --host-id ${SKCODE_HOSTD_HOST_ID}
 Restart=on-failure
 RestartSec=5

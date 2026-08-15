@@ -1,23 +1,27 @@
 # skcode-hostd systemd deploy tooling
 
 Tooling to run `skcode-hostd` as a managed **systemd user unit**. It ships safe:
-**tailnet-only bind**, **deny-all verifier by default**, and it does **NOT
-auto-start**. Installing only stages the unit; the operator decides when to
-enable and start it.
+**tailnet-only bind**, **capauth-gated on every data route**, **dispatch
+allowlist empty (deny all)**, and it does **NOT auto-start**. Installing only
+stages the unit; the operator decides when to enable and start it.
 
 ## What the unit does
 
-`skcode-hostd.service` runs the P0 read-only remote-control daemon from
+`skcode-hostd.service` runs the remote-control daemon from
 `src/skharness/serve.py`:
 
 ```
 %h/.skenv/bin/python -m skharness --host ${SKCODE_HOSTD_TAILSCALE_IP} --port 9394 --host-id ${SKCODE_HOSTD_HOST_ID}
 ```
 
-It owns one harness (the claude-code tmux adapter) and exposes exactly the three
-capauth-gated read routes plus the static client. There is **no write surface**.
+It owns one harness (the claude-code tmux adapter) and serves the capauth-gated
+read routes, the static client, **and a write surface**: `POST
+/api/v1/sessions/{sid}/inject`, `/ratify`, `/deny`, `/cancel`, and `POST
+/api/v1/dispatch`, which spawns a new agent session (remote code execution).
+Earlier revisions of this file claimed there was no write surface; that was
+stale. The authoritative route and scope table is [../SOP.md](../SOP.md) section 7.
 
-## Two safety defaults (do not weaken)
+## Three safety defaults (do not weaken)
 
 1. **Tailnet-only bind.** `--host` is sourced from `${SKCODE_HOSTD_TAILSCALE_IP}`
    in the env file. `serve.py`'s `resolve_bind()` **refuses** a wildcard/public
@@ -25,22 +29,30 @@ capauth-gated read routes plus the static client. There is **no write surface**.
    the unit closed instead of exposing a public port. Always point it at a real
    Tailscale IP (e.g. `100.64.0.2`), never a public/wildcard value.
 
-2. **Deny-all verifier by default.** The unit deliberately does **not** set
-   `SKCODE_REAL_VERIFIER`. `serve.py`'s `select_verifier()` then runs the P0
-   deny-all placeholder, so no caller is accepted and the RCE surface stays
-   gated. This is the intended P0 posture.
+2. **Dispatch allowlist empty = deny all.** Neither the unit nor the env template
+   sets `SKCODE_DISPATCH_REPOS`, so the spawn guard refuses every repo. Add roots
+   only on a node that is meant to dispatch, and **never add `skos` or
+   `skharness`**: an agent dispatched into either could edit the very code that
+   grades it.
 
-### Opting into the real capauth verifier
+3. **Fail-closed auth on every gated route.** No token, an invalid or expired
+   token, a wrong-audience token, or an unreachable capauth all deny. Since
+   CR-3.2 `select_verifier()` runs the **real** capauth verifier by default and
+   falls back to deny-all only when capauth cannot be imported. Writes need the
+   `skcode.inject` scope and dispatch needs `skcode.dispatch`, each additionally
+   decided by the capauth PDP at a `VERIFIED` enrollment floor.
 
-Only after the pairing/verifier is provisioned (spec 7.6), uncomment in your
-live env file:
+### Disarming without stopping the unit
+
+Set the escape hatch in your live env file and restart:
 
 ```
-SKCODE_REAL_VERIFIER=1
+SKCODE_FORCE_DENY_ALL=1
 ```
 
-Then `systemctl --user restart skcode-hostd`. Enabling it before the verifier is
-provisioned would swap deny-all for a verifier with nothing to verify against.
+Every caller is then denied and nothing actuates. `SKCODE_REAL_VERIFIER=1` is
+the legacy explicit opt-in to the real verifier; it is redundant now that real
+is the default, and it is harmless to leave set.
 
 ## Install
 
@@ -65,7 +77,7 @@ cp ~/.config/skcode-hostd/skcode-hostd.env.example ~/.config/skcode-hostd/skcode
 $EDITOR ~/.config/skcode-hostd/skcode-hostd.env
 # set SKCODE_HOSTD_TAILSCALE_IP=<this node's tailnet IP>
 # set SKCODE_HOSTD_HOST_ID=<node id, e.g. .158>
-# leave SKCODE_REAL_VERIFIER commented out unless the verifier is provisioned
+# leave SKCODE_DISPATCH_REPOS unset unless this node should dispatch (empty = deny all)
 ```
 
 ## Enable / start (operator decision)
@@ -85,14 +97,14 @@ The installer can also do this for you (still never auto-run without the flags):
 ./systemd/install.sh --enable --start  # enable + start
 ```
 
-Even with `--enable --start`, the tailnet-only bind and deny-all defaults are
-unchanged: those flags only toggle systemd enablement, never the daemon's
-security posture.
+Even with `--enable --start`, the tailnet-only bind and the empty dispatch
+allowlist are unchanged: those flags only toggle systemd enablement, never the
+daemon's security posture.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `skcode-hostd.service` | the user unit (tailnet-only, deny-all, `Restart=on-failure`, standard hardening) |
-| `skcode-hostd.env.example` | tunables template (`SKCODE_HOSTD_TAILSCALE_IP`, `SKCODE_HOSTD_HOST_ID`, commented `SKCODE_REAL_VERIFIER`) |
+| `skcode-hostd.service` | the user unit (tailnet-only, capauth-gated, `Restart=on-failure`, standard hardening) |
+| `skcode-hostd.env.example` | tunables template (`SKCODE_HOSTD_TAILSCALE_IP`, `SKCODE_HOSTD_HOST_ID`, plus commented `SKCODE_DISPATCH_REPOS`, `SKCODE_FORCE_DENY_ALL`, `SKCODE_REAL_VERIFIER`) |
 | `install.sh` | idempotent installer; `--dry-run` / `--diff` / `--enable` / `--start`; never auto-starts |
