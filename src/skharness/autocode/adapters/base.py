@@ -10,6 +10,7 @@ import subprocess
 from skharness.harness import Harness
 
 from .. import health
+from ..buckets import dispatch_model_of, validate_bucket
 from ..claude_code import frame
 from ..grading import GRADE_RUBRIC, parse_grade
 from ..sandbox import LaunchSpec
@@ -72,6 +73,13 @@ def _grade_axes(out, brief: AssessBrief) -> tuple[str | None, str | None, str | 
                       error=type(exc).__name__)
         sensitivity = None
     return size, risk, sensitivity
+
+class ModelOverrideUnsupported(RuntimeError):
+    """A per-call model override was requested of an adapter that cannot honour it.
+
+    Raised instead of dropping the override: dropping it would run the call on the
+    statically configured model, discarding the requested routing (and with it the
+    card's sensitivity ceiling) with no visible signal at all."""
 
 
 def _record_assess_inconclusive(brief: AssessBrief, out: dict) -> None:
@@ -182,11 +190,25 @@ class BaseCliAdapter(Harness):
         self.live_execution = live_execution
 
     # -- hooks each concrete adapter provides --
-    def _argv(self, prompt: str, light: bool = False) -> list[str]: raise NotImplementedError
+    # `model` is the per-call model override (widening the existing `light` seam:
+    # same shape, threaded down the same path). It is passed ONLY when non-None AND
+    # the adapter declares supports_model_override(), so an adapter that has not
+    # implemented it keeps its narrow (prompt, light) / () signatures untouched.
+    def _argv(self, prompt: str, light: bool = False,
+              model: str | None = None) -> list[str]: raise NotImplementedError
     def _image(self) -> str: raise NotImplementedError
     def _auth_mounts(self) -> list: raise NotImplementedError
     def _auth_env(self) -> dict: raise NotImplementedError
-    def _config_files(self) -> dict: return {}
+    def _config_files(self, model: str | None = None) -> dict: return {}
+
+    def supports_model_override(self) -> bool:
+        """True only when this adapter honours a per-call model id in BOTH _argv and
+        _config_files. Default False, and _run_raw REFUSES a per-call override on a
+        False adapter rather than dropping it. Silently ignoring the override is the
+        dangerous outcome: the call would run on the statically configured model with
+        the card's sensitivity ceiling quietly discarded, which is exactly the class
+        of failure this seam exists to prevent. Fail closed and loudly instead."""
+        return False
     def _stdin_for(self, prompt: str) -> str | None: return None
     def _parse(self, raw: dict) -> dict: raise NotImplementedError
     def capabilities(self): raise NotImplementedError
@@ -218,13 +240,27 @@ class BaseCliAdapter(Harness):
 
     # -- shared spawn helpers --
     def _run_raw(self, instruction: str, data: str, *, worktree: str, repo,
-                 light: bool = False) -> dict:
+                 light: bool = False, model: str | None = None) -> dict:
         prompt = frame(instruction, data)
         image = getattr(repo, "sandbox_image", None) or self._image()
-        spec = LaunchSpec(name=self.name, argv=self._argv(prompt, light=light), image=image,
+        # One kwargs dict feeds BOTH hooks, so _argv and _config_files can never be
+        # handed different model ids. They must agree: _config_files DECLARES the
+        # model to the CLI and _argv REQUESTS it, so a disagreement means the CLI
+        # asks for a model it never declared.
+        mkw: dict = {}
+        if model is not None:
+            if not self.supports_model_override():
+                raise ModelOverrideUnsupported(
+                    f"{self.name} adapter cannot honour a per-call model override "
+                    f"({model!r}); refusing rather than silently running the static "
+                    "model without the requested routing.")
+            validate_bucket(model)          # never emit an unvalidated bucket id
+            mkw["model"] = model
+        spec = LaunchSpec(name=self.name, argv=self._argv(prompt, light=light, **mkw),
+                          image=image,
                           worktree=worktree, auth_mounts=self._auth_mounts(),
                           auth_env=self._auth_env(), egress_hosts=self.egress_hosts,
-                          config_files=self._config_files(),
+                          config_files=self._config_files(**mkw),
                           stdin=self._stdin_for(prompt))
         return self.sandbox.spawn(spec, repo_remote_host=self._remote_host(repo),
                                   ci_host=self._ci_host(repo))
@@ -257,11 +293,12 @@ class BaseCliAdapter(Harness):
         return base
 
     def _run(self, instruction: str, data: str, *, worktree: str, repo,
-             light: bool = False) -> dict:
+             light: bool = False, model: str | None = None) -> dict:
         parsed: dict = {}
         attempts = self._run_attempts()
         for i in range(attempts):
-            raw = self._run_raw(instruction, data, worktree=worktree, repo=repo, light=light)
+            raw = self._run_raw(instruction, data, worktree=worktree, repo=repo,
+                                light=light, model=model)
             if not (isinstance(raw, dict) and raw.get("is_error")):
                 parsed = self._parse(raw)
                 if parsed:                      # non-empty parse == usable answer
@@ -401,7 +438,10 @@ class BaseCliAdapter(Harness):
                            "description": brief.description,
                            "acceptance": brief.acceptance,
                            "prior_feedback": brief.prior_feedback, "round": brief.round})
-        raw = self._run_raw(instruction, data, worktree=brief.worktree, repo=brief.repo)
+        # A dispatcher may pin this ONE call to a graded bucket (see buckets.py);
+        # absent that, dispatch_model_of is None and this is the pre-existing call.
+        raw = self._run_raw(instruction, data, worktree=brief.worktree, repo=brief.repo,
+                            model=dispatch_model_of(brief))
         usage = raw.get("usage", {}) if isinstance(raw, dict) else {}
         return HarnessResult(
             ok=(not bool(raw.get("is_error"))) and int(raw.get("exit_code", 0) or 0) == 0,
@@ -421,6 +461,9 @@ class BaseCliAdapter(Harness):
         data = json.dumps({"task_id": brief.task_id, "diff": brief.diff,
                            "acceptance": brief.acceptance, "ci_status": brief.ci_status,
                            "diff_coverage": brief.diff_coverage})
-        out = self._run(instruction, data, worktree=brief.worktree, repo=brief.repo, light=True)
+        # The grader reads the DIFF, which carries the card's content, so it sits in
+        # the same sensitivity zone as the build and takes the same bucket.
+        out = self._run(instruction, data, worktree=brief.worktree, repo=brief.repo,
+                        light=True, model=dispatch_model_of(brief))
         return GateResult(score=out.get("score"), passed=bool(out.get("passed")),
                           notes=out.get("notes", ""), artifact=out.get("artifact"))

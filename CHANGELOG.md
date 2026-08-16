@@ -10,6 +10,27 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 ## [Unreleased]
 
 ### Added
+- **Graded dispatch: a card's grade now selects the model.** `model_class` and
+  `sensitivity` map onto a skgateway bucket id (`sk-<class>-<sensitivity>`),
+  replacing the single static `autocode.config.harness_model`. Bucket ids are
+  validated against the gateway's exact grammar BEFORE being sent, because a
+  typo is not a loud error at the gateway: an id that fails the bucket regex is
+  still caught as `sk-*` and falls through to the difficulty classifier,
+  returning 200 from an arbitrary model with no sensitivity ceiling enforced. A
+  single typo would otherwise discard every sovereignty guarantee.
+- **A per-call model override seam** in the adapters, threaded like the existing
+  `light` flag. `ModelOverrideUnsupported` is raised rather than silently
+  dropping an override an adapter cannot honour, since dropping it would run on
+  the static model and discard the requested ceiling with no visible signal.
+  In the pi adapter a single `_effective_model()` feeds both the CLI argv and
+  the injected `models.json`, so the two cannot disagree about which model was
+  requested.
+- An ungraded card sends no override and behaves exactly as before. It never
+  constructs a bucket id, so it cannot address a trust zone at all. A *corrupt*
+  grade raises instead of degrading to None, because degrading would fall back
+  to the static model and silently drop the requested ceiling.
+
+### Added (earlier in this release)
 - **Joule work grading wired into `phase0_assess`.** A card is graded on three
   independent axes (`size`, `risk`, `sensitivity`) and the grade is written to
   the card via `skcoord.Board.set_grade`, so it is assigned once and not
