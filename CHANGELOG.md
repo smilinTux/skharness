@@ -10,6 +10,43 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 ## [Unreleased]
 
 ### Added
+- **Graded dispatch: a card's grade now selects the model.** `model_class` and
+  `sensitivity` map onto a skgateway bucket id (`sk-<class>-<sensitivity>`),
+  replacing the single static `autocode.config.harness_model`. Bucket ids are
+  validated against the gateway's exact grammar BEFORE being sent, because a
+  typo is not a loud error at the gateway: an id that fails the bucket regex is
+  still caught as `sk-*` and falls through to the difficulty classifier,
+  returning 200 from an arbitrary model with no sensitivity ceiling enforced. A
+  single typo would otherwise discard every sovereignty guarantee.
+- **A per-call model override seam** in the adapters, threaded like the existing
+  `light` flag. `ModelOverrideUnsupported` is raised rather than silently
+  dropping an override an adapter cannot honour, since dropping it would run on
+  the static model and discard the requested ceiling with no visible signal.
+  In the pi adapter a single `_effective_model()` feeds both the CLI argv and
+  the injected `models.json`, so the two cannot disagree about which model was
+  requested.
+- An ungraded card sends no override and behaves exactly as before. It never
+  constructs a bucket id, so it cannot address a trust zone at all. A *corrupt*
+  grade raises instead of degrading to None, because degrading would fall back
+  to the static model and silently drop the requested ceiling.
+
+### Added (earlier in this release)
+- **Joule work grading wired into `phase0_assess`.** A card is graded on three
+  independent axes (`size`, `risk`, `sensitivity`) and the grade is written to
+  the card via `skcoord.Board.set_grade`, so it is assigned once and not
+  recomputed per dispatch. Two runs of the same card route identically.
+- **`sensitivity.py`, a deterministic sensitivity classifier.** No model call.
+  Sensitivity is the one axis a model must not guess: a classifier that is 95%
+  right here is a credential leak 5% of the time. The model may propose a value
+  and the deterministic rules override it unconditionally, in both directions.
+  `public` is unreachable from the rules by design, because no keyword match can
+  support the claim "this payload could be posted publicly"; it requires an
+  explicit human override.
+- **`.gitguardian.yaml`** scoping the scanner off `sensitivity.py` only. That
+  file contains credential-shaped regexes because it is a detector, so the check
+  could never pass by any correct change. `gitleaks` still covers the path.
+
+### Added (pre-existing)
 - `secret-scan` CI gate running the **gitleaks binary** over the full history.
 - **`LICENSE` (GPL-3.0-or-later)** and a matching `license` field plus OSI
   classifier in `pyproject.toml`. The project previously declared no license at
@@ -24,6 +61,20 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   follow-up once the gate has run clean).
 
 ### Fixed
+- **The work-grade policy is now on autocode's hard-coded protected floor.**
+  `_ALWAYS_PROTECTED` covered `protected.py`, `engineering.py`, the fleet store,
+  `itil.py`, the manifest and the freeze file, but not `grading.py`,
+  `sensitivity.py`, `buckets.py`, the vendored grade vocabulary or the golden
+  set. Once a card's grade selects the model that executes it, the rubric IS
+  routing policy, so an engine routed by that rubric could edit it and merge the
+  change behind a twin gate whose CI arm it satisfies with tests it wrote
+  itself. This is the self-modification hazard CR-6.2 already ruled on for
+  skos/skharness, applied to the files that decide the routing. The floor is
+  hard-coded rather than manifest-driven because the realistic failure is not
+  that someone removes an entry, it is that nobody ever adds one. The golden-set
+  glob is versioned (`golden-set-*.json`) so promoting it to v2 does not drop it
+  off the floor at exactly the moment it stops being a consistency check and
+  becomes ground truth.
 - **`README.md` no longer claims the daemon has no write surface.** It asserted
   "There is NO write surface: no spawn, inject, kill, dispatch, rename, archive,
   or model switch" and cited `tests/test_daemon.py::test_no_write_surface` as

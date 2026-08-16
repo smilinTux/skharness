@@ -1,0 +1,24 @@
+# GitGuardian scoping. NOT a blanket exemption: exactly one path, for a reason
+# that cannot be fixed in the code.
+#
+# src/skharness/autocode/sensitivity.py is a secret DETECTOR. It contains regex
+# patterns that match credential shapes so a card pasting one is classified
+# `secret` and routed to sovereign hardware only:
+#
+#   -----BEGIN [A-Z ]*PRIVATE KEY-----      AKIA[0-9A-Z]{16}
+#   sk-(ant|proj|or)-[0-9A-Za-z_-]{16,}     eyJ...\....\....  (JWT)
+#   \d{6,10}:AA[0-9A-Za-z_-]{30,}           (Telegram bot token)
+#
+# Those are quantified regexes, not literal credentials, and they have to stay
+# literal to be reviewable: a reviewer must be able to see which shapes are
+# covered. So no legitimate change to that file makes this check pass, which
+# makes it an UNSATISFIABLE gate rather than a red one. A gate that cannot go
+# green by any correct action gets ignored, and then the ignoring generalises to
+# the next genuinely red finding in this repo. Scoping it is safer than leaving
+# it permanently red.
+#
+# The file is NOT unscanned. `gitleaks` covers the same path over full history
+# in the `secret-scan` job and passes today, so a real credential pasted here
+# still gets caught by a second, independent scanner. Reviewed 2026-08-16.
+paths-ignore:
+  - "src/skharness/autocode/sensitivity.py"
