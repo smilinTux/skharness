@@ -202,13 +202,37 @@ def test_parse_grade_is_total_for_non_string_input(raw):
     "card", _load_golden_set(), ids=lambda c: f"{c['n']:02d}-{c['id']}"
 )
 def test_golden_set_class_matches_hand_grading(card):
+    # No .lower() here on purpose. The golden set stores risk in the canonical
+    # lowercase enum, so normalising at read time would hide it drifting back
+    # to UPPERCASE. It carried that drift once: fed to a comparison rather
+    # than to set_grade(), an uppercase risk mismatches silently and 100% of
+    # the time, which reads as a catastrophically miscalibrated grader rather
+    # than as a format bug. test_golden_set_is_canonical guards the shape.
     raw = json.dumps(
-        {"size": card["size"], "risk": card["risk"].lower(), "sensitivity": "internal"}
+        {"size": card["size"], "risk": card["risk"], "sensitivity": "internal"}
     )
     grade = parse_grade(raw)
     assert grade is not None, f"card {card['n']} ({card['id']}) did not parse: {raw!r}"
     got = model_class_for(grade["size"], grade["risk"])
-    assert got == card["class"], f"card {card['n']} ({card['id']}): {card['why']}"
+    assert got == card["model_class"], f"card {card['n']} ({card['id']}): {card['why']}"
+
+
+def test_golden_set_is_canonical():
+    """The golden set must speak the canonical vocabulary verbatim.
+
+    It is compared against grader output, so any key or casing difference
+    shows up as a grading disagreement rather than as the format mismatch it
+    actually is.
+    """
+    for card in _load_golden_set():
+        assert card["risk"] in VOCABULARY["risk"]["values"], (
+            f"card {card['n']}: risk {card['risk']!r} is not canonical"
+        )
+        assert card["size"] in VOCABULARY["size"]["values"], (
+            f"card {card['n']}: size {card['size']!r} is not canonical"
+        )
+        assert "model_class" in card, f"card {card['n']}: uses a non-canonical class key"
+        assert "class" not in card, f"card {card['n']}: legacy 'class' key returned"
 
 
 def test_golden_set_has_42_cards():
