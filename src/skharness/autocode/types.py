@@ -137,6 +137,9 @@ class Verdict:                        # Phase 0 assess output
     updated_acceptance: list[str] | None = None
     subtasks: list[dict] | None = None      # decompose payload: [{title, description, acceptance}]
     concreteness: float | None = None       # grounding score that drove the gate (audit)
+    size: str | None = None  # grade axis: S|M|L|XL (shadow only, P1)
+    risk: str | None = None  # grade axis: low|med|high|crit (shadow only, P1)
+    sensitivity: str | None = None  # axis: public|internal|secret (shadow, P1)
 
 
 @dataclass

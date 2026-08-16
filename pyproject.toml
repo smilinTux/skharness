@@ -29,7 +29,7 @@ where = ["src"]
 # data); they are shipped in sdists via MANIFEST.in. The autocode engine and its
 # adapters are pure-Python subpackages discovered by find above.
 [tool.setuptools.package-data]
-skharness = ["client/*.html"]
+skharness = ["client/*.html", "autocode/data/*.json"]
 
 [tool.ruff]
 line-length = 99
