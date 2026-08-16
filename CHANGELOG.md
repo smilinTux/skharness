@@ -10,6 +10,22 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 ## [Unreleased]
 
 ### Added
+- **Joule work grading wired into `phase0_assess`.** A card is graded on three
+  independent axes (`size`, `risk`, `sensitivity`) and the grade is written to
+  the card via `skcoord.Board.set_grade`, so it is assigned once and not
+  recomputed per dispatch. Two runs of the same card route identically.
+- **`sensitivity.py`, a deterministic sensitivity classifier.** No model call.
+  Sensitivity is the one axis a model must not guess: a classifier that is 95%
+  right here is a credential leak 5% of the time. The model may propose a value
+  and the deterministic rules override it unconditionally, in both directions.
+  `public` is unreachable from the rules by design, because no keyword match can
+  support the claim "this payload could be posted publicly"; it requires an
+  explicit human override.
+- **`.gitguardian.yaml`** scoping the scanner off `sensitivity.py` only. That
+  file contains credential-shaped regexes because it is a detector, so the check
+  could never pass by any correct change. `gitleaks` still covers the path.
+
+### Added (pre-existing)
 - `secret-scan` CI gate running the **gitleaks binary** over the full history.
 - **`LICENSE` (GPL-3.0-or-later)** and a matching `license` field plus OSI
   classifier in `pyproject.toml`. The project previously declared no license at

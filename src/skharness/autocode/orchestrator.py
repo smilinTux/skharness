@@ -18,8 +18,32 @@ from .types import (WorkItem, AssessBrief, DecisionItem, QualityMode, Verdict,
                     QUALITY_RANK, coerce_quality, ClaimRaced)
 from .executor import EXECUTORS
 from .config import Caps, Config
+from .grading import VOCABULARY, model_class_for
 from .harness import build_harness
+from .sensitivity import classify_sensitivity
 from . import fleet_dispatch, health, journal
+
+#: rubric_version stamped on every grade written. Paired with grader_model it is
+#: the ONLY way to detect grade drift after the fact: without both, a board of
+#: grades is a board of unattributable numbers.
+RUBRIC_VERSION: int = int(VOCABULARY.get("version", 1))
+
+#: PINNED sovereign grader model, used when the harness does not report its own.
+#:
+#: Deliberately NOT ``sk-default``. That alias was repointed twice in two days,
+#: most recently onto a 9B, with no announcement; a grade stamped `sk-default`
+#: records nothing about what actually graded the card. Classification against a
+#: written rubric is a fixed class M task whatever it grades, so the grader does
+#: not need to scale with the work and can be pinned once.
+GRADER_MODEL: str = "ornith-big"
+
+#: A model id is accepted as sovereign only if it names the local ornith family.
+#: The grader reads RAW card text, and card descriptions on this board really do
+#: carry pasted credentials, so the grader must run sovereign-only regardless of
+#: the graded card's own sensitivity. An alias that has silently failed over to a
+#: cloud backend before (`sk-default`) is not evidence of anything, so the check
+#: is an allowlist of concrete local ids rather than a denylist.
+_SOVEREIGN_GRADER_PREFIXES: tuple[str, ...] = ("ornith",)
 
 
 @dataclass
@@ -181,8 +205,103 @@ def classify_kind(task: dict, config=None) -> str:
                                                             "engineering")
 
 
+def grader_model_for(harness) -> str:
+    """The model id to STAMP on a grade: what actually graded, else the pin.
+
+    A harness that reports its model is recorded truthfully, because the stamp
+    only has value if it names the real grader. When it reports nothing usable,
+    the pinned sovereign id is recorded instead.
+    """
+    for attr in ("grader_model", "model"):
+        value = getattr(harness, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return GRADER_MODEL
+
+
+def is_sovereign_grader(model: str) -> bool:
+    """True when `model` names a local, sovereign grader (see the prefix list)."""
+    name = (model or "").strip().lower()
+    return any(name.startswith(p) for p in _SOVEREIGN_GRADER_PREFIXES)
+
+
+def work_grade_for(task: dict, verdict) -> dict | None:
+    """The complete work grade for a card, or None when it cannot be produced.
+
+    PINNED payload contract, consumed by the dispatch side:
+      None, or exactly {"size", "risk", "sensitivity", "model_class"} with str
+      values. NEVER a partial dict, so a consumer never has to reason about a
+      half-present grade.
+
+    An ungraded card is INELIGIBLE, not pessimistically graded: no default is
+    invented for a missing axis, because a synthetic value is indistinguishable
+    from a measured one once it is on the card.
+
+    `sensitivity` is always the deterministic rule verdict over the FULL card
+    (this is the pass that sees `meta.sensitivity_override`); the model never gets
+    a vote on the data-exposure axis. `model_class` is derived, never supplied.
+    """
+    size = getattr(verdict, "size", None)
+    risk = getattr(verdict, "risk", None)
+    if not size or not risk:
+        return None
+    try:
+        sensitivity, _reasons = classify_sensitivity(task)
+        model_class = model_class_for(size, risk)
+    except Exception as exc:
+        # An invalid meta.sensitivity_override lands here. Refusing to write is
+        # the right answer: the operator's marking is malformed, so no grade is
+        # better than a rule verdict they did not ask for. Recorded, not silent.
+        health.record("grade_skipped", task=task.get("id"), error=type(exc).__name__,
+                      detail=str(exc)[:200])
+        return None
+    return {"size": size, "risk": risk, "sensitivity": sensitivity,
+            "model_class": model_class}
+
+
+def _write_grade(board, task_id: str, grade: dict, *, harness, run_id: str) -> bool:
+    """Write a work grade onto the card via Board.set_grade. True when written.
+
+    joule_estimate and joule_bounty are deliberately left None. There is exactly
+    one real energy measurement in existence and no model of tokens-per-card, so
+    any number written now is a guess that a treasury would later settle against
+    as authoritative. set_grade omits them when None.
+
+    confidence is left None for the same reason: this grader has no calibration
+    data, and a plausible-looking 0.8 would be read downstream as measured.
+    """
+    grader_model = grader_model_for(harness)
+    if not is_sovereign_grader(grader_model):
+        # The grader reads raw card text, which on this board carries pasted
+        # credentials. A non-sovereign grader means that text already went
+        # somewhere it should not have, so the card is left UNGRADED rather than
+        # stamped with a grade whose provenance is a third party.
+        health.record("grade_refused_nonsovereign", task=task_id, grader_model=grader_model)
+        return False
+    if not hasattr(board, "set_grade"):
+        health.record("grade_unsupported_board", task=task_id)
+        return False
+    pool = "public" if grade["sensitivity"] == "public" else "private"
+    try:
+        board.set_grade(task_id, size=grade["size"], risk=grade["risk"],
+                        sensitivity=grade["sensitivity"],
+                        joule_estimate=None, joule_bounty=None,
+                        graded_by=fleet_dispatch.claim_agent_name(),
+                        grader_model=grader_model, rubric_version=RUBRIC_VERSION,
+                        confidence=None, pool=pool)
+    except Exception as exc:
+        # One card failing to persist must not end the assess pass for the board.
+        health.record("grade_write_failed", task=task_id, error=type(exc).__name__,
+                      detail=str(exc)[:200])
+        return False
+    health.record("grade_written", task=task_id, run_id=run_id,
+                  model_class=grade["model_class"], sensitivity=grade["sensitivity"],
+                  grader_model=grader_model, rubric_version=RUBRIC_VERSION)
+    return True
+
+
 def _to_workitem(task: dict, *, unblocked: bool = True, verdict: str = "valid",
-                 config=None) -> WorkItem:
+                 config=None, work_grade: dict | None = None) -> WorkItem:
     """Build a WorkItem, enriching the payload with the phase-0 facts the executor's
     selectable/run contract reads (unblocked, verdict) and mapping coord's
     acceptance_criteria onto the `acceptance` key the executor expects.
@@ -190,12 +309,40 @@ def _to_workitem(task: dict, *, unblocked: bool = True, verdict: str = "valid",
     Normalization happens here exactly once (toggle spec 2.2): the resolved
     QualityMode (tag > default > gated, then raised to the repo floor) is written
     into `payload["quality"]`, and `classify_kind` reads the same chain to pick the
-    executor kind. Downstream code reads only the normalized value."""
+    executor kind. Downstream code reads only the normalized value.
+
+    `payload["work_grade"]` carries the Joule Economy grade of the WORK, which is
+    a different thing from `harness.grade(...)`, the 1-5 twin-gate score of
+    produced OUTPUT. It is either None (ungraded, therefore ineligible under
+    enforcement) or the complete four-key dict; never partial. It is read from the
+    card's stored grade when the caller does not pass a freshly computed one, so
+    two dispatches of the same card route identically."""
+    if work_grade is None:
+        work_grade = stored_work_grade(task)
     payload = {**task, "unblocked": unblocked, "verdict": verdict,
                "acceptance": task.get("acceptance_criteria") or task.get("acceptance") or [],
-               "quality": resolve_quality(task, config).value}
+               "quality": resolve_quality(task, config).value,
+               "work_grade": work_grade}
     return WorkItem(kind=classify_kind(task, config), ref=task["id"],
                     source=task.get("source", "coord"), repo=repo_tag(task), payload=payload)
+
+
+def stored_work_grade(task: dict) -> dict | None:
+    """The grade already ON the card at meta.grade, in the payload contract shape.
+
+    The grade is a property of the WORK, assigned once and stored, never
+    recomputed per dispatch: recomputing would let two runs of the same card route
+    to different model classes. Returns None unless all four keys are present, so
+    a half-written meta.grade reads as ungraded rather than as a partial dict.
+    """
+    meta = task.get("meta")
+    grade = meta.get("grade") if isinstance(meta, dict) else None
+    if not isinstance(grade, dict):
+        return None
+    out = {k: grade.get(k) for k in ("size", "risk", "sensitivity", "model_class")}
+    if any(not isinstance(v, str) or not v for v in out.values()):
+        return None
+    return out
 
 
 def deepdive_spawn(board, proposals, *, caps: Caps, run_id: str,
@@ -473,13 +620,22 @@ def phase0_assess(*, board, harness, tasks_dir, caps: Caps, run_id: str,
                                f"(concreteness={gr.concreteness:.2f}); split into "
                                f"buildable subtasks",
                         concreteness=gr.concreteness)
+        # Joule Economy work grade. Computed once here, written to the card, and
+        # carried into the WorkItem payload. A card whose grade cannot be produced
+        # simply carries none: absent stays distinguishable from graded, and no
+        # synthetic value is left for a downstream consumer to reason about.
+        # A card being closed as obsolete, or parked as a decomposed parent, is
+        # not work anyone will dispatch, so it is not worth a write.
+        wg = work_grade_for(t, v)
+        if wg is not None and not dry_run and v.verdict in ("valid", "stale", "needs_decision"):
+            _write_grade(board, tid, wg, harness=harness, run_id=run_id)
         if v.verdict == "valid":
-            candidates.append(_to_workitem(t, verdict="valid", config=config))
+            candidates.append(_to_workitem(t, verdict="valid", config=config, work_grade=wg))
         elif v.verdict == "stale":
             if not dry_run:
                 board.update_task(tid, description=v.updated_description,
                                   acceptance_criteria=v.updated_acceptance, run_id=run_id)
-            candidates.append(_to_workitem(t, verdict="stale", config=config))
+            candidates.append(_to_workitem(t, verdict="stale", config=config, work_grade=wg))
         elif v.verdict == "obsolete":
             if not dry_run:
                 board.close_task_obsolete(tid, v.reason, run_id=run_id)

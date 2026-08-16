@@ -6,9 +6,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from skharness.autocode import orchestrator as orch
+from skharness.autocode.adapters.base import BaseCliAdapter
 from skharness.autocode.executor import EXECUTORS
+from skharness.autocode.grading import GRADE_RUBRIC
 from skharness.autocode.orchestrator import Caps, CapLedger, kill_switch_active, stable_qid
-from skharness.autocode.types import Verdict, WorkItem, GateResult, DecisionItem
+from skharness.autocode.sandbox import AuthMount, Sandbox
+from skharness.autocode.types import AssessBrief, Verdict, WorkItem, GateResult, DecisionItem
 from skharness.autocode.grounding import Grounding as _Grounding
 
 
@@ -910,3 +913,385 @@ def test_swarm_runs_items_concurrently_when_max_concurrent_gt_1(clean_execs, fak
     assert len(state) == 4 and all(v["state"] == "finalized" for v in state.values())
     assert active["max"] >= 2, "no real concurrency observed"
     assert elapsed < 0.9, f"ran serially ({elapsed:.2f}s for 4x0.3s)"
+
+
+# ---------------------------------------------------------------------------
+# Joule Economy work grade: assess -> card -> WorkItem payload
+#
+# Naming note: `work_grade` throughout. `harness.grade(...)` in this repo is the
+# 1-5 twin-gate score of PRODUCED OUTPUT; the Joule grade is a property of the
+# WORK, assigned before any work happens. They are different things and must not
+# share a name.
+# ---------------------------------------------------------------------------
+
+
+def _graded_verdict(verdict="valid", size="M", risk="high", sensitivity="internal"):
+    return Verdict(verdict=verdict, reason="", size=size, risk=risk,
+                   sensitivity=sensitivity)
+
+
+def _grade_kwargs(board):
+    board.set_grade.assert_called_once()
+    call = board.set_grade.call_args
+    return call.args, call.kwargs
+
+
+def test_phase0_writes_the_work_grade_to_the_card(tmp_path):
+    _write_task(tmp_path, "t-1", tags=["repo:skos"], acceptance_criteria=["w"])
+    board = _board(["t-1"])
+    harness = MagicMock()
+    harness.assess.return_value = _graded_verdict(size="M", risk="high")
+    orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                       caps=Caps(), run_id="r1")
+    args, kw = _grade_kwargs(board)
+    assert args == ("t-1",)
+    assert kw["size"] == "M" and kw["risk"] == "high"
+    assert kw["sensitivity"] == "internal"
+    assert kw["rubric_version"] == orch.RUBRIC_VERSION
+    assert kw["grader_model"] == orch.GRADER_MODEL
+    assert kw["graded_by"]
+
+
+def test_model_class_is_derived_by_the_board_never_supplied(tmp_path):
+    """set_grade derives model_class itself; a caller supplying one could
+    contradict the max(size_rank, risk_rank) rule the whole economy is built on."""
+    _write_task(tmp_path, "t-1", tags=["repo:skos"])
+    board = _board(["t-1"])
+    harness = MagicMock()
+    harness.assess.return_value = _graded_verdict(size="S", risk="high")
+    orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                       caps=Caps(), run_id="r1")
+    _, kw = _grade_kwargs(board)
+    assert "model_class" not in kw
+
+
+def test_no_joule_numbers_are_invented(tmp_path):
+    """There is one real energy measurement in existence and no tokens-per-card
+    model, so any number here is a guess a treasury would later settle against as
+    if it were authoritative. Both stay None."""
+    _write_task(tmp_path, "t-1", tags=["repo:skos"])
+    board = _board(["t-1"])
+    harness = MagicMock()
+    harness.assess.return_value = _graded_verdict()
+    orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                       caps=Caps(), run_id="r1")
+    _, kw = _grade_kwargs(board)
+    assert kw["joule_estimate"] is None and kw["joule_bounty"] is None
+    assert kw["confidence"] is None
+
+
+def test_phase0_dry_run_writes_no_grade(tmp_path):
+    _write_task(tmp_path, "t-1", tags=["repo:skos"])
+    board = _board(["t-1"])
+    harness = MagicMock()
+    harness.assess.return_value = _graded_verdict()
+    cands, _ = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                                  caps=Caps(), run_id="r1", dry_run=True)
+    board.set_grade.assert_not_called()
+    # the grade is still computed and carried, so a dry run SHOWS what it would do
+    assert cands[0].payload["work_grade"]["size"] == "M"
+
+
+def test_ungraded_card_is_ineligible_not_pessimistically_graded(tmp_path):
+    """An unparseable grade reply degrades ONE card to ungraded and never raises.
+
+    Nothing is written, so `absent` stays distinguishable from `graded` and there
+    is no synthetic value for a downstream consumer to reason about. In
+    particular risk is NOT defaulted: `crit` routes to a human by spec, so a
+    pessimistic default would empty the board into one person's queue.
+    """
+    _write_task(tmp_path, "t-1", tags=["repo:skos"])
+    board = _board(["t-1"])
+    harness = MagicMock()
+    harness.assess.return_value = Verdict(verdict="valid", reason="")   # no axes
+    cands, _ = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                                  caps=Caps(), run_id="r1")
+    board.set_grade.assert_not_called()
+    assert len(cands) == 1                       # the card still went through
+    assert cands[0].payload["work_grade"] is None
+
+
+def test_one_bad_grade_does_not_stop_the_assess_pass(tmp_path):
+    for tid in ("t-1", "t-2", "t-3"):
+        _write_task(tmp_path, tid, tags=["repo:skos"])
+    board = _board(["t-1", "t-2", "t-3"])
+    harness = MagicMock()
+    harness.assess.side_effect = [
+        _graded_verdict(size="S", risk="low"),
+        Verdict(verdict="valid", reason="", size="not-a-size", risk="low"),
+        _graded_verdict(size="L", risk="med"),
+    ]
+    cands, _ = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                                  caps=Caps(), run_id="r1")
+    assert len(cands) == 3
+    graded = {c.ref: c.payload["work_grade"] for c in cands}
+    assert graded["t-2"] is None                 # only the bad one degraded
+    assert graded["t-1"]["model_class"] == "S" and graded["t-3"]["model_class"] == "L"
+    assert board.set_grade.call_count == 2
+
+
+def test_obsolete_card_is_not_graded(tmp_path):
+    _write_task(tmp_path, "t-1", tags=["repo:skos"])
+    board = _board(["t-1"])
+    harness = MagicMock()
+    harness.assess.return_value = _graded_verdict(verdict="obsolete")
+    orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                       caps=Caps(), run_id="r1")
+    board.set_grade.assert_not_called()
+
+
+# -- the payload contract a sibling depends on exactly --------------------------
+
+def test_work_grade_payload_contract_is_none_or_complete(tmp_path):
+    _write_task(tmp_path, "t-1", tags=["repo:skos"])
+    board = _board(["t-1"])
+    harness = MagicMock()
+    harness.assess.return_value = _graded_verdict(size="XL", risk="low")
+    cands, _ = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                                  caps=Caps(), run_id="r1")
+    wg = cands[0].payload["work_grade"]
+    assert set(wg) == {"size", "risk", "sensitivity", "model_class"}
+    assert all(isinstance(v, str) and v for v in wg.values())
+    assert wg["model_class"] == "XL"
+
+
+@pytest.mark.parametrize("size,risk", [("M", None), (None, "high"), (None, None),
+                                       ("", "high"), ("M", "")])
+def test_work_grade_is_never_a_partial_dict(size, risk):
+    """A half-present grade is worse than none: a consumer would have to invent
+    the missing axis to use it, which is the synthetic value we are refusing."""
+    task = {"id": "t-1", "title": "t"}
+    assert orch.work_grade_for(task, Verdict(verdict="valid", reason="",
+                                             size=size, risk=risk)) is None
+
+
+def test_grade_is_read_from_the_card_not_recomputed_per_dispatch(tmp_path):
+    """Two dispatches of the same card must route identically, so the payload
+    reads the STORED grade rather than grading again."""
+    task = {"id": "t-1", "title": "t", "tags": ["repo:skos"],
+            "meta": {"grade": {"size": "L", "risk": "med", "sensitivity": "internal",
+                               "model_class": "L", "grader_model": "ornith-big"}}}
+    first = orch._to_workitem(task)
+    second = orch._to_workitem(task)
+    assert first.payload["work_grade"] == second.payload["work_grade"]
+    assert first.payload["work_grade"] == {"size": "L", "risk": "med",
+                                           "sensitivity": "internal", "model_class": "L"}
+
+
+def test_half_written_card_grade_reads_as_ungraded(tmp_path):
+    task = {"id": "t-1", "title": "t", "meta": {"grade": {"size": "L", "risk": "med"}}}
+    assert orch._to_workitem(task).payload["work_grade"] is None
+    assert orch.stored_work_grade({"id": "x"}) is None
+    assert orch.stored_work_grade({"id": "x", "meta": {"grade": "nope"}}) is None
+
+
+# -- sensitivity is deterministic, and unbypassable -----------------------------
+
+def test_the_models_sensitivity_never_reaches_the_card(tmp_path):
+    """NEGATIVE CONTROL. The model claims `public` on a capauth card.
+
+    The deterministic rules decide this axis unconditionally, so the write must
+    say `secret`. This test fails the moment anything lets the model's proposal
+    through.
+    """
+    _write_task(tmp_path, "t-1", title="fix a typo in a capauth docstring",
+                tags=["repo:capauth"])
+    board = _board(["t-1"])
+    harness = MagicMock()
+    harness.assess.return_value = _graded_verdict(size="S", risk="low",
+                                                  sensitivity="public")
+    cands, _ = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                                  caps=Caps(), run_id="r1")
+    _, kw = _grade_kwargs(board)
+    assert kw["sensitivity"] == "secret"
+    assert cands[0].payload["work_grade"]["sensitivity"] == "secret"
+    assert kw["pool"] == "private"
+
+
+def test_the_models_sensitivity_is_overridden_in_both_directions(tmp_path):
+    """Not just "always stricter": the rules REPLACE the model's answer. Here the
+    model over-classifies a benign card and the rules bring it back to internal,
+    which a merely-take-the-max implementation would fail."""
+    _write_task(tmp_path, "t-1", title="bump the ruff pin", tags=["repo:skos"])
+    board = _board(["t-1"])
+    harness = MagicMock()
+    harness.assess.return_value = _graded_verdict(size="S", risk="low",
+                                                  sensitivity="secret")
+    orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                       caps=Caps(), run_id="r1")
+    _, kw = _grade_kwargs(board)
+    assert kw["sensitivity"] == "internal"
+
+
+def test_human_override_on_the_card_is_honored(tmp_path):
+    _write_task(tmp_path, "t-1", title="publish the release notes", tags=["repo:skos"],
+                meta={"sensitivity_override": "public"})
+    board = _board(["t-1"])
+    harness = MagicMock()
+    harness.assess.return_value = _graded_verdict(size="S", risk="low")
+    orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                       caps=Caps(), run_id="r1")
+    _, kw = _grade_kwargs(board)
+    assert kw["sensitivity"] == "public" and kw["pool"] == "public"
+
+
+def test_invalid_human_override_leaves_the_card_ungraded_without_raising(tmp_path):
+    _write_task(tmp_path, "t-1", tags=["repo:skos"], meta={"sensitivity_override": "publik"})
+    board = _board(["t-1"])
+    harness = MagicMock()
+    harness.assess.return_value = _graded_verdict()
+    cands, _ = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                                  caps=Caps(), run_id="r1")
+    board.set_grade.assert_not_called()
+    assert cands[0].payload["work_grade"] is None
+
+
+# -- the grader itself must be sovereign ---------------------------------------
+
+def test_grade_is_refused_when_the_grader_is_not_sovereign(tmp_path):
+    """The grader reads RAW card text, and card descriptions on this board carry
+    pasted credentials. A cloud grader means that text already left the fleet, so
+    the card is left ungraded rather than stamped with third-party provenance."""
+    _write_task(tmp_path, "t-1", tags=["repo:skos"])
+    board = _board(["t-1"])
+    harness = MagicMock()
+    harness.model = "sonnet"
+    harness.grader_model = None
+    harness.assess.return_value = _graded_verdict()
+    orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                       caps=Caps(), run_id="r1")
+    board.set_grade.assert_not_called()
+
+
+def test_sk_default_is_not_accepted_as_a_sovereign_grader():
+    """sk-default was repointed twice in two days, most recently onto a 9B, with
+    no announcement, and has silently failed over to cloud before. A grade
+    stamped with it records nothing."""
+    assert orch.is_sovereign_grader("sk-default") is False
+    assert orch.is_sovereign_grader("sonnet") is False
+    assert orch.is_sovereign_grader("") is False
+    assert orch.is_sovereign_grader(orch.GRADER_MODEL) is True
+    assert orch.is_sovereign_grader("ornith-1.0-35b") is True
+
+
+def test_grader_model_stamped_is_the_one_that_actually_graded():
+    assert orch.grader_model_for(SimpleNamespace(model="ornith-1.0-35b")) == "ornith-1.0-35b"
+    assert orch.grader_model_for(SimpleNamespace()) == orch.GRADER_MODEL
+    assert orch.grader_model_for(MagicMock()) == orch.GRADER_MODEL   # Mock is not a str
+
+
+def test_a_board_without_set_grade_does_not_break_the_pass(tmp_path):
+    _write_task(tmp_path, "t-1", tags=["repo:skos"])
+    board = _board(["t-1"])
+    del board.set_grade
+    harness = MagicMock()
+    harness.assess.return_value = _graded_verdict()
+    cands, _ = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                                  caps=Caps(), run_id="r1")
+    assert len(cands) == 1
+
+
+def test_a_failing_set_grade_does_not_stop_the_board(tmp_path):
+    for tid in ("t-1", "t-2"):
+        _write_task(tmp_path, tid, tags=["repo:skos"])
+    board = _board(["t-1", "t-2"])
+    board.set_grade.side_effect = RuntimeError("disk full")
+    harness = MagicMock()
+    harness.assess.return_value = _graded_verdict()
+    cands, _ = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                                  caps=Caps(), run_id="r1")
+    assert len(cands) == 2 and board.set_grade.call_count == 2
+
+
+# -- the assess() end of the wire ----------------------------------------------
+
+class _GradeFake(BaseCliAdapter):
+    """Minimal concrete adapter; only assess() is exercised here."""
+    name = "gradefake"
+    def _argv(self, prompt, light=False): return ["fake", prompt]
+    def _image(self): return "sandbox-fake:1"
+    def _auth_mounts(self): return [AuthMount("/h/.cred", "/c/.cred")]
+    def _auth_env(self): return {}
+    def _parse(self, raw): return raw
+    def capabilities(self): return {}
+
+
+def _assess_adapter(monkeypatch, reply, seen=None):
+    a = _GradeFake(Sandbox(live_execution=False))
+
+    def _fake_run(instruction, data, **kw):
+        if seen is not None:
+            seen["instruction"] = instruction
+        return reply
+
+    monkeypatch.setattr(a, "_run", _fake_run)
+    return a
+
+
+def _abrief(**kw):
+    base = dict(task_id="t-1", title="t", description="d", acceptance=[], tags=[],
+                repo=None, codebase_context="")
+    base.update(kw)
+    return AssessBrief(**base)
+
+
+def test_assess_prompt_carries_the_grade_rubric(monkeypatch):
+    seen = {}
+    a = _assess_adapter(monkeypatch, {"verdict": "valid", "reason": "ok"}, seen)
+    a.assess(_abrief())
+    assert GRADE_RUBRIC in seen["instruction"]
+    assert "SECOND TASK" in seen["instruction"]
+
+
+def test_assess_populates_the_grade_axes_from_the_reply(monkeypatch):
+    a = _assess_adapter(monkeypatch, {"verdict": "valid", "reason": "ok",
+                                      "size": "L", "risk": "med",
+                                      "sensitivity": "internal"})
+    v = a.assess(_abrief())
+    assert (v.size, v.risk) == ("L", "med")
+
+
+def test_assess_discards_the_models_sensitivity(monkeypatch):
+    """The model says `public` on a capauth card. The Verdict says secret.
+
+    There is no code path in assess in which a model-chosen data-exposure label
+    reaches a Verdict; the deterministic pass runs unconditionally.
+    """
+    a = _assess_adapter(monkeypatch, {"verdict": "valid", "reason": "ok",
+                                      "size": "S", "risk": "low",
+                                      "sensitivity": "public"})
+    v = a.assess(_abrief(title="tiny typo fix", tags=["repo:capauth"]))
+    assert v.sensitivity == "secret"
+
+
+def test_assess_discards_an_over_classified_model_sensitivity(monkeypatch):
+    a = _assess_adapter(monkeypatch, {"verdict": "valid", "reason": "ok",
+                                      "size": "S", "risk": "low",
+                                      "sensitivity": "secret"})
+    v = a.assess(_abrief(title="bump the ruff pin", tags=["repo:skos"]))
+    assert v.sensitivity == "internal"
+
+
+@pytest.mark.parametrize("reply", [
+    {"verdict": "valid", "reason": "ok"},                              # no axes
+    {"verdict": "valid", "reason": "ok", "size": "M"},                 # partial
+    {"verdict": "valid", "reason": "ok", "size": "M", "risk": "XL",
+     "sensitivity": "internal"},                                       # risk reuses a size
+    {"verdict": "valid", "reason": "ok", "size": "huge", "risk": "low",
+     "sensitivity": "internal"},                                       # bad size
+])
+def test_assess_unparseable_grade_degrades_one_card_not_the_pass(monkeypatch, reply):
+    a = _assess_adapter(monkeypatch, reply)
+    v = a.assess(_abrief())
+    assert v.verdict == "valid"                  # the assess itself still worked
+    assert v.size is None and v.risk is None     # no invented default
+    assert v.sensitivity == "internal"           # the deterministic axis still ran
+
+
+def test_assess_grades_even_on_the_fail_open_path(monkeypatch):
+    """An inconclusive verdict still fails open to `valid`, and that Verdict
+    carries the grade rather than silently losing it."""
+    a = _assess_adapter(monkeypatch, {"reason": "?", "size": "M", "risk": "crit",
+                                      "sensitivity": "internal"})
+    v = a.assess(_abrief())
+    assert v.verdict == "valid" and (v.size, v.risk) == ("M", "crit")
