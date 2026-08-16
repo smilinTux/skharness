@@ -50,6 +50,38 @@ def test_rubric_has_no_em_or_en_dashes():
 
 
 # ---------------------------------------------------------------------------
+# Vocabulary drift guard: literal assertions against the vendored copy, so a
+# widened or renamed enum fails loudly here instead of silently disagreeing
+# with the canonical skcapstone file it was copied from (mirrors skgateway's
+# tests/grade-vocabulary.test.mjs).
+# ---------------------------------------------------------------------------
+
+
+def test_size_values_are_exactly_s_m_l_xl():
+    assert list(VOCABULARY["size"]["values"]) == ["S", "M", "L", "XL"]
+
+
+def test_risk_values_are_exactly_low_med_high_crit():
+    assert list(VOCABULARY["risk"]["values"]) == ["low", "med", "high", "crit"]
+
+
+def test_sensitivity_values_are_exactly_public_internal_secret():
+    assert list(VOCABULARY["sensitivity"]["values"]) == ["public", "internal", "secret"]
+
+
+def test_no_risk_value_collides_with_a_size_label_in_any_case_form():
+    size_labels = {v.upper() for v in VOCABULARY["size"]["values"]}
+    for risk_value in VOCABULARY["risk"]["values"]:
+        assert risk_value.upper() not in size_labels, risk_value
+
+
+def test_size_and_risk_ranks_both_span_0_to_3():
+    # This is what makes max(size_rank, risk_rank) a valid index into CLASS.
+    assert sorted(VOCABULARY["size"]["ranks"].values()) == [0, 1, 2, 3]
+    assert sorted(VOCABULARY["risk"]["ranks"].values()) == [0, 1, 2, 3]
+
+
+# ---------------------------------------------------------------------------
 # model_class_for: worked examples from the vocabulary
 # ---------------------------------------------------------------------------
 
@@ -139,6 +171,25 @@ def test_parse_grade_returns_none_when_a_value_is_invalid():
 def test_parse_grade_unwraps_a_nested_grade_key():
     raw = '{"reasoning": "...", "grade": {"size": "M", "risk": "low", "sensitivity": "public"}}'
     assert parse_grade(raw) == {"size": "M", "risk": "low", "sensitivity": "public"}
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        12345,
+        3.14,
+        {"size": "M"},
+        {"size": "M", "risk": "high", "sensitivity": "internal"},
+        ["size", "M"],
+        b'{"size":"M","risk":"high","sensitivity":"internal"}',
+        True,
+    ],
+    ids=["int", "float", "dict-partial", "dict-full", "list", "bytes", "bool"],
+)
+def test_parse_grade_is_total_for_non_string_input(raw):
+    """A provider handing back a pre-parsed body must degrade one card to
+    ungraded, never raise and take down the whole assess pass (finding 1)."""
+    assert parse_grade(raw) is None
 
 
 # ---------------------------------------------------------------------------

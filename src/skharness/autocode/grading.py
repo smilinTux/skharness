@@ -129,7 +129,7 @@ def _select_grade_source(obj: Any) -> dict | None:
     return None
 
 
-def parse_grade(raw: str) -> dict | None:
+def parse_grade(raw: Any) -> dict | None:
     """Pull size, risk, sensitivity out of a model's grading reply.
 
     Tolerates markdown fences and surrounding prose. Validates every value against
@@ -137,8 +137,16 @@ def parse_grade(raw: str) -> dict | None:
     when the reply is unusable or any field is missing or invalid. risk NEVER
     accepts an S/M/L/XL size label; that is enforced here by validating against
     the risk enum only, which does not contain them.
+
+    Total: this only ever reads a str. A provider that hands back a pre-parsed
+    dict, a list, bytes, a number, or None is not special-cased here (it would
+    need its own decode/validate path to do so safely), so any non-str input
+    returns None outright rather than raising. Raising would stop assess for
+    every card in the run; None degrades exactly the one card to ungraded.
     """
-    if not raw or not raw.strip():
+    if not isinstance(raw, str):
+        return None
+    if not raw.strip():
         return None
     for candidate in _candidate_texts(raw):
         obj = _try_parse_object(candidate)
