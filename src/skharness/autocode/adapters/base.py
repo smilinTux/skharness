@@ -11,12 +11,67 @@ from skharness.harness import Harness
 
 from .. import health
 from ..claude_code import frame
+from ..grading import GRADE_RUBRIC, parse_grade
 from ..sandbox import LaunchSpec
+from ..sensitivity import classify_sensitivity
 from ..types import (AssessBrief, GateResult, GradeBrief, HarnessResult,
                      TaskBrief, Verdict)
 
 #: The verdicts assess may legitimately return; anything else is "inconclusive".
 _ASSESS_VERDICTS = ("valid", "stale", "obsolete", "needs_decision", "decompose")
+
+
+def _brief_as_card(brief: AssessBrief) -> dict:
+    """The card-shaped dict the deterministic sensitivity rules read.
+
+    AssessBrief is the same free text the rules classify on (title, description,
+    acceptance, tags, repo). It carries no ``meta``, so a human override set on
+    the card is not visible here; the orchestrator re-runs the rules against the
+    full card before it writes, and that pass is the authoritative one. Both
+    passes are deterministic, so they only ever differ when an override exists.
+    """
+    return {"title": getattr(brief, "title", "") or "",
+            "description": getattr(brief, "description", "") or "",
+            "acceptance": getattr(brief, "acceptance", None) or [],
+            "tags": getattr(brief, "tags", None) or [],
+            "repo": getattr(brief, "repo", None) or ""}
+
+
+def _grade_axes(out, brief: AssessBrief) -> tuple[str | None, str | None, str | None]:
+    """(size, risk, sensitivity) for the Verdict this assess call will return.
+
+    size and risk come from the model reply and are None when it is unparseable:
+    an ungraded card is INELIGIBLE, never pessimistically graded. There is no
+    default here on purpose. A synthetic grade would be indistinguishable from a
+    real one downstream, and defaulting risk would default it to something; a
+    pessimistic `crit` routes to a human by spec, so a bad default would empty the
+    whole board into one person's queue.
+
+    sensitivity is NEVER the model's answer. It is always the deterministic rule
+    verdict, computed here from the brief text, so there is no code path in which
+    a model-chosen data-exposure label reaches a Verdict. The model's proposal is
+    read only so `parse_grade` sees a complete object, then dropped.
+
+    Total by construction: a grading failure degrades exactly one card to
+    ungraded and never takes down the assess pass for the rest of the board.
+    """
+    size = risk = None
+    try:
+        parsed = parse_grade(json.dumps(out)) if isinstance(out, dict) else None
+        if parsed:
+            size, risk = parsed["size"], parsed["risk"]
+    except Exception as exc:                                   # never fatal
+        health.record("assess_grade_parse_failed", task=getattr(brief, "task_id", None),
+                      error=type(exc).__name__)
+    if size is None or risk is None:
+        health.record("assess_grade_absent", task=getattr(brief, "task_id", None))
+    try:
+        sensitivity, _reasons = classify_sensitivity(_brief_as_card(brief))
+    except Exception as exc:                                   # never fatal
+        health.record("assess_sensitivity_failed", task=getattr(brief, "task_id", None),
+                      error=type(exc).__name__)
+        sensitivity = None
+    return size, risk, sensitivity
 
 
 def _record_assess_inconclusive(brief: AssessBrief, out: dict) -> None:
@@ -237,11 +292,24 @@ class BaseCliAdapter(Harness):
             "acceptance names nothing that resolves in the facts and is not clearly "
             "greenfield. Reply strictly as JSON: {\"verdict\":\"valid|stale|obsolete|"
             "needs_decision|decompose\",\"reason\":\"...\"}.")
+        # SECOND job, same call: the Joule Economy work grade (spec 3.1 to 3.6).
+        # Piggy-backing on assess means grading costs no extra model call, and the
+        # grade is produced exactly once per card rather than per dispatch.
+        instruction += (
+            "\n\nSECOND TASK, in the SAME reply: grade the WORK this card asks for "
+            "(not the quality of the card's writing). Add \"size\", \"risk\", and "
+            "\"sensitivity\" keys to the SAME JSON object described above, alongside "
+            "verdict and reason.\n\nYour \"sensitivity\" is ADVISORY ONLY. It is "
+            "discarded and replaced by a deterministic rule pass before anything is "
+            "written, because a guessed data-exposure label is a credential leak "
+            "rather than a wrong score. Answer it anyway so the reply is complete.\n\n"
+            + GRADE_RUBRIC)
         data = json.dumps({"task_id": brief.task_id, "title": brief.title,
                            "description": brief.description,
                            "acceptance": brief.acceptance, "tags": brief.tags,
                            "codebase_context": brief.codebase_context})
         out = self._run(instruction, data, worktree=os.getcwd(), repo=None, light=True)
+        size, risk, sensitivity = _grade_axes(out, brief)
         verdict = out.get("verdict")
         if verdict not in _ASSESS_VERDICTS:
             # Inconclusive assess: even after _run's retries the CLI declined or
@@ -257,7 +325,8 @@ class BaseCliAdapter(Harness):
             _record_assess_inconclusive(brief, out)
             return Verdict(verdict="valid",
                            reason="assess inconclusive after retries; proceeding to "
-                                  "the twin gate (fail-open)")
+                                  "the twin gate (fail-open)",
+                           size=size, risk=risk, sensitivity=sensitivity)
         if verdict == "needs_decision":
             # A single needs_decision may be a flaky HEDGE, not a real ambiguity:
             # the same well-formed task grades `valid` on most calls and
@@ -275,14 +344,16 @@ class BaseCliAdapter(Harness):
                               confirm=confirm.get("verdict"))
                 return Verdict(verdict="valid",
                                reason="needs_decision not confirmed on a second "
-                                      "opinion; proceeding to the twin gate")
+                                      "opinion; proceeding to the twin gate",
+                               size=size, risk=risk, sensitivity=sensitivity)
             health.record("assess_needs_decision_confirmed",
                           task=getattr(brief, "task_id", None))
         health.record("assess_ok", verdict=verdict, task=getattr(brief, "task_id", None))
         return Verdict(verdict=verdict,
                        reason=out.get("reason", ""),
                        updated_description=out.get("updated_description"),
-                       updated_acceptance=out.get("updated_acceptance"))
+                       updated_acceptance=out.get("updated_acceptance"),
+                       size=size, risk=risk, sensitivity=sensitivity)
 
     def decompose(self, brief: AssessBrief) -> list[dict]:
         """Split a too-coarse card into 2-8 independently buildable subtasks. Each
