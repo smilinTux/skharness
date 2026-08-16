@@ -39,6 +39,24 @@ _ALWAYS_PROTECTED: tuple[str, ...] = (
     "*objects/_protected.json",
     "*/objects/_freeze.json",                # the kill switch
     "*objects/_freeze.json",
+    # The work-grade policy. Once a card's grade selects the model that does the
+    # work, the grade IS routing policy: it decides the capability floor and,
+    # through sensitivity, which trust zone may see the card's data. An engine
+    # that can rewrite the rubric that routes it, then auto-merge behind a twin
+    # gate whose CI arm it satisfies with tests it wrote itself, is the same
+    # self-modification hazard CR-6.2 already ruled on for skos and skharness.
+    # These are guardrails, not features, so they sit on the hard-coded floor
+    # rather than relying on a manifest entry someone can omit.
+    "*/skharness/autocode/grading.py",        # the rubric text and the parser
+    "*skharness/autocode/grading.py",
+    "*/skharness/autocode/sensitivity.py",    # the deterministic exposure rules
+    "*skharness/autocode/sensitivity.py",
+    "*/skharness/autocode/buckets.py",        # grade -> trust-zone addressing
+    "*skharness/autocode/buckets.py",
+    "*/autocode/data/joule-grade-vocabulary.json",   # the vendored enums
+    "*autocode/data/joule-grade-vocabulary.json",
+    "*/tests/data/joule-economy-golden-set-*.json",  # the calibration reference
+    "*tests/data/joule-economy-golden-set-*.json",
 )
 
 

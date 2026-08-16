@@ -24,6 +24,20 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   follow-up once the gate has run clean).
 
 ### Fixed
+- **The work-grade policy is now on autocode's hard-coded protected floor.**
+  `_ALWAYS_PROTECTED` covered `protected.py`, `engineering.py`, the fleet store,
+  `itil.py`, the manifest and the freeze file, but not `grading.py`,
+  `sensitivity.py`, `buckets.py`, the vendored grade vocabulary or the golden
+  set. Once a card's grade selects the model that executes it, the rubric IS
+  routing policy, so an engine routed by that rubric could edit it and merge the
+  change behind a twin gate whose CI arm it satisfies with tests it wrote
+  itself. This is the self-modification hazard CR-6.2 already ruled on for
+  skos/skharness, applied to the files that decide the routing. The floor is
+  hard-coded rather than manifest-driven because the realistic failure is not
+  that someone removes an entry, it is that nobody ever adds one. The golden-set
+  glob is versioned (`golden-set-*.json`) so promoting it to v2 does not drop it
+  off the floor at exactly the moment it stops being a consistency check and
+  becomes ground truth.
 - **`README.md` no longer claims the daemon has no write surface.** It asserted
   "There is NO write surface: no spawn, inject, kill, dispatch, rename, archive,
   or model switch" and cited `tests/test_daemon.py::test_no_write_surface` as
