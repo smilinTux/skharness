@@ -78,6 +78,24 @@ def test_parse_real_pi_event_schema():
     assert a._parse({"result": stream}) == {"verdict": "valid", "reason": "ok"}
 
 
+def test_per_call_model_override_keeps_argv_and_models_json_in_agreement():
+    # pi DECLARES a provider model in models.json and REQUESTS one on the command
+    # line. If those two disagree, pi asks skgw for a model it never declared, so
+    # the two hooks must resolve the same id for the same call.
+    a = _a(model="ornith-big", base_url="http://gw:18780/v1")
+    for override in (None, "sk-l-internal", "sk-xl-secret"):
+        argv = a._argv("P", model=override)
+        cfg = a._config_files(model=override)["/agent/models.json"]
+        declared = json.loads(cfg)["providers"]["skgw"]["models"][0]["id"]
+        requested = argv[argv.index("--model") + 1]
+        assert requested == f"skgw/{declared}"
+    assert a.model == "ornith-big"                 # the override never sticks
+
+
+def test_pi_declares_the_per_call_override_seam():
+    assert _a().supports_model_override() is True
+
+
 def test_config_files_budget_overridable():
     import json
     from skharness.autocode.sandbox import Sandbox

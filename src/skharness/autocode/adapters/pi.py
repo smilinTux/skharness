@@ -52,13 +52,30 @@ class PiAdapter(BaseCliAdapter):
                 "task_plane": True, "session_plane": False,
                 "headless_api": "none", "hot_set_model": False}
 
-    def _argv(self, prompt: str, light: bool = False) -> list[str]:
+    def supports_model_override(self) -> bool:
+        # pi honours it in both places that name a model: _argv (the REQUEST) and
+        # _config_files (the DECLARATION). Both read _effective_model, so they
+        # cannot disagree.
+        return True
+
+    def _effective_model(self, model: str | None = None) -> str | None:
+        """The model id this ONE call uses: the per-call override when a dispatcher
+        pinned one (a graded skgateway bucket, see buckets.py), else the adapter's
+        statically configured model. Single source of truth for _argv and
+        _config_files: pi DECLARES a provider model in models.json and REQUESTS one
+        on the command line, and if those two disagree pi asks skgw for a model it
+        never declared."""
+        return model if model is not None else self.model
+
+    def _argv(self, prompt: str, light: bool = False,
+              model: str | None = None) -> list[str]:
         # light (assess/grade judgment) accepted for the unified seam; pi's
         # --no-session already runs a single non-agentic shot.
-        if not self.model:
+        eff = self._effective_model(model)
+        if not eff:
             return ["pi", "-p", prompt, "--mode", "json", "--no-session"]
         return ["pi", "-p", prompt, "--mode", "json", "--no-session",
-                "--model", f"skgw/{self.model}", "--api-key", "sk-local"]
+                "--model", f"skgw/{eff}", "--api-key", "sk-local"]
 
     def _image(self) -> str:
         return self.image
@@ -71,9 +88,10 @@ class PiAdapter(BaseCliAdapter):
         # OPENAI_BASE_URL, pi ignores it and hits real OpenAI instead.
         return {"PI_CODING_AGENT_DIR": "/agent"}
 
-    def _config_files(self):
+    def _config_files(self, model: str | None = None):
         if not self.base_url:
             return {}
+        eff = self._effective_model(model)
         models = {
             "providers": {
                 "skgw": {
@@ -81,7 +99,7 @@ class PiAdapter(BaseCliAdapter):
                     "api": "openai-completions",
                     "apiKey": "sk-local",
                     "compat": {"supportsDeveloperRole": False},
-                    "models": [{"id": self.model,
+                    "models": [{"id": eff,
                                 "limit": {"context": self.max_tokens,
                                           "output": self.max_tokens}}],
                 }

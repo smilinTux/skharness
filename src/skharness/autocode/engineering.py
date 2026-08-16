@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import health
+from .buckets import attach_dispatch_model, bucket_for_payload
 from .ci import external_ci_verdict, diff_coverage
 from .failure_memory import build_prior_feedback, distill_failure
 from .types import DecisionItem, GateResult, GradeBrief, RepoSpec, TaskBrief, WorkItem
@@ -318,6 +319,30 @@ class EngineeringExecutor:
                             options={"take": "take", "defer": "defer"},
                             action_ref=item.ref, priority="high")
 
+    def _dispatch_model(self, item: WorkItem) -> str | None:
+        """The skgateway bucket id this card's build and grade calls address, or
+        None when the card is UNGRADED.
+
+        None means INELIGIBLE for graded dispatch, NOT "use a permissive default".
+        The harness then sends no model override and runs on its statically
+        configured sovereign model, byte-identical to the behaviour before graded
+        routing existed. That branch is the ONLY one taken today (zero cards carry
+        a grade), so the surrounding code is unchanged in production.
+
+        WHY not a fallback bucket: an absent grade must never widen access. An
+        ungraded card that got, say, sk-xl-public would reach a third-party model
+        that a card graded `secret` is forbidden from reaching, purely by being
+        ungraded. Refusing to construct any bucket makes that unreachable rather
+        than merely unlikely: a bucket is the only mechanism by which graded
+        routing selects a zone, and an ungraded card never holds one.
+
+        A CORRUPT grade (present but unmappable) raises BucketError out of here
+        rather than degrading to None. Degrading would fall back to the static
+        model and silently discard the ceiling the grade asked for, which is the
+        exact failure mode this card exists to close.
+        """
+        return bucket_for_payload(item.payload)
+
     def run(self, item: WorkItem, harness) -> GateResult:
         self.claim(item)                    # claim before any work: no double-execution
         repo = self.resolve_repo(item)
@@ -330,6 +355,13 @@ class EngineeringExecutor:
         # fresh-start behaviour. The in-run grade feedback below overwrites this
         # round to round exactly as before.
         feedback: str | None = build_prior_feedback(p)
+        # Resolve ONCE per build, before any model call: a validated bucket id, or
+        # None for an ungraded card (no override, today's exact behaviour). Every
+        # round's implement and grade call carries the same one, so a card cannot
+        # drift zone mid-build.
+        dispatch_model = self._dispatch_model(item)
+        if dispatch_model:
+            health.record("graded_dispatch", task=item.ref, bucket=dispatch_model)
         last: GateResult | None = None
         empty_rounds = 0
         for rnd in range(1, self._MAX_ROUNDS + 1):
@@ -338,6 +370,7 @@ class EngineeringExecutor:
                            title=p.get("title", ""), description=p.get("description", ""),
                            acceptance=p.get("acceptance", []),
                            prior_feedback=feedback, round=rnd)
+            attach_dispatch_model(tb, dispatch_model)
             hr = harness.run_task(tb)
             self._accrue_usage(item.ref, hr)   # token/cost telemetry for the joule P&L
             diff = self._diff(repo, wt)
@@ -383,6 +416,7 @@ class EngineeringExecutor:
             gb = GradeBrief(task_id=item.ref, repo=repo, worktree=wt, diff=diff,
                             acceptance=p.get("acceptance", []),
                             ci_status=ci_status, diff_coverage=cov)
+            attach_dispatch_model(gb, dispatch_model)
             gr = harness.grade(gb)              # fresh, no shared context with run_task
             self.board.score_task(item.ref, round=rnd, score=(gr.score or 0),
                                   notes=strip_promise(gr.notes), harness=harness.name)
