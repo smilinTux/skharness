@@ -311,6 +311,38 @@ def test_run_bails_fast_on_noop_empty_diff(mocker, cfg):
     assert ex.board.score_task.call_count == 0
 
 
+# ── S10: the accrued usage must name the adapter that ACTUALLY ran ───────────
+
+def test_accrued_usage_names_the_adapter_that_ran_on_the_wired_path(mocker, cfg):
+    """Asserted through run(), not by hand-calling the helper: pi's envelope has
+    no `usage` key, so the accrual took a fallback branch that never set model,
+    and a pi build's cost rows all claimed to be claude-code."""
+    grades = [GateResult(score=5, passed=True,
+                         notes="ready <promise>COMPLETE</promise>", artifact="pr")]
+    ex, harness, item = _run_ex(mocker, cfg, grades)
+    harness.name = "pi"                       # the adapter that actually runs
+    harness.run_task.return_value = HarnessResult(ok=True, artifact=None, tokens=11,
+                                                  cost_usd=0.03, raw={"exit_code": 0})
+    ex.run(item, harness)
+    assert ex._build_usage["t1"].model == "pi"
+    assert ex._build_usage["t1"].tokens == 11
+
+
+def test_accrued_usage_keeps_the_model_a_claude_envelope_names(mocker, cfg):
+    """The adapter name must not overwrite the more specific model id the
+    claude-code envelope reports."""
+    grades = [GateResult(score=5, passed=True,
+                         notes="ready <promise>COMPLETE</promise>", artifact="pr")]
+    ex, harness, item = _run_ex(mocker, cfg, grades)
+    harness.name = "claude-code"
+    harness.run_task.return_value = HarnessResult(
+        ok=True, artifact=None, tokens=15, cost_usd=0.04,
+        raw={"model": "claude-sonnet-x", "total_cost_usd": 0.04, "num_turns": 2,
+             "usage": {"input_tokens": 10, "output_tokens": 5}})
+    ex.run(item, harness)
+    assert ex._build_usage["t1"].model == "claude-sonnet-x"
+
+
 # ── S5: a failed run's usage and cost must be RECORDED, not dropped ──────────
 # Two concerns used to be collapsed into one `pop`: minting (pass only) and
 # recording (every path). The load-bearing assertions below are all on the
