@@ -18,6 +18,75 @@ _HOP_BY_HOP = {"proxy-connection", "connection"}
 _RESP_FRAMING = {"transfer-encoding", "content-length", "keep-alive"}
 
 
+class _RequestHeaders(dict):
+    """An outbound header dict whose field names compare case-insensitively.
+
+    HTTP field names are case-insensitive, but a plain dict's keys are not. The
+    outbound headers here are seeded from the client's request, which preserves
+    the client's original casing, and then some fields are overridden. With a
+    plain dict a client that sent `host:` and an override written as `Host` are
+    two DISTINCT keys, so both go on the wire. RFC 7230 section 5.4 says a
+    server MUST reject a request with more than one Host field as 400, and the
+    only reason that has not bitten yet is that skgateway tolerates it.
+
+    Keying case-insensitively makes that whole class of bug impossible rather
+    than special-casing Host: any field this proxy sets replaces the client's
+    field whatever case it arrived in, today and for whatever gets overridden
+    next. The casing of the most recent assignment is what goes on the wire.
+    """
+
+    def __init__(self, items=()):
+        super().__init__()
+        for key, value in items:
+            self[key] = value
+
+    def _existing(self, key: str):
+        lowered = key.lower()
+        for present in super().keys():
+            if present.lower() == lowered:
+                return present
+        return None
+
+    def __setitem__(self, key, value):
+        present = self._existing(key)
+        if present is not None and present != key:
+            super().__delitem__(present)
+        super().__setitem__(key, value)
+
+    def __getitem__(self, key):
+        present = self._existing(key)
+        if present is None:
+            raise KeyError(key)
+        return super().__getitem__(present)
+
+    def __delitem__(self, key):
+        present = self._existing(key)
+        if present is None:
+            raise KeyError(key)
+        super().__delitem__(present)
+
+    def __contains__(self, key):
+        return isinstance(key, str) and self._existing(key) is not None
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def setdefault(self, key, default=None):
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+    def update(self, other=(), **kwargs):
+        items = other.items() if hasattr(other, "items") else other
+        for key, value in items:
+            self[key] = value
+        for key, value in kwargs.items():
+            self[key] = value
+
+
 class AllowlistProxy:
     def __init__(self, allow: list[str]) -> None:
         self.allow = {h.strip().lower() for h in allow if h and h.strip()}
@@ -46,10 +115,27 @@ def _handler(proxy: AllowlistProxy, log):
                     log(f"DENY {self.command} {self.path}")
                 self.send_error(403, "egress denied")
                 return
+            parsed = urllib.parse.urlsplit(self.path)
+            if parsed.scheme == "https":
+                # This proxy originates no TLS: it only ever built a cleartext
+                # http.client.HTTPConnection, so forwarding an https absolute-URI
+                # would have sent the request (Authorization header and all) in the
+                # clear, by default to port 80. It is a confinement boundary, so it
+                # fails closed rather than silently downgrading. https reaches an
+                # origin through CONNECT, which takes the blind tunnel path below
+                # and leaves TLS end to end between the client and the origin.
+                if log:
+                    log(f"REFUSE {self.command} {host} (https absolute-URI, "
+                        f"no TLS origination; use CONNECT)")
+                self.send_error(
+                    501, "https forwarding unsupported",
+                    "This proxy does not originate TLS. Use CONNECT for https so "
+                    "the tunnel stays end to end; it will not be downgraded to "
+                    "cleartext.")
+                return
             if log:
                 log(f"ALLOW {self.command} {host}")
 
-            parsed = urllib.parse.urlsplit(self.path)
             port = parsed.port or 80
             target = f"{parsed.path or '/'}"
             if parsed.query:
@@ -58,11 +144,11 @@ def _handler(proxy: AllowlistProxy, log):
             content_length = int(self.headers.get("Content-Length", 0) or 0)
             body = self.rfile.read(content_length) if content_length else None
 
-            headers = {
-                k: v
+            headers = _RequestHeaders(
+                (k, v)
                 for k, v in self.headers.items()
                 if k.lower() not in _HOP_BY_HOP
-            }
+            )
             headers["Host"] = parsed.netloc
 
             try:

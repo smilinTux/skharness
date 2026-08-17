@@ -68,6 +68,30 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   follow-up once the gate has run clean).
 
 ### Fixed
+- **The sandbox egress proxy no longer sends two `Host` headers.** `_forward()`
+  built its outbound headers as a comprehension over `self.headers.items()`,
+  which preserves the CLIENT's casing, so a client's lowercase `host` survived
+  and the following `headers["Host"] = ...` added a SECOND, distinct dict key.
+  `_HOP_BY_HOP` does not list host, so nothing removed the first, and both went
+  on the wire. RFC 7230 section 5.4 says a server MUST reject that as 400; only
+  skgateway's tolerance kept it invisible. The outbound dict is now
+  `_RequestHeaders`, whose field names compare case-insensitively, so any header
+  the proxy overrides replaces the client's whatever case it arrived in. Fixing
+  the class of bug rather than special-casing Host, because the same trap was
+  waiting for the next override. Proven by capturing raw bytes at a socket
+  origin: a `BaseHTTPRequestHandler` upstream folds duplicate headers away and
+  cannot observe this defect at all.
+- **The sandbox egress proxy refuses `https://` absolute-URI forwards instead of
+  silently downgrading them to cleartext.** `_target_host()` accepted https
+  paths, but `_forward()` only ever built an `http.client.HTTPConnection` on
+  `parsed.port or 80` and the module originates no TLS, so such a request went
+  out in the clear, `Authorization` header included, by default to port 80. Not
+  reachable through today's plain-HTTP skgateway flow, and https normally
+  arrives as CONNECT (the separate blind tunnel, which is correct and stays end
+  to end), but it was a live trap for the next sandbox pointed at an https
+  endpoint. The proxy is a confinement boundary, so it fails closed: 501 with an
+  explanation pointing at CONNECT. The allowlist check still runs first, so a
+  denied host keeps its 403 rather than degrading into 501.
 - **The work-grade policy is now on autocode's hard-coded protected floor.**
   `_ALWAYS_PROTECTED` covered `protected.py`, `engineering.py`, the fleet store,
   `itil.py`, the manifest and the freeze file, but not `grading.py`,
