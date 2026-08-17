@@ -45,7 +45,6 @@ from skharness.autocode.joules import (
     settle,
 )
 
-
 requires_skjoule = pytest.mark.skipif(
     not joules._skjoule_available(),
     reason="optional sibling skcapstone/skjoule not installed",
