@@ -1,13 +1,18 @@
 """Carve-out detector tests: the leash cannot be loosened autonomously."""
 from __future__ import annotations
 
+import hashlib
 import json
+
+import pytest
 
 from skharness.autocode.protected import (
     _ALWAYS_PROTECTED,
     _FAIL_CLOSED,
+    changed_paths_are_protected,
     is_protected,
     load_manifest,
+    matched_protected_paths,
 )
 
 
@@ -177,3 +182,120 @@ def test_the_coverage_config_floor_does_not_swallow_ordinary_work(tmp_path):
     for path in ("src/pkg/module.py", "tests/test_module.py", "README.md",
                  "docs/design.md", "src/pkg/config.toml"):
         assert changed_paths_are_protected(tmp_path, [path]) is False, path
+
+
+# ---------------------------------------------------------------------------
+# Card P6 (coord `08963fbb`): the manifest's signature verification is now
+# wired into the production call path (`_manifest_for`, reached by
+# `matched_protected_paths` / `changed_paths_are_protected`, which is what
+# `engineering.py` finalize actually calls). Gated by the same
+# `SKFLEET_SIGNING` rollout flag Card 3.5 uses for writes; `off` (unset, the
+# default) is asserted to be an EXACT no-op against every test above -- none
+# of them set the env var, and they all still pass, which is the load-bearing
+# fact that this section pins explicitly rather than leaving implicit.
+# ---------------------------------------------------------------------------
+
+
+def _fake_signer(data: bytes) -> str:
+    return "sig:" + hashlib.sha256(data).hexdigest()
+
+
+def _fake_verifier(data: bytes, sig: str) -> bool:
+    return sig == "sig:" + hashlib.sha256(data).hexdigest()
+
+
+def _write_signed_manifest(root, extra_protected, fleet_signing):
+    obj = root / "objects"
+    obj.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "protected": extra_protected,
+        "writer": {"identity": "capauth:chef@skworld.io", "role": "operator",
+                   "signature": None},
+    }
+    payload["writer"]["signature"] = _fake_signer(fleet_signing.canonical_bytes(payload))
+    (obj / "_protected.json").write_text(json.dumps(payload))
+    return payload
+
+
+@pytest.mark.needs_skcapstone
+def test_wiring_off_by_default_matches_pre_p6_behavior(tmp_path, monkeypatch):
+    from skcapstone.fleet import signing as fleet_signing
+    monkeypatch.delenv(fleet_signing.SIGNING_ENV, raising=False)
+    # An UNSIGNED manifest (no writer block at all) is still honored, exactly
+    # as before this card: off means unchanged.
+    _write_manifest(tmp_path, {"protected": ["*/skcapstone/fleet/scheduler.py"]})
+    assert changed_paths_are_protected(tmp_path, ["src/skcapstone/fleet/scheduler.py"]) is True
+    assert changed_paths_are_protected(tmp_path, ["src/skcapstone/fleet/cron.py"]) is False
+
+
+@pytest.mark.needs_skcapstone
+def test_wiring_enforce_rejects_unsigned_manifest(tmp_path, monkeypatch):
+    from skcapstone.fleet import signing as fleet_signing
+    monkeypatch.setenv(fleet_signing.SIGNING_ENV, "enforce")
+    monkeypatch.setattr(fleet_signing, "capauth_verifier", lambda: _fake_verifier)
+    _write_manifest(tmp_path, {"protected": ["*/skcapstone/fleet/scheduler.py"]})
+    # Unsigned -> fails closed -> protects EVERYTHING, including the file the
+    # manifest tried to narrowly add, not just the hard-coded floor.
+    assert changed_paths_are_protected(tmp_path, ["src/skcapstone/fleet/cron.py"]) is True
+
+
+@pytest.mark.needs_skcapstone
+def test_wiring_enforce_rejects_tampered_manifest(tmp_path, monkeypatch):
+    from skcapstone.fleet import signing as fleet_signing
+    monkeypatch.setenv(fleet_signing.SIGNING_ENV, "enforce")
+    monkeypatch.setattr(fleet_signing, "capauth_verifier", lambda: _fake_verifier)
+    obj = tmp_path / "objects"
+    obj.mkdir(parents=True)
+    signed = _write_signed_manifest(tmp_path, ["*/skcapstone/fleet/scheduler.py"],
+                                    fleet_signing)
+    # Tamper post-signing: widen the allowed set without re-signing.
+    signed["protected"] = ["*/skcapstone/fleet/scheduler.py", "*/skharness/autocode/protected.py"]
+    (obj / "_protected.json").write_text(json.dumps(signed))
+    assert changed_paths_are_protected(tmp_path, ["src/skcapstone/fleet/cron.py"]) is True
+
+
+@pytest.mark.needs_skcapstone
+def test_wiring_enforce_honors_a_validly_signed_manifest(tmp_path, monkeypatch):
+    from skcapstone.fleet import signing as fleet_signing
+    monkeypatch.setenv(fleet_signing.SIGNING_ENV, "enforce")
+    monkeypatch.setattr(fleet_signing, "capauth_verifier", lambda: _fake_verifier)
+    _write_signed_manifest(tmp_path, ["*/skcapstone/fleet/scheduler.py"], fleet_signing)
+    assert changed_paths_are_protected(tmp_path, ["src/skcapstone/fleet/scheduler.py"]) is True
+    assert changed_paths_are_protected(tmp_path, ["src/skcapstone/fleet/cron.py"]) is False
+
+
+@pytest.mark.needs_skcapstone
+def test_carveout_floor_holds_under_a_validly_signed_manifest_that_omits_it(tmp_path, monkeypatch):
+    """Acceptance criterion 3, proven rather than asserted: even a manifest
+    that VERIFIES -- signed by the trusted key, tamper-free -- cannot narrow
+    protection off the hard-coded guardrail floor by simply not mentioning
+    it. The constitutional carve-out (the operator may rewrite almost
+    anything EXCEPT its own guardrails) survives the signing work; signing
+    raises the bar on who can propose a manifest, it does not hand the
+    manifest author the guardrails themselves.
+    """
+    from skcapstone.fleet import signing as fleet_signing
+    monkeypatch.setenv(fleet_signing.SIGNING_ENV, "enforce")
+    monkeypatch.setattr(fleet_signing, "capauth_verifier", lambda: _fake_verifier)
+    _write_signed_manifest(tmp_path, ["*/some/unrelated/path.py"], fleet_signing)
+    for path in ("src/skharness/autocode/protected.py",
+                 "src/skharness/autocode/engineering.py",
+                 "src/skcapstone/itil.py",
+                 "src/skcapstone/fleet/store.py",
+                 "objects/_freeze.json",
+                 "objects/_protected.json"):
+        assert changed_paths_are_protected(tmp_path, [path]) is True, path
+    # Negative control: ordinary work covered by neither the manifest nor the
+    # floor stays unprotected under the SAME signed, enforced manifest.
+    assert changed_paths_are_protected(tmp_path, ["src/skharness/autocode/orchestrator.py"]) is False
+
+
+@pytest.mark.needs_skcapstone
+def test_matched_protected_paths_reports_which_paths_hit_under_enforce(tmp_path, monkeypatch):
+    from skcapstone.fleet import signing as fleet_signing
+    monkeypatch.setenv(fleet_signing.SIGNING_ENV, "enforce")
+    monkeypatch.setattr(fleet_signing, "capauth_verifier", lambda: _fake_verifier)
+    _write_signed_manifest(tmp_path, ["*/skcapstone/fleet/scheduler.py"], fleet_signing)
+    hits = matched_protected_paths(
+        tmp_path, ["src/skcapstone/fleet/scheduler.py", "src/skcapstone/fleet/cron.py"])
+    assert hits == ["src/skcapstone/fleet/scheduler.py"]

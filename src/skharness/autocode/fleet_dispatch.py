@@ -110,7 +110,18 @@ def default_placer() -> Callable[[WorkItem], DispatchDecision] | None:
         return None
     is_control_plane = any(v.name == me and v.labels.get("control-plane") == "true"
                            for v in views)
-    frozen = store.is_frozen(paths)
+    # Card P6 (coord `08963fbb`): `store.is_frozen` reads `_freeze.json` at
+    # face value, unsigned or not, which is exactly the honor-system gap the
+    # design doc calls out ("last written capauth:lumina, signature: null").
+    # `plane_trust.path_trusted` adds the capauth check on top, gated by the
+    # same `SKFLEET_SIGNING` flag (off by default: no behavior change until an
+    # operator opts in). Once enforced, an unsigned or tampered freeze file
+    # cannot be trusted to say "not frozen", so it is treated as frozen: the
+    # same "when in doubt, halt" direction `is_frozen` already takes for an
+    # unreadable file, just extended to an untrustworthy one.
+    from .plane_trust import path_trusted
+    frozen = store.is_frozen(paths) or not path_trusted(paths.freeze_path(),
+                                                         label="_freeze.json")
     writer = store.Writer(role="scheduler", node=me,
                           identity=store.writer_identity())
 

@@ -21,6 +21,10 @@ dev = ["pytest>=7.0", "pytest-mock>=3.10", "pytest-asyncio>=0.23", "httpx>=0.27"
 # The skcode-hostd binary Atlas's skcode adapter shells (operator explain|observe|
 # act) and the daemon runner (--host <tailnet-ip>) share one entry point.
 skcode-hostd = "skharness.serve:main"
+# Card P6 (coord `08963fbb`): human/operator-run tool that signs
+# objects/_freeze.json and objects/_protected.json. See its module docstring
+# for why it must be run with the operator's own key, not as an agent.
+skharness-sign-plane-files = "skharness.autocode.sign_plane_files:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

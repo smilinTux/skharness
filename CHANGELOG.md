@@ -10,6 +10,37 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 ## [Unreleased]
 
 ### Added
+- **Plane-file signature trust, wired but off by default** (card P6, coord
+  `08963fbb`). `objects/_freeze.json` (the human kill switch) and
+  `objects/_protected.json` (the carve-out manifest) each carried a
+  `writer.signature` slot that nothing filled in and nothing checked. New
+  `autocode/plane_trust.py` wires the check into both production read paths
+  (`protected._manifest_for`, reached by every `engineering.py` finalize; and
+  `fleet_dispatch.default_placer`'s freeze read), gated by the same
+  `SKFLEET_SIGNING` rollout flag (`off | permissive | enforce`) Card 3.5 uses
+  for writes. `off` (unset, the default) is an exact no-op: every existing
+  test and every live plane file behaves exactly as before this landed.
+  `enforce` fails closed with NO grace period: an unsigned or tampered
+  manifest protects everything (same direction as an absent manifest today);
+  an unsigned or tampered freeze file is treated as frozen (same "when in
+  doubt, halt" direction `store.is_frozen` already takes for an unreadable
+  file). New `autocode/sign_plane_files.py` (console script
+  `skharness-sign-plane-files`) is the human/operator-run tool that actually
+  signs the two files; it deliberately resolves the signing key agent-blind
+  (never acting-agent-first) and refuses outright unless the resolved key's
+  fingerprint matches the expected operator root. The live `_freeze.json` and
+  `_protected.json` are NOT signed by this change: the operator root key
+  (`chef@skworld.io`) is held in offline custody by policy, so the write half
+  of the ceremony has to happen on a node/session that actually holds it (or
+  via the Bunker remote signer). Non-regression proven with a test, not
+  asserted: the constitutional carve-out floor (`_ALWAYS_PROTECTED`) still
+  holds guardrail files protected even under a manifest that verifies as
+  genuinely signed but simply omits them.
+  Threat model: this closes the autopilot/programmatic-write path onto these
+  two files. It does NOT make the freeze card AI-proof against an interactive
+  shell; shell is root-equivalent on these nodes, so anything that can invoke
+  `gpg`/capauth the way the operator can could still sign a false state. See
+  `plane_trust.py`'s module docstring.
 - **Autopilot digest decisions are now bound by stable id, not position**
   (card `78409fc0`, spec `2026-08-13-unified-consent-plane-arch.md` section
   3.2). `resolver.answer` answered by POSITION alone: the manifest renumbers

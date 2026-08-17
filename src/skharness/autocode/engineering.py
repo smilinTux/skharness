@@ -921,11 +921,17 @@ class EngineeringExecutor:
         # inert part. It is now evaluated on the path that ACTUALLY runs: every
         # finalize, before the diff is offered for merge by any route.
         #
-        # The manifest half is unsigned (`"signature": null`, and no caller passes
-        # `verify`), so the only unforgeable half is the hard-coded
-        # `_ALWAYS_PROTECTED` tuple. That is exactly what this call reaches with
-        # or without a manifest, which is why moving the call site is sufficient
-        # and does not wait on the signing work.
+        # Card P6 (coord `08963fbb`): `matched_protected_paths` now passes a real
+        # capauth verifier by default (`protected._default_verify`, wired
+        # through `plane_trust`), gated by the same `SKFLEET_SIGNING` rollout
+        # flag Card 3.5 uses for writes. While that flag is `off` (today's
+        # default, and the live default until the signing ceremony completes;
+        # see `plane_trust.py` and `sign_plane_files.py`) the manifest is
+        # trusted at face value exactly as before, so the only unforgeable
+        # half in practice is still the hard-coded `_ALWAYS_PROTECTED` tuple.
+        # Once an operator flips `SKFLEET_SIGNING=enforce` after signing
+        # `_protected.json`, an unsigned or tampered manifest fails closed
+        # (protects everything) instead of being honored at face value.
         from . import protected
         guardrails = protected.matched_protected_paths(
             self._fleet_root(), self._changed_paths(repo, pr_branch))
