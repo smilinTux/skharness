@@ -10,12 +10,43 @@ OPENAI_BASE_URL env (it hits real OpenAI), so routing MUST go through models.jso
 The sandbox proxy forwards plain HTTP for allowlisted hosts, so the internal-net
 container reaches the local http skgateway through it. pi's `--mode json` reply is
 the assistant `message_end` event's content[].text; `_parse` handles that event
-stream plus the single-object shape."""
+stream plus the single-object shape.
+
+Attribution (card A6.1): pi otherwise forwards nothing identifying (measured: host,
+Accept, User-Agent, the OpenAI-JS X-Stainless-* block, authorization, content-type,
+and nothing else), which is why skgateway `request_log` rows have NULL agent_id and
+session_id for every harness run. pi reads a provider-level `headers` map from the
+same models.json we already generate, so the fix is a config change here rather than
+new plumbing. See _attribution_headers for the literal-values rule."""
 from __future__ import annotations
 
 import json
+import re
 
 from .base import BaseCliAdapter, parse_event_stream
+
+# Attribution header values must be plain, inert tokens. pi treats a LEADING `!`
+# in a header value as "run this shell command and use its stdout", re-executed on
+# every request, and a leading `$` as "read this environment variable" (`$$`/`$!`
+# escape them). Our ids are hex today, so rather than escaping we refuse anything
+# outside a conservative token charset: the magic prefixes, whitespace, control
+# characters and header-splitting bytes are all excluded by construction. This is
+# an assertion, not a filter -- a value that fails is a bug upstream, and dropping
+# it silently would leave the run unattributable with nothing to show for it.
+_ATTRIBUTION_TOKEN = re.compile(r"\A[A-Za-z0-9._:@/=+-]{1,200}\Z")
+
+
+def _attribution_value(name: str, value):
+    """Validate one attribution header value. None -> None (header is omitted)."""
+    if value is None:
+        return None
+    value = str(value)
+    if not _ATTRIBUTION_TOKEN.fullmatch(value):
+        raise ValueError(
+            f"unsafe pi attribution header value for {name!r}: {value!r}. Allowed: "
+            "1-200 chars of [A-Za-z0-9._:@/=+-]. A leading '!' or '$' is a pi magic "
+            "prefix (shell exec / env lookup), so such a value is never passed through.")
+    return value
 
 
 class PiAdapter(BaseCliAdapter):
@@ -26,12 +57,26 @@ class PiAdapter(BaseCliAdapter):
     # reasoning before emitting content. Overridable via config.harness_max_tokens.
     _DEFAULT_MAX_TOKENS = 131072
 
+    # Attribution headers pi sends to skgateway so a harness run can be joined to
+    # its gateway request_log row (card A6.1). Names are fixed here; the VALUES are
+    # supplied by the caller.
+    _H_SESSION = "x-session-id"
+    _H_CARD = "x-sk-card-id"
+
     def __init__(self, sandbox=None, model=None, base_url=None, egress_hosts=None,
                  live_execution: bool = False, image=None, max_tokens=None,
-                 run_timeout=None):
+                 run_timeout=None, session_id=None, card_id=None):
         from ..sandbox import Sandbox
         self.model = model
         self.base_url = base_url
+        # Attribution ids. Optional and None by default: a caller that does not know
+        # who it is sends NO attribution headers at all, rather than empty strings.
+        # "no session" and "session is the empty string" are different facts and the
+        # gateway must be able to tell them apart. A follow-up card wires
+        # autocode.identity.resolve_identity() in here; this adapter deliberately does
+        # not import it, so it stays independently mergeable and independently usable.
+        self.session_id = _attribution_value(self._H_SESSION, session_id)
+        self.card_id = _attribution_value(self._H_CARD, card_id)
         self.image = image or "sandbox-pi:1"
         self.max_tokens = int(max_tokens) if max_tokens else self._DEFAULT_MAX_TOKENS
         # pi does one turn and terminates (measured ~3.6s for a classification prompt
@@ -88,24 +133,51 @@ class PiAdapter(BaseCliAdapter):
         # OPENAI_BASE_URL, pi ignores it and hits real OpenAI instead.
         return {"PI_CODING_AGENT_DIR": "/agent"}
 
-    def _config_files(self, model: str | None = None):
+    def _attribution_headers(self, session_id=None, card_id=None) -> dict:
+        """The provider-level `headers` map, or {} when we have nothing to attribute.
+
+        Values are baked in as LITERALS and must never be written as `$VAR` env
+        interpolation. pi supports that form, but with the variable unset it makes NO
+        request at all, reports an internal error, and STILL EXITS 0 -- `_parse` then
+        returns {} and the whole call has failed in a way no exit code reveals.
+        `_config_files` is regenerated per call with the values already in hand, so
+        there is no reason to reach for interpolation. Proven in the card evidence:
+        coordination/evidence/4852c56d-pi-custom-headers/ (variant J).
+
+        Each id is independent: supplying one and not the other emits one header, and
+        supplying neither emits no `headers` key at all (see _config_files)."""
+        sid = _attribution_value(self._H_SESSION, session_id) or self.session_id
+        cid = _attribution_value(self._H_CARD, card_id) or self.card_id
+        headers = {}
+        if sid:
+            headers[self._H_SESSION] = sid
+        if cid:
+            headers[self._H_CARD] = cid
+        return headers
+
+    def _config_files(self, model: str | None = None, session_id=None, card_id=None):
         if not self.base_url:
             return {}
         eff = self._effective_model(model)
-        models = {
-            "providers": {
-                "skgw": {
-                    "baseUrl": self.base_url,
-                    "api": "openai-completions",
-                    "apiKey": "sk-local",
-                    "compat": {"supportsDeveloperRole": False},
-                    "models": [{"id": eff,
-                                "limit": {"context": self.max_tokens,
-                                          "output": self.max_tokens}}],
-                }
-            }
+        skgw = {
+            "baseUrl": self.base_url,
+            "api": "openai-completions",
+            "apiKey": "sk-local",
+            # SINGLE SOURCE OF x-session-id: skharness. pi can mint its own
+            # x-session-id via compat.sendSessionAffinityHeaders +
+            # sessionAffinityFormat: "openrouter", which would be a random UUID that
+            # fights ours on the same header name. We deliberately do not set either
+            # key, so the only x-session-id skgateway ever sees from pi is the one the
+            # harness put there and can join back to a run.
+            "compat": {"supportsDeveloperRole": False},
+            "models": [{"id": eff,
+                        "limit": {"context": self.max_tokens,
+                                  "output": self.max_tokens}}],
         }
-        return {"/agent/models.json": json.dumps(models)}
+        headers = self._attribution_headers(session_id=session_id, card_id=card_id)
+        if headers:                       # absent, never {}, when we know no ids
+            skgw["headers"] = headers
+        return {"/agent/models.json": json.dumps({"providers": {"skgw": skgw}})}
 
     def _parse(self, raw: dict) -> dict:
         if not isinstance(raw, dict):
