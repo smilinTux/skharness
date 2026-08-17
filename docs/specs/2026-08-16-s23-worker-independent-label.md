@@ -65,13 +65,37 @@ survivor cannot write a clean row.
 
 ## 3. Cost, and the sampling rule, stated plainly
 
-Mutation testing costs one scoped test run per mutant. Measured on this card's
-own diff in this repo: 102 mutable sites over 705 changed lines across four
-files, and the scoped test command takes roughly 17 seconds. A COMPLETE run over
-that diff would have been about 29 minutes of wall clock for one card.
+Mutation testing costs one scoped test run per mutant. **Measured, not
+estimated**, by running the probe against this card's own diff on 2026-08-16:
 
-That is too expensive to run on every build, and this document says so rather
-than pretending otherwise. The bounds, all recorded on the row:
+```
+102 mutable sites over 705 changed lines across 4 files
+cap 20  ->  19 mutants executed (1 candidate discarded: it did not compile)
+12 killed, 7 SURVIVED, 0 unjudged
+537.9 seconds wall clock  =  28.3 seconds per mutant
+mutation_state: mutants_survived   complete: false
+```
+
+A COMPLETE run over all 102 sites would therefore have cost roughly **48
+minutes of wall clock for one card**. That is too expensive to run on every
+build, and this document says so rather than pretending otherwise.
+
+Two things are worth stating about that result, because they are the whole
+argument for the label:
+
+* **7 of 19 mutants survived the test suite that this card itself authored.**
+  That suite is 43 tests, it passes, and it would satisfy both the CI arm and
+  the coverage arm of the twin gate. A worker-authored label said the work was
+  good; a label the worker did not author found 37 percent of a sample of
+  changed-line mutations that those tests do not notice. This is exactly the
+  gap section 1 says the twin gate cannot see, measured on a real diff.
+* **The run was INCOMPLETE (20 of 102 sites) and the verdict is still valid**,
+  because the verdict is `mutants_survived`. That is the asymmetry working as
+  designed: a survivor found in a sample is a real survivor. Had the same
+  incomplete run found no survivor it would have recorded `unobserved`, not
+  `survived_clean`.
+
+The bounds, all recorded on the row:
 
 | bound | default | effect when hit |
 | --- | --- | --- |
@@ -200,12 +224,31 @@ The card's success criterion was not "the loop is closed". It was that the
 refusal becomes falsifiable: someone can point at real data and argue the reopen
 condition is met, or point at it and argue it is not.
 
-That is now possible, and the honest current reading is: **not met.** The
-instrument exists, it produces a real verdict on a real diff (see section 3, and
-the run recorded in the S23 report), and the ledger's own summary
-(`autopilot_cost.mutation_summary()`) reports `observed_fraction: 0.0` and
-`survival_rate: null` because no executor stamps a report yet. That is an
-argument someone can now make against real data instead of against a gap.
+That is now possible, and the honest current reading is: **not met, and the one
+real measurement points AGAINST reopening.**
+
+The instrument exists and it produces a real verdict on a real diff: 7 of 19
+mutants survived this card's own passing, CI-green, coverage-satisfying test
+suite (section 3). If a single hand-run sample over one card's diff finds a 37
+percent survival rate, the twin gate's score is measuring less about
+correctness than a learner trained on it would need. That is evidence for the
+refusal, not against it.
+
+The ledger's own summary, measured on 2026-08-16 over all 183 rows:
+
+```
+{"rows": 183, "survived_clean": 0, "mutants_survived": 0, "unobserved": 183,
+ "observed": 0, "observed_fraction": 0.0, "survival_rate": null}
+```
+
+`survival_rate` is `null`, not `0.0`, and `observed_fraction` is `0.0`. Every
+one of those 183 rows predates this module and carries none of its keys; they
+read as `unobserved` because nothing backfilled them, which is the correct
+reading. A reader can now see at a glance that the fleet-wide number is not a
+measurement.
+
+So the argument someone can now make is against real data instead of against a
+gap.
 
 The condition flips when two things are true and both are measurable:
 `observed_fraction` on the ledger is materially above zero, and the survival

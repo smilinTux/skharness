@@ -163,7 +163,16 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
     live worktree at grade time is on the protected floor. The module therefore
     ships its own entry point (`python -m skharness.autocode.mutation`) so real
     data can be produced now. New read helper
-    `autopilot_cost.mutation_summary()`.
+    `autopilot_cost.mutation_summary()`, which over the live 183-row ledger
+    reports `observed_fraction: 0.0` and `survival_rate: null` rather than a
+    reassuring zero.
+  - MEASURED, not estimated. Run against this card's own diff: 102 mutable
+    sites, capped at 20, 19 mutants executed in 537.9s (28.3s each, so a
+    complete run would have been ~48 minutes for one card), **12 killed and 7
+    SURVIVED**. Those 7 survived the 43-test suite this card itself authored, a
+    suite that passes and satisfies both the CI and the coverage arm. The run
+    was incomplete and the `mutants_survived` verdict still stands, which is
+    the asymmetry working: a survivor found in a sample is a real survivor.
 - **Graded dispatch: a card's grade now selects the model.** `model_class` and
   `sensitivity` map onto a skgateway bucket id (`sk-<class>-<sensitivity>`),
   replacing the single static `autocode.config.harness_model`. Bucket ids are
