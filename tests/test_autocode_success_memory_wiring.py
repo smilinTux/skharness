@@ -19,7 +19,13 @@ import pytest
 from skharness.autocode.direct import DirectExecutor
 from skharness.autocode.engineering import EngineeringExecutor
 from skharness.autocode.types import (
-    GATE_OUTCOMES, GateResult, HarnessResult, QualityMode, RepoSpec, WorkItem)
+    GATE_OUTCOMES,
+    GateResult,
+    HarnessResult,
+    QualityMode,
+    RepoSpec,
+    WorkItem,
+)
 
 RUN_ID = "run-1"
 
