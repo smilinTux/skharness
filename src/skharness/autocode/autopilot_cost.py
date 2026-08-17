@@ -46,6 +46,74 @@ def _joules(cost_usd: float) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Attribution vocabulary + normalisers (A1, card 8967bf22)                    #
+# --------------------------------------------------------------------------- #
+
+#: Closed vocabulary for ``fallback_reason``: why a run was NOT served by the
+#: sovereign pi path. Closed on purpose. An open free-text field would let a
+#: rate ("what fraction of runs left pi, and why") be computed over a set of
+#: strings nobody can group, which is the same shape of unreadability the
+#: ``outcome`` vocabulary (types.GATE_OUTCOMES) exists to prevent.
+#:
+#: ``pi`` is a member rather than an absence: "pi served it" and "nobody looked"
+#: are different facts, and only the first should count as sovereign. None on
+#: the row means nothing was observed, never that pi served it.
+FALLBACK_REASONS: frozenset[str] = frozenset({
+    "pi",                    # no fallback: the sovereign pi adapter served it
+    "harness-configured",    # config selected a non-pi harness outright
+    "capability-missing",    # pi lacks a capability this run needed
+    "gateway-unreachable",   # the sovereign gateway did not answer
+    "bucket-unavailable",    # the requested bucket had no sovereign backend
+    "adapter-error",         # the pi adapter raised and another path ran
+    "unknown",               # not pi, and the reason itself was not observed
+})
+
+
+def _ident(value: object) -> str | None:
+    """Normalise one attribution string: a stripped str, or None.
+
+    Empty and whitespace-only collapse to None because an empty string is the
+    worst of both readings: it joins to nothing, yet it counts as present. A
+    ledger reader that groups by ``gateway_req_id`` or ``session_id`` would
+    build one large fake cohort out of every run that simply had no id. A null
+    says "absent" and groups as absent, which is the honest answer.
+    """
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _grade_axis(work_grade: object, key: str) -> str | None:
+    """One axis of the nested ``work_grade`` dict, lifted out for querying.
+
+    Reads the axis off the grade; it never re-derives one axis from another,
+    and never invents one for a card that does not carry it. Case is folded
+    down so ``"M"`` and ``"m"`` group as one value rather than two, matching
+    what ``escalation.floor_class`` already does with ``model_class``. The
+    nested dict itself is untouched and keeps whatever casing the card stored.
+
+    None for an ungraded card, a non-dict grade, or a missing/blank axis, which
+    all mean the same thing here: this row carries no value for that axis.
+    """
+    if not isinstance(work_grade, dict):
+        return None
+    axis = _ident(work_grade.get(key))
+    return axis.lower() if axis else None
+
+
+def _count(kind: str, **detail) -> None:
+    """Record one health event. Never raises: health.record is already silent,
+    and the import is guarded so a telemetry dependency can never turn a
+    telemetry failure into a run failure."""
+    try:
+        from . import health
+        health.record(kind, **detail)
+    except Exception:  # noqa: BLE001 -- counting a failure never causes one
+        pass
+
+
+# --------------------------------------------------------------------------- #
 # Paths                                                                       #
 # --------------------------------------------------------------------------- #
 
@@ -82,9 +150,18 @@ def record_run(*, card_id: str, repo: str, tokens: int, cost_usd: float,
                model_served: str | None = None, score: int | None = None,
                retries: int = 0, quality_mode: str | None = None,
                work_grade: dict | None = None,
-               terminal_state: str | None = None) -> None:
+               terminal_state: str | None = None,
+               agent: str | None = None, session_id: str | None = None,
+               agent_var: str | None = None,
+               session_id_var: str | None = None,
+               node: str | None = None, gateway_url: str | None = None,
+               bucket: str | None = None, backend_served: str | None = None,
+               gateway_req_id: str | None = None,
+               fallback_reason: str | None = None) -> None:
     """Append one run to the ledger. Never raises -- a cost-tracking bug must
-    never turn a successful (or a well-formed failed) run into a crash.
+    never turn a successful (or a well-formed failed) run into a crash. A
+    failed write is COUNTED as a health event rather than only logged, see the
+    bottom of this docstring.
 
     ``run_id`` (default "" for back-compat) is the bridge's own journal handle
     stamp (``airun-<card_id>-<YYYYmmddTHHMMSSZ>``), so ledger rows join cleanly
@@ -103,9 +180,27 @@ def record_run(*, card_id: str, repo: str, tokens: int, cost_usd: float,
     caller that does not know what actually served the run must pass None,
     not the request it made.
 
+    ``backend_served`` (A1, below) is held to that IDENTICAL discipline, for
+    the identical reason one level down: it names the backend that actually
+    answered, never the backend a bucket or a gateway config implies. Unknown
+    and matched are different facts. Defaulting either field from the request
+    would make every run in the ledger read as sovereign, and the resulting
+    100% sovereign rate would be indistinguishable from a real one.
+
     ``work_grade`` carries the Joule Economy grade dict (``size``, ``risk``,
     ``sensitivity``, ``model_class``) exactly as stored on the card, or None
     when the card is ungraded; this module never re-derives it.
+
+    ``work_grade`` STAYS NESTED. It is passed through as the dict it is, and
+    is never flattened away, because ``escalation.py`` (S12, landing on its own
+    branch with 31 tests) reads it with ``work_grade.get("model_class")`` at
+    lines 126-128: flattening would break that call site on contact.
+    The three ``grade_*`` keys on the row are DERIVED copies of the axes for
+    querying, computed here from the same dict, exactly as the
+    ``escalation_floor_class`` / ``escalation_served_class`` /
+    ``escalation_state`` facts are computed rather than accepted. They are an
+    addition beside the dict, never a replacement for it, and no caller can
+    set them to something the dict disagrees with.
 
     ``terminal_state`` (S4, card 432b81b7) names the terminal disposition of
     the run as its OWN DISPATCHER saw it, which is a different fact from
@@ -125,9 +220,80 @@ def record_run(*, card_id: str, repo: str, tokens: int, cost_usd: float,
     the row says "this item ended, and no gate outcome exists", which is
     neither a pass nor a null.
 
-    NO BACKFILL: rows written before this change carry none of these nine
-    keys at all (not even as null), and nothing on the read path invents a
-    value for them."""
+    ATTRIBUTION (A1, card 8967bf22). Ten optional fields, all defaulting to
+    None, answering "who ran this, where, and what actually served it". They
+    are the join keys that turn a ledger of anonymous rows into a ledger that
+    can be attributed:
+
+    ``agent``, ``session_id``, ``agent_var``, ``session_id_var``
+      The resolved writer identity plus its PROVENANCE. ``(agent_var,
+      session_id_var)`` is NOT redundant with ``agent``: the env vars that feed
+      the resolver genuinely disagree in production. One ``skcomms.service``
+      unit on the ``.41`` node sets ``SKAGENT=jarvis``,
+      ``SKMEMORY_AGENT=lumina`` and ``SKCHAT_IDENTITY=capauth:opus@skworld.io``
+      at once, so a row carrying only ``agent="jarvis"`` has silently discarded
+      the fact that two other names were also on the table, and no later reader
+      can recover which variable was read. ``agent_var`` names the variable the
+      name came from; ``session_id_var`` is ``"SK_SESSION_ID"`` when the id was
+      inherited across a re-exec or ``"minted"`` when this process created it,
+      which is what separates one long session from several short ones.
+
+    ``node``
+      ``socket.gethostname()`` of the box that ran it. The fleet is multi-node
+      and the ledger is Syncthing-synced into ONE tree, so without this every
+      node's rows are already interleaved and unseparable.
+
+    ``gateway_url``
+      Which skgateway answered. REQUIRED semantically even though it is
+      optional in the signature, because a bucket id is not self-describing: a
+      bucket resolves to different backends depending on the gateway that
+      resolved it, and ``autopilot-pi.yaml`` points at ``100.86.156.5:18780``
+      while the other flags in this epic were verified against
+      ``localhost:18780``. A bucket recorded without its gateway is
+      indistinguishable from correct routing whichever way it actually went.
+
+    ``bucket``
+      The ``sk-<class>-<sensitivity>`` id, when one was actually DISPATCHED.
+      Not the id a payload would have produced: an item that never reached a
+      dispatch has no bucket, and recording the hypothetical one would report
+      a dispatch that did not happen.
+
+    ``backend_served``
+      The backend that actually served the run, never derived. See the
+      ``model_served`` discipline above, which this field extends.
+
+    ``gateway_req_id``
+      The skgateway request id: the join key that lets a ledger row be matched
+      to the gateway's own record of the same call. It is the only field here
+      that makes the two sides checkable against each other rather than merely
+      consistent-looking.
+
+    ``fallback_reason``
+      A member of ``FALLBACK_REASONS`` (closed): why this run was not pi. An
+      off-vocabulary value is still written verbatim (a row is never dropped or
+      rewritten to fit a vocabulary) but is COUNTED as
+      ``ledger_vocabulary_drift`` so the drift is readable instead of silent.
+
+    FAILED WRITES ARE COUNTED. This function still never raises, but a write
+    that fails now records a ``ledger_write_error`` health event as well as
+    logging, matching what ``record_outcome_row`` already does with
+    ``outcome_row_error``. A run record that fails to write used to be visible
+    only as one line in a log nobody aggregates, which is exactly the
+    invisible-absence failure this epic exists to remove: the missing rows were
+    ABSENT rather than marked absent, so the ledger could not detect its own
+    gaps. A count can be read, alerted on, and compared against the run journal.
+
+    NO BACKFILL: rows written before this change carry none of these keys at
+    all (not even as null), and nothing on the read path invents a value for
+    them."""
+    fallback_reason = _ident(fallback_reason)
+    if fallback_reason is not None and fallback_reason not in FALLBACK_REASONS:
+        # Written through verbatim, never coerced: silently normalising an
+        # unknown value into "unknown" would erase the evidence that a caller
+        # and this vocabulary have diverged.
+        _count("ledger_vocabulary_drift", field="fallback_reason",
+               value=fallback_reason[:80], card_id=card_id, run_id=run_id)
+
     row = {
         "ts": ts, "date": ts[:10], "card_id": card_id, "repo": repo,
         "tokens": tokens, "cost_usd": cost_usd, "joules": _joules(cost_usd),
@@ -136,13 +302,33 @@ def record_run(*, card_id: str, repo: str, tokens: int, cost_usd: float,
         "model_requested": model_requested, "model_served": model_served,
         "score": score, "retries": retries, "quality_mode": quality_mode,
         "work_grade": work_grade, "terminal_state": terminal_state,
+        # A1 attribution. Every id goes through _ident, so a caller that has
+        # nothing to say writes a null rather than an empty string that would
+        # group as a real (and enormous) cohort.
+        "agent": _ident(agent), "session_id": _ident(session_id),
+        "agent_var": _ident(agent_var),
+        "session_id_var": _ident(session_id_var),
+        "node": _ident(node), "gateway_url": _ident(gateway_url),
+        "bucket": _ident(bucket),
+        # NEVER defaulted from model_requested, model_served, bucket or
+        # gateway_url. Only a caller that observed the answer can fill it.
+        "backend_served": _ident(backend_served),
+        "gateway_req_id": _ident(gateway_req_id),
+        "fallback_reason": fallback_reason,
+        # Derived FROM the nested work_grade dict above, which stays intact.
+        "grade_size": _grade_axis(work_grade, "size"),
+        "grade_risk": _grade_axis(work_grade, "risk"),
+        "grade_sensitivity": _grade_axis(work_grade, "sensitivity"),
     }
     try:
         path = ledger_path()
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
-    except Exception:  # noqa: BLE001 -- ledger writes are best-effort
+    except Exception as exc:  # noqa: BLE001 -- ledger writes are best-effort
         log.exception("autopilot_cost.record_run: failed to append ledger row")
+        # Counted, not just logged: see FAILED WRITES ARE COUNTED above.
+        _count("ledger_write_error", card_id=card_id, run_id=run_id,
+               terminal_state=terminal_state, error=str(exc)[:120])
 
 
 def _read_ledger() -> list[dict]:
