@@ -240,7 +240,8 @@ def test_summary_text_reports_the_fraction_of_the_ledger_affected():
     text = wc.summary_text(wc.correct_ledger(rows))
     assert "50.0%" in text
     assert "75" in text
-    assert "—" not in text and "–" not in text
+    # house style: no em dash or en dash in emitted text
+    assert "\u2014" not in text and "\u2013" not in text
 
 
 def test_cli_reports_without_touching_the_wallet(tmp_path, capsys):
