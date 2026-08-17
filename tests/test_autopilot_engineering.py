@@ -912,3 +912,65 @@ def test_pr_base_uses_integration_branch_when_it_exists(mocker):
                      args=[], returncode=0,
                      stdout="abc123\trefs/heads/autopilot/integration\n", stderr=""))
     assert ex._pr_base(_pr_spec()) == "autopilot/integration"
+
+
+# ── Merge-commit sha is recorded, so revert actually works (card 1e5be0a7) ────
+# Before this, the merge record was {pr, branch, ts, auto} with no sha while
+# _revert_impl required merge["sha"], so revert ALWAYS failed on automerged work
+# and meta.autopilot.reverted could never be written. A calibration loop reading
+# "was this reverted" therefore got a constant False for a broken-tool reason.
+
+def _ex():
+    cfg = _t.SimpleNamespace(repo_map={"skrender": _spec("skrender")}, automerge_repos=[])
+    return EngineeringExecutor(cfg, board=object(), journal=object())
+
+
+def test_merge_record_carries_the_merge_commit_sha(mocker):
+    ex = _ex()
+    spec = _spec("skrender")
+    run = mocker.patch("skharness.autocode.engineering.subprocess.run",
+                       return_value=mocker.Mock(returncode=0, stdout="abc123sha\n", stderr=""))
+    sha = ex._merge_commit_sha(spec, "autopilot/t1")
+    assert sha == "abc123sha"
+    argv = run.call_args_list[-1].args[0]
+    assert argv[:4] == ["gh", "pr", "view", "autopilot/t1"], argv
+    assert "mergeCommit" in argv
+
+
+def test_merge_sha_lookup_failure_degrades_the_record_not_the_merge(mocker):
+    # NEGATIVE CONTROL: a failed sha lookup must return "" rather than raising.
+    # Raising here would leave a MERGED pr with no board record at all, which is
+    # strictly worse than a record that cannot be reverted.
+    ex = _ex()
+    mocker.patch("skharness.autocode.engineering.subprocess.run",
+                 return_value=mocker.Mock(returncode=1, stdout="", stderr="boom"))
+    assert ex._merge_commit_sha(_spec("skrender"), "autopilot/t1") == ""
+
+    mocker.patch("skharness.autocode.engineering.subprocess.run",
+                 side_effect=OSError("gh not found"))
+    assert ex._merge_commit_sha(_spec("skrender"), "autopilot/t1") == ""
+
+
+def test_revert_distinguishes_never_merged_from_merged_without_sha(mocker):
+    cfg = _t.SimpleNamespace(repo_map={"skrender": _spec("skrender")}, automerge_repos=[])
+    board = mocker.Mock()
+
+    # (a) genuinely never merged
+    never = _t.SimpleNamespace(id="t1", tags=["repo:skrender"], meta={"autopilot": {}})
+    board.load_tasks.return_value = [never]
+    with pytest.raises(ValueError, match="no recorded merge"):
+        _revert_impl(board, cfg, "t1")
+
+    # (b) merged, but the sha is missing. MUST NOT say "no recorded merge":
+    # telling an operator the work was never merged when it WAS is the failure
+    # this test exists to prevent.
+    merged = _t.SimpleNamespace(
+        id="t2", tags=["repo:skrender"],
+        meta={"autopilot": {"merge": {"pr": "http://pr/9", "branch": "b", "auto": True}}})
+    board.load_tasks.return_value = [merged]
+    with pytest.raises(ValueError) as exc:
+        _revert_impl(board, cfg, "t2")
+    msg = str(exc.value)
+    assert "WAS merged" in msg
+    assert "no recorded merge" not in msg
+    assert "http://pr/9" in msg          # tells the operator where to look
