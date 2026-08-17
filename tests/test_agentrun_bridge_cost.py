@@ -186,6 +186,119 @@ def test_non_passing_run_still_records_a_ledger_row_with_empty_pr(mocker):
 
 
 # --------------------------------------------------------------------------- #
+# 1b. S4 scope addition (card 432b81b7): the bridge threads the S3 fields.    #
+#                                                                             #
+# S3 widened record_run and left this, its only caller, unwired, so every     #
+# real row written since carried nulls for all eight new fields. A row with a #
+# null outcome is indistinguishable from a run that had no outcome, which is  #
+# the exact defect epic 935d4b61 exists to remove.                            #
+#                                                                             #
+# The GateResults below are the shapes direct.py actually returns from its    #
+# two terminal branches (score None, mode direct, outcome pass|direct_fail);  #
+# the values are read off the result the executor returned, never handed to   #
+# record_run by the test.                                                     #
+# --------------------------------------------------------------------------- #
+
+
+def _direct_result(passed: bool) -> GateResult:
+    """What DirectExecutor.run returns from its two terminal branches."""
+    return GateResult(score=None, passed=passed,
+                      notes="direct mode: UNGATED single run; review required",
+                      artifact="/fake/worktree", mode=QualityMode.DIRECT.value,
+                      outcome=("pass" if passed else "direct_fail"))
+
+
+@pytest.mark.needs_skcapstone
+def test_bridge_row_carries_a_real_outcome_not_a_null(mocker):
+    """The load-bearing half for this leg: a REFUSED bridge run writes a row
+    whose outcome is the direct run's real terminal state."""
+    card = _card(["repo:skrender"])
+    harness = _FakeHarness(tokens=42, cost_usd=0.05)
+    _wire_common(mocker, card, _cfg(), harness)
+
+    def _failing_run(self, item, harness):
+        self.journal.set_worktree(item.ref, "/fake/worktree")
+        harness.run_task(_t.SimpleNamespace())
+        return _direct_result(passed=False)
+
+    mocker.patch.object(AgentRunDirectExecutor, "run", _failing_run)
+    mocker.patch("skharness.autocode.agentrun_bridge.ratify",
+                 side_effect=lambda *a, **k: GateResult(
+                     score=2, passed=False, notes="thin", artifact=None,
+                     outcome="ci_red"))
+    mocker.patch.object(AgentRunDirectExecutor, "prune_worktree")
+
+    execute_dispatch(_context(card_id=card.id))
+
+    row = autopilot_cost._read_ledger()[0]
+    assert row["outcome"] == "direct_fail"     # NOT None, NOT "pass"
+    assert row["passed"] is False              # and it agrees with `passed`
+    assert row["terminal_state"] == "agentrun-refused"
+    assert row["adapter"] == "fake"
+    assert row["quality_mode"] == "direct"
+    assert row["score"] == 2                   # the INDEPENDENT ratify grade
+    assert row["retries"] == 0
+
+
+@pytest.mark.needs_skcapstone
+def test_bridge_row_on_a_pass_carries_outcome_and_the_ratify_score(mocker):
+    card = _card(["repo:skrender"])
+    harness = _FakeHarness(tokens=555, cost_usd=1.23)
+    _wire_common(mocker, card, _cfg(), harness)
+
+    def _passing_run(self, item, harness):
+        self.journal.set_worktree(item.ref, "/fake/worktree")
+        harness.run_task(_t.SimpleNamespace())
+        return _direct_result(passed=True)
+
+    def _finalize(self, item, result):
+        self.pr_url = "https://github.com/acme/skrender/pull/42"
+
+    mocker.patch.object(AgentRunDirectExecutor, "run", _passing_run)
+    mocker.patch("skharness.autocode.agentrun_bridge.ratify", side_effect=_passing_ratify)
+    mocker.patch.object(AgentRunDirectExecutor, "finalize", _finalize)
+
+    execute_dispatch(_context(card_id=card.id))
+
+    row = autopilot_cost._read_ledger()[0]
+    assert row["outcome"] == "pass"
+    assert row["terminal_state"] == "agentrun-finalized"
+    assert row["score"] == 5                   # from ratify, not from gr
+    assert row["quality_mode"] == "direct"
+
+
+@pytest.mark.needs_skcapstone
+def test_bridge_never_defaults_model_served_from_model_requested(mocker):
+    """Negative control. _FakeHarness carries no `model`, so model_requested is
+    None here; the point is that model_served is None INDEPENDENTLY of it and
+    is never echoed from the request. During the .100 outage on 2026-08-16
+    skgateway silently served a cloud model for a sovereign sk-default request,
+    and a defaulted model_served would have hidden exactly that."""
+    card = _card(["repo:skrender"])
+    harness = _FakeHarness(tokens=1, cost_usd=0.01)
+    harness.model = "ornith-big"
+    _wire_common(mocker, card, _cfg(), harness)
+
+    def _failing_run(self, item, harness):
+        self.journal.set_worktree(item.ref, "/fake/worktree")
+        harness.run_task(_t.SimpleNamespace())
+        return _direct_result(passed=False)
+
+    mocker.patch.object(AgentRunDirectExecutor, "run", _failing_run)
+    mocker.patch("skharness.autocode.agentrun_bridge.ratify", side_effect=_passing_ratify)
+    mocker.patch.object(AgentRunDirectExecutor, "prune_worktree")
+
+    execute_dispatch(_context(card_id=card.id))
+
+    row = autopilot_cost._read_ledger()[0]
+    assert row["model_requested"] == "ornith-big"
+    assert row["model_served"] is None
+    # The bridge builds an ad-hoc WorkItem with no Joule grade. None here means
+    # "genuinely ungraded", not "we forgot to look": nothing is invented.
+    assert row["work_grade"] is None
+
+
+# --------------------------------------------------------------------------- #
 # 2. Pre-existing day_total over the cap refuses WITHOUT running the engine   #
 # --------------------------------------------------------------------------- #
 

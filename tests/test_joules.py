@@ -76,6 +76,55 @@ def test_from_claude_json_tolerates_missing_fields():
     assert u.tokens == 0 and u.cost_usd == 0.0 and u.turns == 0
 
 
+# ── S10: BuildUsage.model must name the adapter that ACTUALLY ran ────────────
+# pi and opencode return an envelope with no `usage` key, so the accrual took a
+# fallback branch that never set model, and every cost row and settlement for a
+# pi build claimed to be claude-code.
+
+class _FakeResult:
+    """The HarnessResult shape the accrual reads (ok/tokens/cost_usd/raw)."""
+
+    def __init__(self, tokens=0, cost_usd=0.0, raw=None):
+        self.ok = True
+        self.artifact = None
+        self.tokens = tokens
+        self.cost_usd = cost_usd
+        self.raw = raw if raw is not None else {}
+
+
+def test_from_harness_result_records_the_adapter_on_the_fallback_branch():
+    """A pi envelope: no `usage` key, no `model` key. The recorded model must be
+    the adapter that ran, never the claude-code default."""
+    u = BuildUsage.from_harness_result(_FakeResult(tokens=42, cost_usd=0.07),
+                                       adapter="pi")
+    assert u.model == "pi"
+    assert u.output_tokens == 42 and u.cost_usd == 0.07 and u.turns == 1
+
+
+def test_from_harness_result_prefers_the_model_the_envelope_names():
+    """A claude-code envelope names the real model id; the adapter name must not
+    overwrite a more specific truth."""
+    raw = {"model": "claude-sonnet-x", "total_cost_usd": 0.5, "num_turns": 2,
+           "usage": {"input_tokens": 10, "output_tokens": 5}}
+    u = BuildUsage.from_harness_result(_FakeResult(raw=raw), adapter="claude-code")
+    assert u.model == "claude-sonnet-x"
+    assert u.input_tokens == 10 and u.output_tokens == 5
+
+
+def test_from_harness_result_falls_back_to_adapter_when_envelope_omits_model():
+    """A usage block with no model id: the adapter is still the best truth
+    available, and it must not silently read as claude-code."""
+    u = BuildUsage.from_harness_result(
+        _FakeResult(raw={"usage": {"output_tokens": 3}}), adapter="opencode")
+    assert u.model == "opencode"
+
+
+def test_build_usage_default_model_does_not_claim_claude_code():
+    """An unfed BuildUsage has measured nothing, so it must not name a vendor.
+    The old default made 'never recorded' and 'ran on claude-code' identical."""
+    assert BuildUsage().model == "unknown"
+
+
 @requires_skjoule
 def test_settle_mints_and_spends_real_pnl(tmp_path):
     usage = BuildUsage(model="claude-code", input_tokens=1000, output_tokens=500, cost_usd=0.50)

@@ -1,6 +1,8 @@
+import pytest
+
 from skharness.autocode.types import (
     WorkItem, RepoSpec, AssessBrief, TaskBrief, GradeBrief,
-    GateResult, Verdict, HarnessResult, DecisionItem,
+    GateResult, GATE_OUTCOMES, UNRECORDED, Verdict, HarnessResult, DecisionItem,
 )
 
 
@@ -33,3 +35,49 @@ def test_all_contracts_construct():
     di = DecisionItem(qid="q1", prompt="?", options={"yes": 1}, action_ref=None, priority="high")
     assert wi.repo == "skos" and gr.passed and hr.tokens == 10 and di.qid == "q1"
     assert ab.tags == ["repo:skos"] and tb.round == 1 and gb.ci_status == "green"
+
+
+def test_gateresult_outcome_vocabulary_is_exactly_five_values():
+    # Load-bearing: this set is closed. If a sixth value is added to GATE_OUTCOMES
+    # without updating this test, this assertion fails.
+    assert GATE_OUTCOMES == {"pass", "ci_red", "no_op", "salvage", "direct_fail"}
+    assert len(GATE_OUTCOMES) == 5
+
+
+def test_gateresult_outcome_and_cost_fields_have_safe_defaults():
+    # Existing construction sites across the repo do not pass outcome/tokens/cost_usd.
+    # They must keep constructing without error, with tokens/cost_usd defaulting to 0/0.0.
+    gr = GateResult(score=5, passed=True, notes="", artifact=None)
+    assert gr.outcome == UNRECORDED
+    assert gr.tokens == 0
+    assert gr.cost_usd == 0.0
+
+
+def test_unrecorded_is_not_in_gate_outcomes():
+    # UNRECORDED means "no terminal state was recorded". It must never be mistaken
+    # for a member of the closed five-value terminal-state vocabulary.
+    assert UNRECORDED not in GATE_OUTCOMES
+
+
+def test_gateresult_default_outcome_does_not_report_pass():
+    # A default-constructed GateResult (no outcome passed) must NOT read as a success.
+    # If anyone ever changes the default back to "pass", this test goes red.
+    gr = GateResult(score=5, passed=True, notes="", artifact=None)
+    assert gr.outcome != "pass"
+    assert gr.outcome == UNRECORDED
+
+
+def test_gateresult_accepts_each_vocabulary_value():
+    for outcome in GATE_OUTCOMES:
+        gr = GateResult(score=5, passed=True, notes="", artifact=None, outcome=outcome,
+                         tokens=42, cost_usd=1.5)
+        assert gr.outcome == outcome
+        assert gr.tokens == 42
+        assert gr.cost_usd == 1.5
+
+
+def test_gateresult_rejects_invalid_outcome():
+    # Negative control: an outcome outside the closed vocabulary must be rejected,
+    # not silently accepted.
+    with pytest.raises(ValueError):
+        GateResult(score=5, passed=True, notes="", artifact=None, outcome="totally_bogus")

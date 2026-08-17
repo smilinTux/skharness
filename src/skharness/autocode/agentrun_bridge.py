@@ -301,10 +301,36 @@ def execute_dispatch(context: dict) -> dict:
                      f"twin gate {'PASS' if rr.passed else 'not passed'}: {rr.notes}"),
         })
 
-        def _record_cost_and_check_caps(pr_url_for_record: str) -> None:
+        def _record_cost_and_check_caps(pr_url_for_record: str,
+                                        terminal_state: str) -> None:
             """Ledger write + activity line + cap alert. Wrapped defensively so
             a cost-tracking bug can NEVER turn this run's real outcome
-            (pass/refuse, PR opened or not) into a crash."""
+            (pass/refuse, PR opened or not) into a crash.
+
+            S4 scope addition (card 432b81b7): S3 widened record_run with eight
+            outcome fields but did not thread them into this, its only caller,
+            so every real row written since has carried nulls for all of them.
+            A row with a null outcome is indistinguishable from a run that had
+            no outcome, which is the exact defect this epic exists to remove.
+            Each value below is OBSERVED on this run, never derived:
+
+              outcome        gr.outcome, the sandboxed direct run's terminal
+                             state (S2 populates it in direct.py). It matches
+                             the row's `passed`, which has always been
+                             gr.passed, so the two cannot disagree.
+              score          rr.score, the INDEPENDENT ratify grade. Direct
+                             mode runs no grader at all, so gr.score is always
+                             None and rr is the only grade this run produced.
+              quality_mode   gr.mode, stamped by the executor that actually
+                             ran, not the mode this code hoped it would use.
+              model_served   None, always. The bridge does not observe what
+                             skgateway served; echoing model_requested would
+                             manufacture the exact fact that field detects.
+              work_grade     None: the bridge builds an ad-hoc WorkItem with
+                             no Joule grade, so the card genuinely is ungraded
+                             here. Nothing is invented to fill the column.
+              retries        0: direct mode is ONE round, by construction.
+            """
             try:
                 day_after = pre + captured["cost_usd"]
                 activity.append({
@@ -313,10 +339,19 @@ def execute_dispatch(context: dict) -> dict:
                              f"{captured['tokens']} tokens; today "
                              f"${day_after:.2f}/${cfg.caps.max_usd_per_day:.0f}"),
                 })
+                model = getattr(harness, "model", None)
                 autopilot_cost.record_run(
                     card_id=card_id, repo=repo.name, tokens=captured["tokens"],
                     cost_usd=captured["cost_usd"], passed=bool(gr.passed),
-                    pr=pr_url_for_record, ts=_now_iso(), run_id=run_id)
+                    pr=pr_url_for_record, ts=_now_iso(), run_id=run_id,
+                    terminal_state=terminal_state,
+                    outcome=getattr(gr, "outcome", None),
+                    adapter=getattr(harness, "name", None),
+                    model_requested=(model if isinstance(model, str) and model
+                                     else None),
+                    model_served=None,
+                    score=getattr(rr, "score", None), retries=0,
+                    quality_mode=getattr(gr, "mode", None), work_grade=None)
                 autopilot_cost.check_and_alert_caps(
                     cfg=cfg, today=today, day_cost=day_after,
                     this_run_tokens=captured["tokens"])
@@ -326,13 +361,13 @@ def execute_dispatch(context: dict) -> dict:
         if not gr.passed:
             if wt:
                 ex.prune_worktree(repo, wt)
-            _record_cost_and_check_caps("")
+            _record_cost_and_check_caps("", "agentrun-refused")
             return _refuse(f"sandboxed run did not pass: {gr.notes}", activity)
 
         ex.finalize(item, gr)          # commit + push + DRAFT PR; gr.mode == "direct"
         branch = f"autopilot/{item.ref}"
         pr_url = getattr(ex, "pr_url", "")
-        _record_cost_and_check_caps(pr_url)
+        _record_cost_and_check_caps(pr_url, "agentrun-finalized")
         if not pr_url:
             return _refuse(
                 f"branch {branch} pushed but the PR could not be opened "

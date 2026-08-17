@@ -95,8 +95,14 @@ class EngineeringExecutor:
                 or getattr(self.config, "agent", None)
                 or "lumina")
 
-    def _accrue_usage(self, ref: str, hr) -> None:
+    def _accrue_usage(self, ref: str, hr, adapter: str = "") -> None:
         """Fold one implement round's tokens + cost into the build's running usage.
+
+        `adapter` is the harness that actually ran this round. Both envelope
+        shapes are now parsed by ONE helper (BuildUsage.from_harness_result), so
+        the fallback branch taken by pi and opencode (their envelope has no
+        `usage` key) can no longer leave the model unset and inherit a
+        claude-code label it never earned.
 
         Best-effort telemetry: never raises into the build loop.
         """
@@ -104,31 +110,118 @@ class EngineeringExecutor:
             from .joules import BuildUsage
 
             u = self._build_usage.setdefault(ref, BuildUsage())
-            raw = getattr(hr, "raw", None)
-            if isinstance(raw, dict) and raw.get("usage"):
-                r = BuildUsage.from_claude_json(raw)
-                u.add(input_tokens=r.input_tokens, output_tokens=r.output_tokens,
-                      cost_usd=r.cost_usd, turns=r.turns, model=r.model)
-            else:  # older/stub result: fall back to the summed fields
-                u.add(output_tokens=int(getattr(hr, "tokens", 0) or 0),
-                      cost_usd=float(getattr(hr, "cost_usd", 0.0) or 0.0), turns=1)
+            r = BuildUsage.from_harness_result(hr, adapter=adapter)
+            u.add(input_tokens=r.input_tokens, output_tokens=r.output_tokens,
+                  cost_usd=r.cost_usd, turns=r.turns, model=r.model)
         except Exception as exc:
             health.record("usage_accrue_error", task=ref, error=str(exc)[:120])
 
-    def _settle_economics(self, item: WorkItem, sha: str) -> None:
-        """Settle the build's joule P&L on a twin-gate pass (mint value, spend real
-        token cost). Best-effort: a wallet failure never affects the finalized PR."""
+    def _take_usage(self, ref: str, outcome: str):
+        """Take a terminal non-pass's accrued usage off the books and RECORD it.
+
+        Two separate concerns used to be collapsed into one `pop`:
+
+          MINTING   -- legal ONLY on a twin-gate pass. settle()'s contract, and
+                       this method does not touch it: settle() is still reachable
+                       only from _settle_economics, only on result.passed.
+          RECORDING -- what the run actually COST. True on every path, and the
+                       one number an honest cost picture cannot do without.
+
+        The salvage path popped the usage under the comment "no mint on a
+        non-pass". The comment was right; the action overreached and discarded
+        the telemetry along with the mint, so a salvaged run's real token and
+        dollar cost was recorded nowhere at all. Meanwhile the no-op bail and the
+        did-not-converge return never popped at all, so _build_usage grew for the
+        process lifetime.
+
+        One place now removes the usage from the books AND writes it down, which
+        fixes the leak and the censorship together. Returns the BuildUsage so a
+        caller can read tokens/cost off it; best-effort, never raises into the
+        build loop.
+        """
+        from .joules import BuildUsage
+
+        usage = self._build_usage.pop(ref, None) or BuildUsage()
         try:
+            health.record("build_usage_unsettled", task=ref, outcome=outcome,
+                          tokens=usage.tokens, cost_usd=round(usage.cost_usd, 6),
+                          model=usage.model, turns=usage.turns, minted=False)
+        except Exception as exc:      # noqa: BLE001 - telemetry never breaks a build
+            log_ref = str(exc)[:120]
+            print(f"autopilot[{ref}] usage record failed (build unaffected): {log_ref}")
+        return usage
+
+    def _peek_usage(self, ref: str):
+        """This build's usage so far, WITHOUT taking it off the books.
+
+        The twin-gate pass return needs the numbers, but it must not take them:
+        _settle_economics is the one path allowed to pop them, because it is the
+        one path allowed to mint. Every non-pass terminal uses _take_usage
+        instead, which pops and records.
+        """
+        from .joules import BuildUsage
+
+        return self._build_usage.get(ref) or BuildUsage()
+
+    def _settle_economics(self, item: WorkItem, sha: str, *,
+                          retries: int = 0, rounds_max: int = 0) -> None:
+        """Settle the build's joule P&L on a twin-gate pass (mint value, spend real
+        token cost). Best-effort: a wallet failure never affects the finalized PR.
+
+        `retries` is how many recorded attempts this card burned before the pass,
+        captured by the caller BEFORE _archive_attempts clears them, and
+        `rounds_max` is the highest round any of those attempts reached.
+
+        Both are CLIPPED, not unbounded: a single run grinds at most
+        _MAX_ROUNDS (4) rounds before it terminates, so rounds_max saturates
+        there and a genuinely harder card is indistinguishable from a merely
+        hard one past the cap. The cap is emitted alongside the value
+        (`rounds_cap`) so no reader can mistake the distribution for an open one.
+        """
+        try:
+            from . import autopilot_cost
             from .joules import BuildUsage, settle
 
+            # Double-settle guard. finalize CAN run twice on one card: the
+            # orchestrator turns a finalize failure into a DecisionItem and a
+            # retry re-enters finalize with a FRESH worktree and a FRESH commit
+            # sha, so a (card_id, commit_sha) key would not catch it. This is the
+            # same journal-local "one settlement per card_id" rule the agent-run
+            # bridge already applies (autopilot_cost.already_settled); reuse it
+            # rather than growing a second, divergent guard.
+            #
+            # It matters beyond the wallet balance: once outcome rows exist, a
+            # double settle is a duplicate row for one unit of work, biasing any
+            # count computed from them, and the bias is invisible because both
+            # rows are individually valid.
+            if autopilot_cost.already_settled(item.ref):
+                # Still take the usage off the books and write the numbers down
+                # (S5): a refused mint must not become a silent leak.
+                self._take_usage(item.ref, "pass")
+                health.record("build_economics_skipped", task=item.ref,
+                              reason="already_settled")
+                print(f"autopilot[{item.ref}] joules already settled for this card")
+                return
             usage = self._build_usage.pop(item.ref, None) or BuildUsage()
             econ = settle(self._agent(), item.ref,
                           priority=item.payload.get("priority"),
                           score=5, usage=usage, commit_sha=sha)
+            if econ.recorded:
+                # Arm the guard ONLY on a settlement that actually happened. On a
+                # bare harness (skjoule absent) settle() is a no-op returning
+                # recorded=False; journalling that would let a no-op permanently
+                # block the real settlement on a node that does have the wallet.
+                autopilot_cost.record_settlement(
+                    card_id=item.ref, commit_sha=sha, agent=self._agent(),
+                    minted=econ.minted, spent=econ.spent_joules,
+                    net=econ.net_joules, balance_after=econ.balance_after,
+                    ts=_now_iso())
             health.record("build_economics", task=item.ref, minted=econ.minted,
                           cost_usd=econ.cost_usd, net_joules=econ.net_joules,
                           joules_per_usd=round(econ.joules_per_usd, 2),
-                          tokens=econ.tokens, recorded=econ.recorded)
+                          tokens=econ.tokens, recorded=econ.recorded,
+                          retries=retries, rounds_max=rounds_max,
+                          rounds_cap=self._MAX_ROUNDS)
             if econ.recorded:
                 print(f"autopilot[{item.ref}] {econ.summary()}")
         except Exception as exc:
@@ -297,19 +390,34 @@ class EngineeringExecutor:
             health.record("record_attempt_error", task=item.ref,
                           outcome=outcome, error=str(exc)[:120])
 
-    def _archive_attempts(self, item: WorkItem) -> None:
+    def _archive_attempts(self, item: WorkItem) -> list:
         """On a pass, clear the card's failure memory and keep it in the journal.
 
         skcoord clears and hands the entries back; skharness archives them. A
         flake therefore haunts a card at most until its next pass.
+
+        RETURNS the archived entries so the caller can carry the retry evidence
+        forward to the recording point. This used to return None, and the archive
+        runs before that point, so a card that struggled through several attempts
+        and then passed recorded ZERO retries: the hardest-won evidence in the
+        dataset was deleted milliseconds before the only place that could keep
+        it. Retry count is the best available proxy for "was this card harder
+        than its grade said", which is the whole question the calibration work
+        exists to answer.
+
+        Returns an empty list (never None) on any failure, so a caller can take
+        len() unconditionally; the archive is best-effort and never breaks a
+        finalize.
         """
         try:
-            removed = self.board.clear_attempts(item.ref)
+            removed = self.board.clear_attempts(item.ref) or []
             if removed:
                 self.journal.archive_attempts(item.ref, removed)
                 health.record("attempts_cleared", task=item.ref, count=len(removed))
+            return list(removed)
         except Exception as exc:      # noqa: BLE001 - never break a finalize
             health.record("clear_attempts_error", task=item.ref, error=str(exc)[:120])
+            return []
 
     def escalate(self, item: WorkItem, reason: str) -> DecisionItem:
         """Queue a decision for a non-converging item (mirrors the stub shape)."""
@@ -372,7 +480,10 @@ class EngineeringExecutor:
                            prior_feedback=feedback, round=rnd)
             attach_dispatch_model(tb, dispatch_model)
             hr = harness.run_task(tb)
-            self._accrue_usage(item.ref, hr)   # token/cost telemetry for the joule P&L
+            # token/cost telemetry for the joule P&L. harness.name is the adapter
+            # that actually ran, and it is the model of record when the envelope
+            # does not name one (pi and opencode never do).
+            self._accrue_usage(item.ref, hr, getattr(harness, "name", ""))
             diff = self._diff(repo, wt)
             # No-op guard (efficiency): a build that produces NO diff can never
             # pass the gate, so grinding all MAX_ROUNDS on it burns tokens for
@@ -396,12 +507,15 @@ class EngineeringExecutor:
                                     "cannot write"),
                         replacement_hint=("verify against the base branch before "
                                           "re-implementing"))
+                    # record what the two rounds cost; no mint (not a pass)
+                    u = self._take_usage(item.ref, "no_op")
                     return GateResult(
                         score=None, passed=False, artifact=None,
                         notes=("no-op: the agent produced no diff in 2 rounds. The "
                                "acceptance is likely ALREADY satisfied on the base "
                                "branch (stale card) or the harness cannot write. "
-                               "This is not a gate failure -- review the card."))
+                               "This is not a gate failure -- review the card."),
+                        outcome="no_op", tokens=u.tokens, cost_usd=u.cost_usd)
                 feedback = ("You produced NO changes to the repository. If the "
                             "acceptance criteria are ALREADY satisfied by existing "
                             "code on this branch, do not re-implement -- instead make "
@@ -425,8 +539,23 @@ class EngineeringExecutor:
             # coverage. The predicate is the shared twin_gate_passed (also used by
             # the ratify one-shot) so the gate has one definition, never two.
             if twin_gate_passed(gr, ci_status, cov, repo):
-                return GateResult(score=5, passed=True,
-                                  notes=strip_promise(gr.notes), artifact=gr.artifact)
+                # Return the score the GRADER produced, which is the same number
+                # already persisted to the board two lines up. The old literal 5
+                # was accurate (twin_gate_passed requires gr.score == 5 to reach
+                # here) but it restated the gate's current threshold instead of
+                # reading the grade, so the pass path was structurally incapable
+                # of ever carrying a different number and the value was
+                # indistinguishable from a constant to every downstream reader.
+                # NOTE deliberately NOT folded in: _settle_economics still passes
+                # score=5 to settle(). That changes minted joule values, so it is
+                # an economic change needing Chef's sign-off (spec open question 2).
+                # PEEK, never take: finalize's _settle_economics pops this usage
+                # to mint against it, and it is the only path allowed to.
+                u = self._peek_usage(item.ref)
+                return GateResult(score=gr.score, passed=True,
+                                  notes=strip_promise(gr.notes), artifact=gr.artifact,
+                                  outcome="pass", tokens=u.tokens,
+                                  cost_usd=u.cost_usd)
             # Grade-resilience: the grader could not certify (score None == the
             # adapter returned no parseable verdict even after its retries -- a
             # flaky/transient grade), BUT the DETERMINISTIC signals are strong: CI
@@ -437,10 +566,14 @@ class EngineeringExecutor:
             if gr.score is None and ci_status == "green" and diff.strip() and cov_ok:
                 health.record("grade_inconclusive_ci_green", task=item.ref, round=rnd)
                 pr_url = self._salvage_to_review(item, repo, wt, pr_branch)
+                # record what the salvaged rounds cost; no mint (the grade never
+                # said 5, so this is not a pass)
+                u = self._take_usage(item.ref, "salvage")
                 return GateResult(
                     score=None, passed=False, artifact=pr_url,
                     notes=(f"grade inconclusive but CI green + coverage met; opened "
-                           f"PR {pr_url} for human review (NOT auto-merged)."))
+                           f"PR {pr_url} for human review (NOT auto-merged)."),
+                    outcome="salvage", tokens=u.tokens, cost_usd=u.cost_usd)
             feedback = strip_promise(gr.notes)
         # Terminal: the rounds are spent and the gate never closed. Distil the
         # cause (failing test id + assertion) rather than carrying the grader's
@@ -450,10 +583,13 @@ class EngineeringExecutor:
             tried=f"gated build of {p.get('title', item.ref)!r}, "
                   f"{self._MAX_ROUNDS} rounds",
             why_failed=distill_failure(strip_promise(last.notes) if last else ""))
+        # record what all the rounds cost; no mint (the gate never closed)
+        u = self._take_usage(item.ref, "ci_red")
         return GateResult(score=(last.score if last else None), passed=False,
                           notes=f"did not converge in {self._MAX_ROUNDS} rounds: "
                                 f"{strip_promise(last.notes) if last else ''}",
-                          artifact=(last.artifact if last else None))
+                          artifact=(last.artifact if last else None),
+                          outcome="ci_red", tokens=u.tokens, cost_usd=u.cost_usd)
 
     def _merge(self, repo: RepoSpec, pr_branch: str) -> str:
         subprocess.run(["git", "-C", repo.path, "checkout", repo.integration_branch],
@@ -513,7 +649,12 @@ class EngineeringExecutor:
         """
         self._commit_and_push(repo, wt, pr_branch, item)
         pr_url = self._open_pr(repo, pr_branch, item)
-        self._build_usage.pop(item.ref, None)   # drop unsettled usage (no mint on a non-pass)
+        # The usage is NOT dropped here any more. This helper owns the PR
+        # mechanics, not the books: the caller's terminal return takes the usage
+        # off the books via _take_usage AND records it. The no-mint rule is
+        # unchanged (settle() is still only reachable from _settle_economics on a
+        # pass); what changed is that the numbers are now written down instead of
+        # thrown away with the mint.
         health.record("grade_salvaged_to_review", task=item.ref, pr=pr_url)
         print(f"autopilot[{item.ref}] grade inconclusive; salvaged to PR {pr_url} for review")
         return pr_url
@@ -528,11 +669,6 @@ class EngineeringExecutor:
                 "EngineeringExecutor cannot finalize a non-gated result; "
                 "non-gated work is finalized by its own executor "
                 "(toggle spec G1/G2/G4).")
-        # The twin gate closed, so whatever this card failed for before is stale.
-        # Clear it here (not after the PR mechanics) so the memory is dropped on
-        # the strength of the PASS itself, independent of how the PR lands.
-        if result.passed:
-            self._archive_attempts(item)
         repo = self.resolve_repo(item)
         wt = self.journal.worktree_for(item.ref)
         # The worktree can be missing (None) or already pruned off disk if a
@@ -547,12 +683,37 @@ class EngineeringExecutor:
                 f"finalize: worktree for {item.ref} is missing "
                 f"({wt!r}); it was pruned or the journal lost it. The gate passed "
                 "but the built diff is not on disk to commit. Retry to rebuild.")
+        # The twin gate closed, so whatever this card failed for before is stale.
+        # Clear it AFTER the worktree check and BEFORE the PR mechanics: the
+        # memory is still dropped on the strength of the PASS itself, independent
+        # of how the PR lands, but it is no longer destroyed by an abort.
+        #
+        # It used to run above, so the two `if result.passed` guards straddled
+        # the raise: a pass whose worktree had been pruned wiped the card's
+        # accumulated failure memory, then died before settling or recording
+        # anything. All that survived was a "finalize failed" journal line, and
+        # the next run of that card started blind, rebuilding into exactly the
+        # wall the memory existed to prevent. Do not clear memory before an
+        # operation that can abort.
+        #
+        # The archive is also the LAST place the card's retry evidence exists, and
+        # the recording point is below it, so capture the count here rather than
+        # letting it die with the clear.
+        retries = 0
+        rounds_max = 0
+        if result.passed:
+            archived = self._archive_attempts(item)
+            retries = len(archived)
+            rounds_max = max((int(a.get("round") or 0) for a in archived
+                              if isinstance(a, dict)), default=0)
         pr_branch = f"autopilot/{item.ref}"
         self._commit_and_push(repo, wt, pr_branch, item)   # harness edits are uncommitted
         if result.passed:
             # Verified work reached finalize: settle the build's joule P&L (mint the
-            # value, spend the real token cost) now that a commit SHA exists.
-            self._settle_economics(item, self._head_sha(wt))
+            # value, spend the real token cost) now that a commit SHA exists, and
+            # stamp the retry evidence captured above onto the same record.
+            self._settle_economics(item, self._head_sha(wt),
+                                   retries=retries, rounds_max=rounds_max)
         # Always open the PR: it is the visible record AND the surface GitHub CI
         # runs on. Auto-merge then merges THAT PR on GitHub (updating origin +
         # leaving history), never a silent local merge.

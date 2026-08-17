@@ -57,5 +57,14 @@ def ratify(repo: RepoSpec, worktree: str, acceptance: list[str],
                     ci_status=ci_status, diff_coverage=cov)
     gr = harness.grade(gb)              # fresh grade over the existing diff
     passed = twin_gate_passed(gr, ci_status, cov, repo)   # the ONE pinned predicate
+    # ratify is called from skcode's ratify endpoint, not the orchestrator, so it
+    # writes no outcome row. It populates `outcome` anyway: a field that some
+    # construction sites may skip is optional in practice, and an optional
+    # terminal-state field is how the vocabulary rots back into a sentinel.
+    # A non-pass here is the gate failing to close over an existing diff, which
+    # is the same terminal state the gated loop calls ci_red; ratify has no
+    # rounds, so no_op and salvage cannot arise. tokens/cost stay 0 because
+    # ratify runs no build: it grades a diff someone else already paid for.
     return GateResult(score=gr.score, passed=passed,
-                      notes=strip_promise(gr.notes), artifact=gr.artifact)
+                      notes=strip_promise(gr.notes), artifact=gr.artifact,
+                      outcome=("pass" if passed else "ci_red"))

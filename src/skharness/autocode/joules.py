@@ -174,7 +174,12 @@ class BuildUsage:
     authoritative figure); tokens drive the UsageTracker's independent estimate.
     """
 
-    model: str = "claude-code"
+    #: The model or adapter this usage was actually produced by. Defaults to
+    #: "unknown", NOT "claude-code": an unfed BuildUsage has measured nothing,
+    #: and a vendor-named default made "never recorded" and "ran on claude-code"
+    #: the same observation. Populated from the envelope's own model id when it
+    #: has one, else from the adapter that ran (see from_harness_result).
+    model: str = "unknown"
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: float = 0.0
@@ -201,20 +206,52 @@ class BuildUsage:
         return self.input_tokens + self.output_tokens
 
     @classmethod
-    def from_claude_json(cls, raw: dict) -> "BuildUsage":
+    def from_claude_json(cls, raw: dict, *,
+                         default_model: str = "claude-code") -> "BuildUsage":
         """Build a BuildUsage from a claude-code ``--output-format json`` result.
 
         Tolerant of missing fields (older CLIs / stub replies): unknown -> 0.
+
+        ``default_model`` is what to record when the envelope does not name a
+        model. It defaults to "claude-code" because that is what this envelope
+        format IS, preserving every existing caller; ``from_harness_result``
+        passes the adapter that actually ran, so a non-claude adapter emitting a
+        usage block is never mislabelled.
         """
         u = (raw or {}).get("usage") or {}
         return cls(
-            model=str((raw or {}).get("model") or "claude-code"),
+            model=str((raw or {}).get("model") or default_model),
             input_tokens=int(u.get("input_tokens", 0) or 0)
             + int(u.get("cache_read_input_tokens", 0) or 0)
             + int(u.get("cache_creation_input_tokens", 0) or 0),
             output_tokens=int(u.get("output_tokens", 0) or 0),
             cost_usd=float((raw or {}).get("total_cost_usd", 0.0) or 0.0),
             turns=int((raw or {}).get("num_turns", 0) or 0),
+        )
+
+    @classmethod
+    def from_harness_result(cls, hr, *, adapter: str) -> "BuildUsage":
+        """One round's usage from ANY adapter's ``HarnessResult``.
+
+        The claude-code envelope carries a ``usage`` block and its own ``model``.
+        Every other adapter (pi, opencode, codex) returns an envelope with
+        neither, so the accrual took a fallback branch that summed the flat
+        ``tokens``/``cost_usd`` fields and NEVER SET model, leaving the dataclass
+        default. That is how a build pi ran was recorded, priced and settled as
+        "claude-code": the requested value was fabricated one layer below any
+        served-vs-requested check that could have caught it.
+
+        ``adapter`` is the harness that actually ran, and it is the model of
+        record whenever the envelope does not name a more specific one.
+        """
+        raw = getattr(hr, "raw", None)
+        if isinstance(raw, dict) and raw.get("usage"):
+            return cls.from_claude_json(raw, default_model=adapter or "unknown")
+        return cls(
+            model=(adapter or "unknown"),
+            output_tokens=int(getattr(hr, "tokens", 0) or 0),
+            cost_usd=float(getattr(hr, "cost_usd", 0.0) or 0.0),
+            turns=1,
         )
 
 

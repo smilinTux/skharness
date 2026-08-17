@@ -240,6 +240,28 @@ def test_run_stops_at_five_with_green_gate(mocker, cfg):
     assert rounds == [1, 2]
 
 
+def test_pass_return_carries_the_graders_score_not_a_literal(mocker, cfg):
+    """S6: the twin-gate pass return must READ the grade, not restate the gate.
+
+    twin_gate_passed currently requires gr.score == 5, so on the live path a
+    hardcoded `score=5` and `gr.score` are indistinguishable: no observation
+    separates them. Pinning the one shared predicate open is what makes the two
+    distinguishable, and it is the exact property the card asks for (the pass
+    path must be structurally capable of carrying a different number). A
+    hardcoded literal turns this red.
+    """
+    grades = [GateResult(score=4, passed=False,
+                         notes="ready <promise>COMPLETE</promise>", artifact="pr")]
+    ex, harness, item = _run_ex(mocker, cfg, grades)
+    mocker.patch("skharness.autocode.engineering.twin_gate_passed", return_value=True)
+    res = ex.run(item, harness)
+    assert res.passed is True
+    assert res.score == 4                     # the grader's number, not a literal 5
+    # ... and it agrees with the score persisted to the board in the same round,
+    # which is the value the return was throwing away.
+    assert ex.board.score_task.call_args.kwargs["score"] == 4
+
+
 def test_run_caps_at_four_rounds_then_fails(mocker, cfg):
     grades = [GateResult(score=4, passed=False, notes="one gap", artifact=None)] * 6
     ex, harness, item = _run_ex(mocker, cfg, grades)
@@ -287,6 +309,221 @@ def test_run_bails_fast_on_noop_empty_diff(mocker, cfg):
     assert harness.run_task.call_count == 2   # one flaky-retry, then bail (not 4)
     assert harness.grade.call_count == 0      # never grade / CI / score an empty diff
     assert ex.board.score_task.call_count == 0
+
+
+# ── S11: the gated settle path needs the same double-settle guard the bridge
+# has. finalize CAN run twice: orchestrator turns a finalize failure into a
+# DecisionItem and a retry re-enters finalize with a fresh worktree and a fresh
+# commit sha, so a (card_id, sha) key cannot catch it. ────────────────────────
+
+def _settle_item():
+    return WorkItem(kind="engineering", ref="t1", source="coord", repo=None,
+                    payload={"tags": ["repo:skrender"], "title": "t"})
+
+
+def _fake_econ(recorded=True):
+    from skharness.autocode import joules
+    return joules.Economics(agent="lumina", task_ref="t1", minted=25,
+                            spent_joules=2, net_joules=23, balance_after=100,
+                            recorded=recorded)
+
+
+@pytest.mark.parametrize("cls_name", ["EngineeringExecutor", "DirectExecutor"])
+def test_settle_is_refused_a_second_time_for_the_same_card(mocker, cfg, cls_name):
+    """A finalize retry after a partial finalize must not mint the same unit of
+    work twice. Both gated and direct call the SAME inherited helper, so both
+    are pinned here."""
+    from skharness.autocode.direct import DirectExecutor
+    cls = {"EngineeringExecutor": EngineeringExecutor,
+           "DirectExecutor": DirectExecutor}[cls_name]
+    settle = mocker.patch("skharness.autocode.joules.settle",
+                          return_value=_fake_econ())
+    ex = cls(cfg, board=mocker.Mock(), journal=mocker.Mock(), agent_name="autopilot")
+    ex._settle_economics(_settle_item(), "sha1")
+    ex._settle_economics(_settle_item(), "sha2")   # retry: fresh worktree, fresh sha
+    settle.assert_called_once()
+
+
+def test_the_double_settle_guard_survives_a_new_process(mocker, cfg):
+    """A finalize retry is a NEW executor (often a new process), so an in-memory
+    flag would not catch it. The guard must read the shared settlement journal."""
+    settle = mocker.patch("skharness.autocode.joules.settle",
+                          return_value=_fake_econ())
+    first = EngineeringExecutor(cfg, board=mocker.Mock(), journal=mocker.Mock(),
+                                agent_name="autopilot")
+    first._settle_economics(_settle_item(), "sha1")
+    second = EngineeringExecutor(cfg, board=mocker.Mock(), journal=mocker.Mock(),
+                                 agent_name="autopilot")
+    second._settle_economics(_settle_item(), "sha2")
+    settle.assert_called_once()
+
+
+def test_an_unrecorded_settle_does_not_block_a_later_real_one(mocker, cfg):
+    """skjoule absent (a bare harness) means nothing was minted. Journalling that
+    as a settlement would let a no-op permanently block the real settlement, so
+    the guard must only ever be armed by a settlement that actually happened."""
+    settle = mocker.patch("skharness.autocode.joules.settle",
+                          return_value=_fake_econ(recorded=False))
+    ex = EngineeringExecutor(cfg, board=mocker.Mock(), journal=mocker.Mock(),
+                             agent_name="autopilot")
+    ex._settle_economics(_settle_item(), "sha1")
+    settle.return_value = _fake_econ(recorded=True)
+    ex._settle_economics(_settle_item(), "sha2")
+    assert settle.call_count == 2
+
+
+def test_a_refused_second_settle_still_takes_the_usage_off_the_books(mocker, cfg):
+    """The guard must not reintroduce the S5 leak: a refused settle still has to
+    clear the accrued usage and write the numbers down."""
+    mocker.patch("skharness.autocode.joules.settle", return_value=_fake_econ())
+    ex = EngineeringExecutor(cfg, board=mocker.Mock(), journal=mocker.Mock(),
+                             agent_name="autopilot")
+    ex._settle_economics(_settle_item(), "sha1")
+    ex._accrue_usage("t1", HarnessResult(ok=True, artifact=None, tokens=9,
+                                         cost_usd=0.05, raw={}), "pi")
+    rec = mocker.patch("skharness.autocode.engineering.health.record")
+    ex._settle_economics(_settle_item(), "sha2")
+    assert ex._build_usage == {}
+    ev = _unsettled(rec)
+    assert len(ev) == 1 and ev[0]["tokens"] == 9 and ev[0]["minted"] is False
+
+
+# ── S10: the accrued usage must name the adapter that ACTUALLY ran ───────────
+
+def test_accrued_usage_names_the_adapter_that_ran_on_the_wired_path(mocker, cfg):
+    """Asserted through run(), not by hand-calling the helper: pi's envelope has
+    no `usage` key, so the accrual took a fallback branch that never set model,
+    and a pi build's cost rows all claimed to be claude-code."""
+    grades = [GateResult(score=5, passed=True,
+                         notes="ready <promise>COMPLETE</promise>", artifact="pr")]
+    ex, harness, item = _run_ex(mocker, cfg, grades)
+    harness.name = "pi"                       # the adapter that actually runs
+    harness.run_task.return_value = HarnessResult(ok=True, artifact=None, tokens=11,
+                                                  cost_usd=0.03, raw={"exit_code": 0})
+    ex.run(item, harness)
+    assert ex._build_usage["t1"].model == "pi"
+    assert ex._build_usage["t1"].tokens == 11
+
+
+def test_accrued_usage_keeps_the_model_a_claude_envelope_names(mocker, cfg):
+    """The adapter name must not overwrite the more specific model id the
+    claude-code envelope reports."""
+    grades = [GateResult(score=5, passed=True,
+                         notes="ready <promise>COMPLETE</promise>", artifact="pr")]
+    ex, harness, item = _run_ex(mocker, cfg, grades)
+    harness.name = "claude-code"
+    harness.run_task.return_value = HarnessResult(
+        ok=True, artifact=None, tokens=15, cost_usd=0.04,
+        raw={"model": "claude-sonnet-x", "total_cost_usd": 0.04, "num_turns": 2,
+             "usage": {"input_tokens": 10, "output_tokens": 5}})
+    ex.run(item, harness)
+    assert ex._build_usage["t1"].model == "claude-sonnet-x"
+
+
+# ── S5: a failed run's usage and cost must be RECORDED, not dropped ──────────
+# Two concerns used to be collapsed into one `pop`: minting (pass only) and
+# recording (every path). The load-bearing assertions below are all on the
+# FAILURE paths, which are the censored half; the pass path already worked.
+
+def _usage_ex(mocker, cfg, grades, **kw):
+    """_run_ex with a harness whose rounds cost real, non-zero tokens/dollars."""
+    ex, harness, item = _run_ex(mocker, cfg, grades, **kw)
+    harness.run_task.return_value = HarnessResult(ok=True, artifact=None, tokens=7,
+                                                  cost_usd=0.02, raw={})
+    rec = mocker.patch("skharness.autocode.engineering.health.record")
+    return ex, harness, item, rec
+
+
+def _unsettled(rec):
+    """Every build_usage_unsettled event health.record was handed."""
+    return [c.kwargs for c in rec.call_args_list
+            if c.args and c.args[0] == "build_usage_unsettled"]
+
+
+def test_noop_bail_records_its_usage_and_leaves_no_leak(mocker, cfg):
+    ex, harness, item, rec = _usage_ex(mocker, cfg, grades=[])
+    mocker.patch.object(ex, "_diff", return_value="")      # no-op bail
+    ex.run(item, harness)
+    ev = _unsettled(rec)
+    assert len(ev) == 1 and ev[0]["outcome"] == "no_op"
+    assert ev[0]["tokens"] == 14 and ev[0]["cost_usd"] == 0.04   # 2 rounds accrued
+    assert ex._build_usage == {}                # accrued each round, never popped before
+
+
+def test_did_not_converge_records_its_usage_and_leaves_no_leak(mocker, cfg):
+    grades = [GateResult(score=4, passed=False, notes="one gap", artifact=None)] * 6
+    ex, harness, item, rec = _usage_ex(mocker, cfg, grades)
+    ex.run(item, harness)
+    ev = _unsettled(rec)
+    assert len(ev) == 1 and ev[0]["outcome"] == "ci_red"
+    assert ev[0]["tokens"] == 28 and ev[0]["cost_usd"] == 0.08   # 4 rounds accrued
+    assert ex._build_usage == {}
+
+
+def test_salvage_records_its_usage_instead_of_discarding_it(mocker, cfg):
+    grades = [GateResult(score=None, passed=False, notes="", artifact=None)] * 6
+    ex, harness, item, rec = _usage_ex(mocker, cfg, grades)
+    mocker.patch.object(ex, "_salvage_to_review", return_value="https://gh/pr/9")
+    ex.run(item, harness)
+    ev = _unsettled(rec)
+    assert len(ev) == 1 and ev[0]["outcome"] == "salvage"
+    assert ev[0]["tokens"] == 7 and ev[0]["cost_usd"] == 0.02    # the real cost, not 0
+    assert ex._build_usage == {}
+
+
+def test_salvage_helper_itself_no_longer_discards_the_numbers(mocker, cfg):
+    """The pop lived inside _salvage_to_review, so the helper destroyed the
+    telemetry before any caller could record it. Prove the helper leaves the
+    accrued usage intact and does exactly its PR job."""
+    ex = EngineeringExecutor(cfg, board=mocker.Mock(), journal=mocker.Mock(),
+                             agent_name="autopilot")
+    mocker.patch.object(ex, "_commit_and_push")
+    mocker.patch.object(ex, "_open_pr", return_value="https://gh/pr/9")
+    item = WorkItem(kind="engineering", ref="t1", source="coord", repo=None,
+                    payload={"tags": ["repo:skrender"], "title": "t"})
+    ex._accrue_usage("t1", HarnessResult(ok=True, artifact=None, tokens=7,
+                                         cost_usd=0.02, raw={}))
+    ex._salvage_to_review(item, cfg.repo_map["skrender"], "/wt/t1", "autopilot/t1")
+    assert ex._build_usage["t1"].tokens == 7    # the numbers survive the helper
+
+
+@pytest.mark.parametrize("kind", ["no_op", "ci_red", "salvage"])
+def test_settle_is_never_called_off_the_pass_path(mocker, cfg, kind):
+    """Recording usage must NOT weaken settle()'s pass-only contract: no mint on
+    a non-pass, ever. Asserted against joules.settle itself, the one function
+    that touches the wallet."""
+    settle = mocker.patch("skharness.autocode.joules.settle")
+    grades = {"no_op": [],
+              "ci_red": [GateResult(score=4, passed=False, notes="g", artifact=None)] * 6,
+              "salvage": [GateResult(score=None, passed=False, notes="", artifact=None)] * 6
+              }[kind]
+    ex, harness, item, _rec = _usage_ex(mocker, cfg, grades)
+    if kind == "no_op":
+        mocker.patch.object(ex, "_diff", return_value="")
+    if kind == "salvage":
+        mocker.patch.object(ex, "_salvage_to_review", return_value="https://gh/pr/9")
+    res = ex.run(item, harness)
+    assert res.passed is False
+    settle.assert_not_called()
+    # ... and a non-passed result reaching finalize still never settles
+    ex.journal.worktree_for.return_value = "/wt/t1"
+    ex.digest = mocker.Mock()
+    mocker.patch("skharness.autocode.engineering.os.path.isdir", return_value=True)
+    mocker.patch.object(ex, "_commit_and_push")
+    mocker.patch.object(ex, "_open_pr", return_value="https://gh/pr/9")
+    mocker.patch.object(ex, "_head_sha", return_value="sha1")
+    ex.finalize(item, res)
+    settle.assert_not_called()
+
+
+def test_settle_positive_control_a_pass_does_reach_the_wallet(mocker, cfg):
+    """Positive control for the three assert_not_called tests above: the same
+    patch target IS hit on the pass path. Without this an always-wrong mock
+    target would make those three green for the wrong reason."""
+    settle = mocker.patch("skharness.autocode.joules.settle")
+    ex, item = _final_ex(mocker, cfg, "skrender")
+    ex.finalize(item, GateResult(score=5, passed=True, notes="", artifact="pr"))
+    settle.assert_called_once()
 
 
 def test_twin_gate_blocks_merge_when_ci_red_even_at_five(mocker, cfg):
@@ -337,6 +574,76 @@ def test_finalize_escalates_when_worktree_missing(mocker):
     with pytest.raises(RuntimeError, match="worktree.*missing"):
         ex.finalize(item, GateResult(score=5, passed=True, notes="", artifact="pr"))
     commit.assert_not_called()                       # never reaches the None-path subprocess
+
+
+def test_finalize_does_not_wipe_failure_memory_when_worktree_missing(mocker):
+    """S8: two `if result.passed` guards straddle the worktree raise. A pass
+    whose worktree was pruned used to clear the card's accumulated failure
+    memory, then die before settling or recording anything, so the next run of
+    that card started blind and rebuilt into the wall the memory existed to
+    prevent. Never clear memory before an operation that can abort."""
+    spec = _spec("skrender")
+    cfg = _t.SimpleNamespace(repo_map={"skrender": spec}, automerge_repos=[])
+    ex, item = _final_ex(mocker, cfg, "skrender")
+    ex.journal.worktree_for.return_value = None          # worktree pruned / lost
+    with pytest.raises(RuntimeError, match="worktree.*missing"):
+        ex.finalize(item, GateResult(score=5, passed=True, notes="", artifact="pr"))
+    ex.board.clear_attempts.assert_not_called()          # the memory survives
+    ex.journal.archive_attempts.assert_not_called()
+
+
+def test_finalize_still_archives_failure_memory_on_a_normal_pass(mocker):
+    """Positive control for the move above: the archive must still happen on the
+    ordinary pass path, or S8 would have 'fixed' the bug by disabling it."""
+    spec = _spec("skrender")
+    cfg = _t.SimpleNamespace(repo_map={"skrender": spec}, automerge_repos=[])
+    ex, item = _final_ex(mocker, cfg, "skrender")
+    ex.board.clear_attempts.return_value = [{"round": 1, "outcome": "ci_red"}]
+    ex.finalize(item, GateResult(score=5, passed=True, notes="", artifact="pr"))
+    ex.board.clear_attempts.assert_called_once_with("t1")
+    ex.journal.archive_attempts.assert_called_once()
+
+
+def test_finalize_carries_the_retry_count_to_the_recording_point(mocker):
+    """S7: _archive_attempts clears meta.autopilot.attempts BEFORE the recording
+    point, so a card that struggled and then passed recorded ZERO retries. The
+    hardest-won evidence in the dataset was deleted milliseconds before the only
+    place that could keep it. Capture the count before the archive."""
+    from skharness.autocode import joules
+    spec = _spec("skrender")
+    cfg = _t.SimpleNamespace(repo_map={"skrender": spec}, automerge_repos=[])
+    ex, item = _final_ex(mocker, cfg, "skrender")
+    mocker.patch("skharness.autocode.joules.settle",
+                 return_value=joules.Economics(agent="lumina", task_ref="t1"))
+    ex.board.clear_attempts.return_value = [
+        {"round": 1, "outcome": "ci_red"},
+        {"round": 4, "outcome": "ci_red"},
+        {"round": 2, "outcome": "no_op"}]
+    rec = mocker.patch("skharness.autocode.engineering.health.record")
+    ex.finalize(item, GateResult(score=5, passed=True, notes="", artifact="pr"))
+    ev = [c.kwargs for c in rec.call_args_list
+          if c.args and c.args[0] == "build_economics"]
+    assert len(ev) == 1
+    assert ev[0]["retries"] == 3              # survived the archive
+    assert ev[0]["rounds_max"] == 4           # the worst round reached
+    assert ev[0]["rounds_cap"] == 4           # clipped: never read as unbounded
+
+
+def test_finalize_records_zero_retries_for_a_first_try_pass(mocker):
+    """The other half of the distribution: a card that passed first time must
+    record 0, not an absent/None field, or 'easy' and 'unmeasured' collapse."""
+    from skharness.autocode import joules
+    spec = _spec("skrender")
+    cfg = _t.SimpleNamespace(repo_map={"skrender": spec}, automerge_repos=[])
+    ex, item = _final_ex(mocker, cfg, "skrender")
+    mocker.patch("skharness.autocode.joules.settle",
+                 return_value=joules.Economics(agent="lumina", task_ref="t1"))
+    ex.board.clear_attempts.return_value = []
+    rec = mocker.patch("skharness.autocode.engineering.health.record")
+    ex.finalize(item, GateResult(score=5, passed=True, notes="", artifact="pr"))
+    ev = [c.kwargs for c in rec.call_args_list
+          if c.args and c.args[0] == "build_economics"]
+    assert len(ev) == 1 and ev[0]["retries"] == 0 and ev[0]["rounds_max"] == 0
 
 
 def test_finalize_automerges_when_whitelisted_and_green(mocker):
