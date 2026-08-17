@@ -21,7 +21,7 @@ from .config import Caps, Config
 from .grading import VOCABULARY, model_class_for
 from .harness import build_harness
 from .sensitivity import classify_sensitivity
-from . import fleet_dispatch, health, journal
+from . import fleet_dispatch, health, journal, sovereignty
 
 #: rubric_version stamped on every grade written. Paired with grader_model it is
 #: the ONLY way to detect grade drift after the fact: without both, a board of
@@ -37,13 +37,18 @@ RUBRIC_VERSION: int = int(VOCABULARY.get("version", 1))
 #: not need to scale with the work and can be pinned once.
 GRADER_MODEL: str = "ornith-big"
 
-#: A model id is accepted as sovereign only if it names the local ornith family.
-#: The grader reads RAW card text, and card descriptions on this board really do
-#: carry pasted credentials, so the grader must run sovereign-only regardless of
-#: the graded card's own sensitivity. An alias that has silently failed over to a
-#: cloud backend before (`sk-default`) is not evidence of anything, so the check
-#: is an allowlist of concrete local ids rather than a denylist.
-_SOVEREIGN_GRADER_PREFIXES: tuple[str, ...] = ("ornith",)
+#: A MODEL ID IS NOT EVIDENCE OF SOVEREIGNTY, so no allowlist of model names
+#: lives here any more (card a43cac2e). The grader reads RAW card text and card
+#: descriptions on this board really do carry pasted credentials, so the gate is
+#: load-bearing; that is exactly why it must check the fact it claims to check.
+#:
+#: The old rule was `name.startswith("ornith")`. skgateway resolves failover
+#: server side, so the id in a request is an INTENT. The live ledger holds a
+#: `ornith-big` row (this file's own pinned grader) with `backend=nvidia`,
+#: `basis=imputed_cloud`, and the old rule called it sovereign.
+#:
+#: The one definition now lives in `sovereignty.py` and keys on the backend that
+#: served plus the energy basis it reported. See `is_sovereign_grader`.
 
 
 @dataclass
@@ -418,12 +423,18 @@ def classify_kind(task: dict, config=None) -> str:
                                                             "engineering")
 
 
-def grader_model_for(harness) -> str:
-    """The model id to STAMP on a grade: what actually graded, else the pin.
+def requested_grader_model(harness) -> str:
+    """The model id REQUESTED for grading, to stamp on the grade as provenance.
 
-    A harness that reports its model is recorded truthfully, because the stamp
-    only has value if it names the real grader. When it reports nothing usable,
-    the pinned sovereign id is recorded instead.
+    Renamed from `grader_model_for`, whose docstring claimed this was "what
+    actually graded". It never was. `harness.grader_model` / `harness.model` is
+    the statically configured id the harness ASKS skgateway for; skgateway then
+    resolves failover server side and may serve it from anywhere. The two are
+    different facts and the old name invited a caller to gate on this one.
+
+    Still worth recording: paired with `rubric_version` it is the only way to
+    detect grade drift after the fact. It is provenance, not a permission. What
+    actually served is `grader_sovereignty` below.
     """
     for attr in ("grader_model", "model"):
         value = getattr(harness, attr, None)
@@ -432,10 +443,46 @@ def grader_model_for(harness) -> str:
     return GRADER_MODEL
 
 
-def is_sovereign_grader(model: str) -> bool:
-    """True when `model` names a local, sovereign grader (see the prefix list)."""
-    name = (model or "").strip().lower()
-    return any(name.startswith(p) for p in _SOVEREIGN_GRADER_PREFIXES)
+def grader_sovereignty(harness) -> sovereignty.Verdict:
+    """What the harness OBSERVED about who served the grading call.
+
+    Reads `backend_served` / `energy_basis` / `energy_node` off the harness and
+    hands them to the one fleet definition. A harness with no attribution
+    channel reports nothing, and nothing classifies `unobserved`, which is a
+    refusal here and NOT a violation. The distinction matters operationally: a
+    violation means fix the routing, an unobserved means wire the observation.
+    """
+    return sovereignty.from_attributes(harness)
+
+
+def is_sovereign_grader(observed) -> bool:
+    """True only when the OBSERVED serving facts say hardware we own answered.
+
+    `observed` is the serving evidence for the grading call: an object
+    reporting `backend_served` / `energy_basis` / `energy_node`, or a
+    `sovereignty.Verdict`. It is NEVER a model id, and passing a string raises
+    rather than answering, so an old caller cannot silently get a verdict about
+    a name and read it as a verdict about a machine.
+
+    Sovereignty is a claim about hardware and jurisdiction. The weights are not
+    the variable: `ornith-1.0-9b` served by `nvidia` is a violation, and the
+    same weights served by `reg:ornith` are not. The live ledger holds
+    `ornith-big` rows on `backend=nvidia` / `basis=imputed_cloud`, so the model
+    id demonstrably cannot carry this decision.
+
+    Unknown is not sovereign. When nothing was observed this returns False and
+    `grader_sovereignty` reports `unobserved`, so the refusal stays
+    distinguishable from a measured violation in the health log.
+    """
+    if isinstance(observed, str):
+        raise TypeError(
+            "is_sovereign_grader takes observed serving facts, not a model id. "
+            "A model id is what was requested; skgateway resolves failover server "
+            "side, so it says nothing about who answered. Pass the harness or a "
+            "sovereignty.Verdict.")
+    if isinstance(observed, sovereignty.Verdict):
+        return observed.sovereign
+    return sovereignty.from_attributes(observed).sovereign
 
 
 def work_grade_for(task: dict, verdict) -> dict | None:
@@ -483,13 +530,24 @@ def _write_grade(board, task_id: str, grade: dict, *, harness, run_id: str) -> b
     confidence is left None for the same reason: this grader has no calibration
     data, and a plausible-looking 0.8 would be read downstream as measured.
     """
-    grader_model = grader_model_for(harness)
-    if not is_sovereign_grader(grader_model):
+    grader_model = requested_grader_model(harness)
+    verdict = grader_sovereignty(harness)
+    if not is_sovereign_grader(verdict):
         # The grader reads raw card text, which on this board carries pasted
         # credentials. A non-sovereign grader means that text already went
         # somewhere it should not have, so the card is left UNGRADED rather than
         # stamped with a grade whose provenance is a third party.
-        health.record("grade_refused_nonsovereign", task=task_id, grader_model=grader_model)
+        #
+        # FAIL CLOSED, and that includes `unobserved`. A harness that cannot yet
+        # report which backend served it has not earned a pass; assuming
+        # sovereign on no evidence is the precise failure that let a cloud-served
+        # grade look identical to a local one. The state and the observed backend
+        # go into the event, so an operator can tell "wire the observation" from
+        # "fix the routing" without re-running anything.
+        health.record("grade_refused_nonsovereign", task=task_id,
+                      grader_model=grader_model, sovereignty=verdict.state,
+                      backend_served=verdict.backend, energy_basis=verdict.basis,
+                      energy_node=verdict.node, reason=verdict.reason)
         return False
     if not hasattr(board, "set_grade"):
         health.record("grade_unsupported_board", task=task_id)
