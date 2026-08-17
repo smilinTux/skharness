@@ -20,14 +20,126 @@ shipping. Override per run via ``settle(..., joule_per_usd=...)``.
 from __future__ import annotations
 
 import logging
+import os
+import sys
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 log = logging.getLogger("skharness.autocode.joules")
 
 # Joules charged per USD of real token spend. See module docstring for calibration.
 DEFAULT_JOULE_PER_USD = 50.0
 
+#: Env var that redirects the joule wallet, and the usage ledger that rides with
+#: it, at an alternate skcapstone root. It exists for the same reason
+#: ``SKAI_COST_DIR`` does: settle() is a WRITE to real economic state, and a test
+#: suite must never be that write. tests/conftest.py sets it for every test, so
+#: isolation is the default rather than something each test file opts into.
+WALLET_HOME_ENV = "SKHARNESS_WALLET_HOME"
+
 _PRIORITIES = ("critical", "high", "medium", "low")
+
+
+class ProductionWalletInTestError(RuntimeError):
+    """A test run resolved the joule wallet to a production skcapstone root.
+
+    Deliberately loud, and deliberately raised OUTSIDE settle()'s catch-all, for
+    which see the comment at the top of settle(). The failure this replaces was
+    silent: the suite minted well formed joules into the operator's live ledger
+    for weeks, and a balance that is two thirds pytest output looks exactly like
+    a balance that is real.
+    """
+
+
+# --------------------------------------------------------------------------- #
+# Wallet home resolution and the production guard                              #
+# --------------------------------------------------------------------------- #
+
+def _skjoule_available() -> bool:
+    """True when the optional skcapstone sibling that owns the wallet is here."""
+    import importlib.util
+
+    return importlib.util.find_spec("skcapstone") is not None
+
+
+def _default_wallet_root() -> Path:
+    """The root JouleWallet picks on its own, read LIVE rather than at import.
+
+    skjoule binds ``SHARED_ROOT`` into its own namespace with a ``from . import``
+    at import time, so this reads the attribute off the module on every call.
+    That is the value the writer will actually use, and reading it late is what
+    lets a test stand up a decoy root and prove the guard sees whatever the
+    writer sees, without the demonstration minting into the real ledger.
+    """
+    try:
+        from skcapstone import skjoule
+
+        return Path(skjoule.SHARED_ROOT).expanduser()
+    except Exception:
+        return Path.home() / ".skcapstone"
+
+
+def _production_roots() -> set[Path]:
+    """Roots holding real, operator-owned economic state."""
+    roots: set[Path] = set()
+    for cand in (_default_wallet_root(), Path.home() / ".skcapstone"):
+        try:
+            roots.add(Path(cand).expanduser().resolve())
+        except Exception:
+            continue
+    return roots
+
+
+def _in_test_run() -> bool:
+    """True while pytest is driving this process."""
+    return bool(os.environ.get("PYTEST_CURRENT_TEST")) or "pytest" in sys.modules
+
+
+def wallet_home(home=None) -> Path | None:
+    """Resolve the skcapstone root the wallet should be opened against.
+
+    Precedence: an explicit ``home`` argument, then :data:`WALLET_HOME_ENV`, then
+    None, which leaves skjoule to resolve its own default. The explicit argument
+    wins so a caller that already isolated itself keeps its choice, mirroring how
+    the per-file ``SKAI_COST_DIR`` fixtures still win over the conftest default.
+    """
+    if home is not None:
+        return Path(home)
+    override = os.environ.get(WALLET_HOME_ENV)
+    if override:
+        return Path(override).expanduser()
+    return None
+
+
+def assert_not_production_wallet_in_test(home=None) -> None:
+    """Fail loudly if a test run is about to open a production wallet.
+
+    Shaped after skgateway's ``assertNotProductionCacheInTest``, and here for the
+    same reason that one exists. This fleet has already shipped a store where the
+    READER honoured an env override and the WRITER ignored it, so every check
+    passed while production was being overwritten. The lesson is that asserting
+    on the resolver is not enough, so this checks the path the writer will
+    actually use: ``wallet_home()`` when something overrides it, and skjoule's
+    own live default when nothing does.
+
+    A no-op outside a test run. Production must never be refused a settlement.
+    """
+    if not _in_test_run():
+        return
+    resolved = wallet_home(home)
+    target = resolved if resolved is not None else _default_wallet_root()
+    try:
+        target = Path(target).expanduser().resolve()
+    except Exception:
+        return
+    if target in _production_roots():
+        raise ProductionWalletInTestError(
+            f"refusing to open a PRODUCTION joule wallet from a test run: {target}. "
+            f"settle() mints and spends real joules, so a suite that reaches this "
+            f"path writes fabricated economic history into the operator's ledger. "
+            f"Set {WALLET_HOME_ENV} to a throwaway directory (tests/conftest.py "
+            f"does this for every test by default), or pass home=tmp_path."
+        )
 
 
 def _priority_bucket(card_priority: str | None) -> str:
@@ -187,10 +299,25 @@ def settle(
     """Settle a PASSED build's economics: record real token cost, mint value for
     the verified work, spend the USD-equivalent joules, and return the P&L.
 
-    MUST only be called on a twin-gate pass (verified work). Never raises: on any
-    failure (skjoule absent, wallet error) it returns a ``recorded=False``
-    Economics and logs, leaving the build path untouched.
+    MUST only be called on a twin-gate pass (verified work). Never raises in
+    production: on any failure (skjoule absent, wallet error) it returns a
+    ``recorded=False`` Economics and logs, leaving the build path untouched. The
+    single exception is :class:`ProductionWalletInTestError`, which can only fire
+    inside a test run.
+
+    ``home`` resolves through :func:`wallet_home`, so ``SKHARNESS_WALLET_HOME``
+    redirects both the wallet and the usage ledger. Callers that already pass an
+    explicit home keep it.
     """
+    # Resolve the root and run the guard BEFORE the try below. Everything after
+    # that point is deliberately swallowed so accounting can never fail a correct
+    # build, and a guard the swallow ate would be no guard at all. This is also
+    # why the guard raises its own exception type rather than returning a flag:
+    # settle()'s callers wrap it in their own try/except too, and a flag would be
+    # dropped on the floor by every one of them.
+    home = wallet_home(home)
+    assert_not_production_wallet_in_test(home)
+
     econ = Economics(
         agent=agent,
         task_ref=task_ref,
@@ -255,9 +382,15 @@ def settle(
 
 
 def _usage_home(agent: str, home=None):
-    """Resolve the UsageTracker home for *agent* (agent-scoped when available)."""
-    from pathlib import Path
+    """Resolve the UsageTracker home for *agent* (agent-scoped when available).
 
+    Routed through :func:`wallet_home` so the env override covers the usage
+    ledger too. The wallet was the loud half of this leak, but UsageTracker
+    writes ``{home}/usage/tokens-{date}.json`` under the same real agent home,
+    so isolating only the wallet would have left the suite still editing
+    production cost telemetry.
+    """
+    home = wallet_home(home)
     if home is not None:
         return Path(home)
     try:
