@@ -3,6 +3,28 @@
 Precedence: SKOS_AUTOPILOT_CONFIG (explicit) > <SKCAPSTONE_HOME>/config/autopilot.yaml
 > ~/.skcapstone/config/autopilot.yaml. A missing file yields a disabled default so
 a fresh box never auto-runs.
+
+WHY AN UNKNOWN KEY RAISES, and it is the reason `ConfigError` exists
+--------------------------------------------------------------------
+Every block below is parsed by filtering the raw yaml against a known-key set.
+Before 2026-08-16 an unrecognised key was simply dropped, so a key the operator
+DELIBERATELY wrote had no effect and produced no output of any kind. Measured on
+~/.skcapstone/config/autopilot-pi.yaml the same day: it carried `new_tasks_per_run: 1`
+at the TOP level, while `Config.load` only ever reads that name out of the `caps:`
+block. The operator believed the run was capped at one new task. The default of 10
+applied instead, and nothing anywhere said so. A misplaced key and a correct key are
+indistinguishable at runtime, which is exactly the class of failure this file must
+not have.
+
+So parsing fails closed, matching the house precedent: `types.coerce_quality` falls
+to GATED rather than to a permissive mode on an unrecognised value, and
+`buckets.BucketError` raises rather than returning None because returning None would
+silently widen. Here, dropping a key silently widens a cap. A raise makes a typo or a
+misplaced key a startup failure rather than a policy change nobody ordered.
+
+The lint covers all three filtered levels (top level, `caps:`, and each `repo_map:`
+entry) because each one uses the same drop-on-unknown filter and would otherwise be
+the next place this happens.
 """
 from __future__ import annotations
 
@@ -19,6 +41,36 @@ _REPO_KEYS = {
     "coverage_cmd", "ci_poll_timeout", "ci_scope", "advisory_checks", "automerge",
     "auto_revert", "min_diff_coverage", "sandbox_image", "min_quality", "deploy_cmd",
 }
+
+
+class ConfigError(ValueError):
+    """An autopilot yaml carries a key this loader does not understand.
+
+    Raised, never warned. See the module docstring: a dropped key is a policy
+    change the operator did not order and cannot observe.
+    """
+
+
+def _reject_unknown(known: set[str], raw: dict, where: str, path: Path) -> None:
+    """Raise ConfigError if `raw` carries a key outside `known`.
+
+    `where` names the block for the message ("top level", "caps", "repo_map.skos")
+    so the operator is told which line to move, not merely that something is wrong.
+    """
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{path}: {where} must be a mapping, got {type(raw).__name__}")
+    unknown = sorted(set(raw) - known)
+    if not unknown:
+        return
+    hint = ""
+    # The measured case: a caps key written at the top level. Say so outright.
+    misplaced = [k for k in unknown if where == "top level" and k in _CAPS_KEYS]
+    if misplaced:
+        hint = (f" ({', '.join(misplaced)} belongs under the `caps:` block; "
+                "at the top level it is ignored and the default cap applies)")
+    raise ConfigError(
+        f"{path}: unknown key(s) in {where}: {', '.join(unknown)}{hint}. "
+        "Autopilot refuses to load a config it would otherwise silently ignore.")
 
 
 def config_path() -> Path:
@@ -40,6 +92,11 @@ class Caps:
     max_decompose_children_per_run: int = 24  # per-RUN child ceiling across all epics (anti-flood)
     max_decompose_depth: int = 2          # children carry decomp_depth; ceiling -> needs_decision
     concreteness_floor: float = 0.34      # repo card below this (and not net_new) -> decompose
+
+
+#: The accepted `caps:` keys. Derived from the dataclass so a new cap cannot be
+#: rejected by a hand-maintained list that someone forgot to update.
+_CAPS_KEYS = set(Caps.__dataclass_fields__)
 
 
 @dataclass
@@ -74,16 +131,19 @@ class Config:
         if not p.exists():
             return cls()                                  # disabled default
         raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        _reject_unknown(_TOP_KEYS, raw, "top level", p)
         repo_map: dict[str, RepoSpec] = {}
         for name, spec in (raw.get("repo_map") or {}).items():
-            spec = dict(spec)
+            spec = dict(spec or {})
             spec.setdefault("name", name)                 # key is the canonical name
+            _reject_unknown(_REPO_KEYS, spec, f"repo_map.{name}", p)
             if spec.get("min_quality") is not None:       # yaml str -> QualityMode floor
                 spec["min_quality"] = coerce_quality(spec["min_quality"])
             repo_map[name] = RepoSpec(**{k: v for k, v in spec.items() if k in _REPO_KEYS})
         caps_raw = raw.get("caps") or {}
+        _reject_unknown(_CAPS_KEYS, caps_raw, "caps", p)
         caps = Caps(**{k: v for k, v in caps_raw.items()
-                       if k in Caps.__dataclass_fields__})
+                       if k in _CAPS_KEYS})
         return cls(
             enabled=bool(raw.get("enabled", False)),
             harness=raw.get("harness", "claude-code"),
@@ -105,6 +165,12 @@ class Config:
             default_quality=coerce_quality(raw.get("default_quality")),
             fleet_dispatch=bool(raw.get("fleet_dispatch", True)),
         )
+
+
+#: The accepted top-level yaml keys. Every Config field is settable from yaml and
+#: `load` reads exactly these, so deriving the set from the dataclass keeps the lint
+#: and the parser from ever disagreeing.
+_TOP_KEYS = set(Config.__dataclass_fields__)
 
 
 _AUTOPILOT_JOB_YAML = """\

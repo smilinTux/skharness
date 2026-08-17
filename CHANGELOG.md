@@ -92,6 +92,19 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   endpoint. The proxy is a confinement boundary, so it fails closed: 501 with an
   explanation pointing at CONNECT. The allowlist check still runs first, so a
   denied host keeps its 403 rather than degrading into 501.
+- **An autopilot config key this loader does not understand now raises instead of
+  being silently dropped.** Measured on `~/.skcapstone/config/autopilot-pi.yaml`
+  (2026-08-16): the file set `new_tasks_per_run: 1` at the TOP level, but
+  `Config.load` only ever read that name out of the `caps:` block, so the key was
+  filtered away and the default of 10 applied. Nothing distinguished a misplaced
+  key from a correct one at runtime, and the operator who wrote 1 believed the run
+  was capped at 1. `Config.load` now raises `ConfigError` on an unknown key at all
+  three filtered levels (top level, `caps:`, each `repo_map:` entry), naming the
+  file and the block. This follows the same fail-closed discipline as
+  `types.coerce_quality` (falls to GATED, never to a permissive mode) and
+  `buckets.BucketError` (raises rather than returning None, because returning None
+  would silently widen). Dropping a key silently widens a cap. The known-key sets
+  are derived from the dataclass fields so the lint cannot drift from the parser.
 - **The work-grade policy is now on autocode's hard-coded protected floor.**
   `_ALWAYS_PROTECTED` covered `protected.py`, `engineering.py`, the fleet store,
   `itil.py`, the manifest and the freeze file, but not `grading.py`,
