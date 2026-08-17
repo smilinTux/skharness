@@ -19,11 +19,19 @@ shipping. Override per run via ``settle(..., joule_per_usd=...)``.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import sys
+import threading
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+try:  # POSIX only; the fallback below covers everything else.
+    import fcntl
+except ImportError:  # pragma: no cover - not reachable on this fleet
+    fcntl = None  # type: ignore[assignment]
 
 log = logging.getLogger("skharness.autocode.joules")
 
@@ -140,6 +148,125 @@ def assert_not_production_wallet_in_test(home=None) -> None:
             f"Set {WALLET_HOME_ENV} to a throwaway directory (tests/conftest.py "
             f"does this for every test by default), or pass home=tmp_path."
         )
+
+
+# --------------------------------------------------------------------------- #
+# The settlement lock                                                          #
+# --------------------------------------------------------------------------- #
+
+#: Lock file that serialises settlements against one agent's wallet. It lives in
+#: the wallet directory, beside the state and the journal it protects, so a lock
+#: can never end up guarding a different wallet than the one being written.
+SETTLE_LOCK_NAME = ".settle.lock"
+
+#: How long to queue for the lock before giving up and settling anyway. The
+#: critical section is a handful of small file writes, so this is orders of
+#: magnitude beyond a healthy wait; reaching it means something is wedged.
+SETTLE_LOCK_TIMEOUT = 30.0
+
+#: Fallback when fcntl is unavailable. Serialises threads within one process
+#: only, which is strictly worse than flock and is why it is a fallback.
+_fallback_locks: dict[str, threading.Lock] = {}
+_fallback_locks_guard = threading.Lock()
+
+
+def _settle_lock_path(agent: str, home=None) -> Path:
+    """Path of the lock file guarding *agent*'s wallet.
+
+    Resolved through exactly the inputs the wallet itself resolves through, so
+    the lock follows the wallet wherever ``SKHARNESS_WALLET_HOME`` or an
+    explicit ``home`` sends it. A lock pinned to a fixed path while the wallet
+    moved would be the fleet's oldest failure shape: a guard that watches a
+    different file than the writer touches.
+    """
+    root = Path(home) if home is not None else _default_wallet_root()
+    return Path(root).expanduser() / "agents" / agent / "wallet" / SETTLE_LOCK_NAME
+
+
+@contextlib.contextmanager
+def settle_lock(agent: str, home=None, timeout: float = SETTLE_LOCK_TIMEOUT):
+    """Hold exclusive write access to *agent*'s wallet, across processes.
+
+    Yields True when the lock is held and False when it could not be taken. The
+    caller proceeds either way; see the note on the timeout below.
+
+    WHY AN flock AND NOT A MUTEX. ``JouleWallet`` already carries a
+    ``threading.Lock``, but it is an INSTANCE attribute and the snapshot is read
+    once in ``__init__``. ``settle()`` builds a fresh wallet per call, so two
+    settlements hold two locks that never contend, and the read-modify-write of
+    the balance is unguarded. An in-process mutex would close only half of that
+    anyway: several sessions run on one box, each in its own interpreter, so the
+    contending writers are frequently different PROCESSES. ``flock`` is the
+    cheapest primitive that covers both, because Linux associates the lock with
+    the open file description rather than the process, so two threads that each
+    ``open()`` the file contend exactly as two processes do.
+
+    WHY A TIMEOUT THAT PROCEEDS RATHER THAN RAISES. ``settle()`` must never fail
+    a correct build, and returning ``recorded=False`` would DISCARD the credit
+    this card exists to protect. Since commit 7bebcd8 the journal is written
+    before the state, so an unlocked settlement still leaves a durable
+    transaction that ``replay_balance()`` can reconstruct from; only the cached
+    balance is at risk. Waiting forever, by contrast, would hang a build behind
+    a stale lock file. So a timeout logs loudly and continues degraded.
+
+    Args:
+        agent: Wallet owner.
+        home: Resolved skcapstone root, or None for skjoule's own default.
+        timeout: Seconds to queue before proceeding unlocked.
+    """
+    path = _settle_lock_path(agent, home)
+    if fcntl is None:  # pragma: no cover - POSIX everywhere on this fleet
+        with _fallback_locks_guard:
+            lock = _fallback_locks.setdefault(str(path), threading.Lock())
+        acquired = lock.acquire(timeout=timeout)
+        try:
+            if not acquired:
+                log.warning("settle lock (in-process fallback) timed out for %s", agent)
+            yield acquired
+        finally:
+            if acquired:
+                lock.release()
+        return
+
+    handle = None
+    acquired = False
+    try:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handle = path.open("a+")
+        except OSError as exc:
+            # An unopenable lock file must not cost a settlement. Same reasoning
+            # as the timeout: the journal is the durable side.
+            log.warning("could not open settle lock %s (%s); settling unlocked", path, exc)
+            yield False
+            return
+
+        deadline = time.monotonic() + max(timeout, 0.0)
+        delay = 0.002
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    log.warning(
+                        "settle lock for %s still held after %.1fs; settling unlocked, "
+                        "the journal remains authoritative",
+                        agent,
+                        timeout,
+                    )
+                    break
+                time.sleep(delay)
+                delay = min(delay * 2, 0.05)
+        yield acquired
+    finally:
+        if handle is not None:
+            if acquired:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                handle.close()
 
 
 def _priority_bucket(card_priority: str | None) -> str:
@@ -333,69 +460,77 @@ def settle(
 
     try:
         bridge = XPBridge()
-        wallet = JouleWallet(agent, home=home)
 
-        # 1. Record the REAL token cost (authoritative USD via per-model pricing).
-        if usage.tokens > 0:
-            try:
-                UsageTracker(home=_usage_home(agent, home)).record_usage(
-                    usage.model, usage.input_tokens, usage.output_tokens
+        # Everything that reads or writes the balance runs inside the lock, and
+        # that INCLUDES constructing the wallet, because the read this protects
+        # is JouleWallet.__init__ loading the snapshot. Building the wallet
+        # outside and locking only the mutations would leave the identical bug:
+        # two settlements would still capture the same stale balance and the
+        # second write would still erase the first.
+        with settle_lock(agent, home=home):
+            wallet = JouleWallet(agent, home=home)
+
+            # 1. Record the REAL token cost (authoritative USD via per-model pricing).
+            if usage.tokens > 0:
+                try:
+                    UsageTracker(home=_usage_home(agent, home)).record_usage(
+                        usage.model, usage.input_tokens, usage.output_tokens
+                    )
+                except Exception as exc:  # cost telemetry is best-effort
+                    log.debug("usage record failed for %s: %s", agent, exc)
+
+            # 2. Mint joules for the verified work (twin-gate pass).
+            minted = bridge.calculate_joules(
+                "task_complete",
+                priority=_priority_bucket(priority),
+                quality=_quality_bucket(score),
+            )
+            # proof_hash is an ARTIFACT proof, and is deliberately NOT unique per
+            # settlement. It answers "which commit is this settlement evidence for",
+            # so both legs below (the mint and the matching llm-cost spend) carry the
+            # SAME value on purpose: they are one economic event, and a reader
+            # reconciling the ledger needs them joinable.
+            #
+            # Two consequences follow, and neither is a defect to fix here:
+            #   1. It cannot serve as a dedupe key, and nothing uses it as one. The
+            #      double-settle guard is autopilot_cost.already_settled(card_id),
+            #      keyed on the card, precisely because a re-dispatch of the same
+            #      card produces a FRESH commit sha and would slip a sha-based key.
+            #   2. Settling the same commit twice yields the same proof. That is the
+            #      correct reading of "proof of this artifact", not a collision.
+            #
+            # The audit that produced this card observed only two distinct proofs
+            # across 1,433 rows and reasonably asked whether that was a second bug.
+            # It was a symptom of the first one: those rows all came from the fixture
+            # ref "t1" with no commit sha, so the fallback hashed the literal "t1"
+            # (sha256 = 628b49d9...) every time. Test rows stop being minted as of
+            # this commit, so the property does not arise for real settlements.
+            proof = XPBridge.compute_proof_hash(commit_sha or task_ref)
+            if minted > 0:
+                wallet.mint(
+                    minted,
+                    description=f"autocode task_complete {task_ref}",
+                    proof_hash=proof,
                 )
-            except Exception as exc:  # cost telemetry is best-effort
-                log.debug("usage record failed for %s: %s", agent, exc)
 
-        # 2. Mint joules for the verified work (twin-gate pass).
-        minted = bridge.calculate_joules(
-            "task_complete",
-            priority=_priority_bucket(priority),
-            quality=_quality_bucket(score),
-        )
-        # proof_hash is an ARTIFACT proof, and is deliberately NOT unique per
-        # settlement. It answers "which commit is this settlement evidence for",
-        # so both legs below (the mint and the matching llm-cost spend) carry the
-        # SAME value on purpose: they are one economic event, and a reader
-        # reconciling the ledger needs them joinable.
-        #
-        # Two consequences follow, and neither is a defect to fix here:
-        #   1. It cannot serve as a dedupe key, and nothing uses it as one. The
-        #      double-settle guard is autopilot_cost.already_settled(card_id),
-        #      keyed on the card, precisely because a re-dispatch of the same
-        #      card produces a FRESH commit sha and would slip a sha-based key.
-        #   2. Settling the same commit twice yields the same proof. That is the
-        #      correct reading of "proof of this artifact", not a collision.
-        #
-        # The audit that produced this card observed only two distinct proofs
-        # across 1,433 rows and reasonably asked whether that was a second bug.
-        # It was a symptom of the first one: those rows all came from the fixture
-        # ref "t1" with no commit sha, so the fallback hashed the literal "t1"
-        # (sha256 = 628b49d9...) every time. Test rows stop being minted as of
-        # this commit, so the property does not arise for real settlements.
-        proof = XPBridge.compute_proof_hash(commit_sha or task_ref)
-        if minted > 0:
-            wallet.mint(
-                minted,
-                description=f"autocode task_complete {task_ref}",
-                proof_hash=proof,
-            )
+            # 3. Spend the USD-equivalent joules (real cost). The framework floors the
+            #    balance at 0, so cap the debit; the intended cost still drives net.
+            spent = int(round(usage.cost_usd * joule_per_usd))
+            actual = min(spent, wallet.balance) if spent > 0 else 0
+            if actual > 0:
+                wallet.spend(
+                    actual,
+                    description=f"autocode llm-cost {task_ref} (${usage.cost_usd:.4f})",
+                    proof_hash=proof,
+                )
 
-        # 3. Spend the USD-equivalent joules (real cost). The framework floors the
-        #    balance at 0, so cap the debit; the intended cost still drives net.
-        spent = int(round(usage.cost_usd * joule_per_usd))
-        actual = min(spent, wallet.balance) if spent > 0 else 0
-        if actual > 0:
-            wallet.spend(
-                actual,
-                description=f"autocode llm-cost {task_ref} (${usage.cost_usd:.4f})",
-                proof_hash=proof,
-            )
-
-        econ.minted = minted
-        econ.spent_joules = spent
-        econ.spent_joules_actual = actual
-        econ.net_joules = minted - spent
-        econ.joules_per_usd = (minted / usage.cost_usd) if usage.cost_usd > 0 else 0.0
-        econ.balance_after = wallet.balance
-        econ.recorded = True
+            econ.minted = minted
+            econ.spent_joules = spent
+            econ.spent_joules_actual = actual
+            econ.net_joules = minted - spent
+            econ.joules_per_usd = (minted / usage.cost_usd) if usage.cost_usd > 0 else 0.0
+            econ.balance_after = wallet.balance
+            econ.recorded = True
     except Exception as exc:  # never fail the build over accounting
         log.warning("build economics failed for %s (build unaffected): %s", task_ref, exc)
     return econ

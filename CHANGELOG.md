@@ -76,6 +76,63 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   is empty. Every fabricated row carries `tokens=0` and `cost_usd=0.0`, which is
   why no consumer that reads the aggregates instead of the row count ever saw
   anything wrong.
+- **Plane-file signature trust, wired but off by default** (card P6, coord
+  `08963fbb`). `objects/_freeze.json` (the human kill switch) and
+  `objects/_protected.json` (the carve-out manifest) each carried a
+  `writer.signature` slot that nothing filled in and nothing checked. New
+  `autocode/plane_trust.py` wires the check into both production read paths
+  (`protected._manifest_for`, reached by every `engineering.py` finalize; and
+  `fleet_dispatch.default_placer`'s freeze read), gated by the same
+  `SKFLEET_SIGNING` rollout flag (`off | permissive | enforce`) Card 3.5 uses
+  for writes. `off` (unset, the default) is an exact no-op: every existing
+  test and every live plane file behaves exactly as before this landed.
+  `enforce` fails closed with NO grace period: an unsigned or tampered
+  manifest protects everything (same direction as an absent manifest today);
+  an unsigned or tampered freeze file is treated as frozen (same "when in
+  doubt, halt" direction `store.is_frozen` already takes for an unreadable
+  file). New `autocode/sign_plane_files.py` (console script
+  `skharness-sign-plane-files`) is the human/operator-run tool that actually
+  signs the two files; it deliberately resolves the signing key agent-blind
+  (never acting-agent-first) and refuses outright unless the resolved key's
+  fingerprint matches the expected operator root. The live `_freeze.json` and
+  `_protected.json` are NOT signed by this change: the operator root key
+  (`chef@skworld.io`) is held in offline custody by policy, so the write half
+  of the ceremony has to happen on a node/session that actually holds it (or
+  via the Bunker remote signer). Non-regression proven with a test, not
+  asserted: the constitutional carve-out floor (`_ALWAYS_PROTECTED`) still
+  holds guardrail files protected even under a manifest that verifies as
+  genuinely signed but simply omits them.
+  Threat model: this closes the autopilot/programmatic-write path onto these
+  two files. It does NOT make the freeze card AI-proof against an interactive
+  shell; shell is root-equivalent on these nodes, so anything that can invoke
+  `gpg`/capauth the way the operator can could still sign a false state. See
+  `plane_trust.py`'s module docstring.
+- **Autopilot digest decisions are now bound by stable id, not position**
+  (card `78409fc0`, spec `2026-08-13-unified-consent-plane-arch.md` section
+  3.2). `resolver.answer` answered by POSITION alone: the manifest renumbers
+  on every rebuild, so a reply sent against yesterday's digest could resolve
+  to a DIFFERENT item than the one actually shown, the same defect class as
+  applying a Terraform plan that drifted after it was saved.
+  `digest.build_manifest` now stamps every item with a `content_hash` (over
+  qid + prompt + options, deliberately excluding `n`) and the manifest as a
+  whole with a `generation` hash over the full ordered presentation.
+  `resolver.answer(n, generation, response)` requires that `generation`, and
+  refuses with `StaleGeneration` when the live manifest has since been
+  rebuilt into a different generation, mirroring Terraform Cloud's
+  stale-plan behaviour: the whole digest that was shown is what is
+  approved, not each line item independently. `n` remains purely a display
+  convenience once the generation check has passed. A second `answer()`
+  against an already-resolved decision now raises `AlreadyAnswered`
+  (AWS Step Functions task-token semantics: single-use, and reuse is an
+  explicit error, never a silent no-op) instead of returning a
+  success-shaped `idempotent: True`, which matters because
+  `~/.skcapstone` is Syncthing-synced and two nodes could each believe they
+  answered first. `digest.queue_decision` now stamps every decision with a
+  mandatory `expires_at` (default 24h TTL); an `answer()` against an expired
+  decision raises `DecisionExpired` and records an explicit EXPIRED state in
+  the store (CodePipeline semantics: a timeout routes to an explicit state,
+  never a silent drop), and expired items stop recirculating into future
+  digests instead of reappearing indefinitely.
 - **The shadow mutation probe is now CALLED on the live path** (card `788425b8`,
   S26). S23 built the worker-independent outcome label, gave it 43 tests and
   merged it, and nothing anywhere called `mutation.probe`: a module with no
@@ -216,6 +273,26 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   the energy.
 
 ### Fixed
+- **A concurrent settlement can no longer erase earned joules** (card `1892cf38`,
+  S28). `balance_after` in the live ledger is not a clean running total of the
+  `amount` column, and two of the breaks are lost updates: two mints 35
+  microseconds apart on 2026-08-15 both recorded `balance_after=123309`, and two
+  mints 105 ms apart on 2026-08-17 both recorded `balance_after=162168`. 25 J and
+  50 J of genuine earned credit are missing from the balance. `JouleWallet` reads
+  its snapshot once in `__init__` and guards mutations with an INSTANCE lock,
+  while `settle()` builds a fresh wallet per call, so two settlements hold two
+  snapshots and two locks that never contend and the second write erases the
+  first. `settle()` now holds an `flock` on `{wallet}/.settle.lock` across the
+  whole read-modify-write, wallet construction included, since construction is
+  the read; `flock` binds to the open file description rather than the process,
+  so one primitive covers concurrent threads and concurrent sessions alike. On
+  timeout it settles unlocked and logs, because since skcapstone `7bebcd8` the
+  journal is written before the state and so remains reconstructible, whereas
+  refusing to settle would discard the credit outright. The test forces the
+  interleaving rather than hoping for it: the snapshot read is gated so both
+  settlers rendezvous immediately after reading. This does NOT cover
+  skcapstone's `JouleEconomy.record_task_completion`, the path both live losses
+  actually came from, nor two hosts writing one replicated wallet.
 - **`revert` now works on auto-merged work.** The merge record was written as
   `{pr, branch, ts, auto}` with no `sha`, while `_revert_impl` requires
   `merge["sha"]`, so revert ALWAYS failed on anything autopilot merged and

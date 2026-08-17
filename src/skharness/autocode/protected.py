@@ -120,8 +120,13 @@ def load_manifest(root: str | Path, *, verify=None) -> dict:
     Args:
         root: the fleet tree root containing `objects/_protected.json`.
         verify: optional callable(manifest_dict) -> bool for signature
-            verification (wired to capauth in the integration card). When it
-            returns False the manifest is rejected and the gate fails closed.
+            verification. When it returns False the manifest is rejected and
+            the gate fails closed. Callers that want the real capauth check
+            wired in (the production path) should go through `_manifest_for`,
+            `matched_protected_paths`, or `changed_paths_are_protected`
+            instead of calling this directly with `verify=None`, which skips
+            verification entirely (kept for the manifest-shape unit tests
+            below, which are not exercising signing).
 
     Returns:
         The manifest dict, or `_FAIL_CLOSED` (protects everything) on any
@@ -153,19 +158,38 @@ def is_protected(changed_paths, manifest: dict) -> bool:
     return any(fnmatch(str(p), g) for p in changed_paths for g in globs)
 
 
-def _manifest_for(root: str | Path) -> dict:
+def _default_verify(manifest: dict) -> bool:
+    """The real capauth signature check (Card P6, coord `08963fbb`).
+
+    Wired here rather than left `None`: this is the one production call path
+    (`_manifest_for` -> `matched_protected_paths` /
+    `changed_paths_are_protected`, which `engineering.py` finalize calls on
+    every build) that used to pass no verifier at all, so a signed-looking
+    but unsigned manifest was accepted as long as its JSON parsed. See
+    `plane_trust` for the rollout gate (`SKFLEET_SIGNING`, default off, so
+    this is a no-op True until an operator opts in) and the threat model.
+    """
+    from .plane_trust import payload_trusted
+
+    return payload_trusted(manifest, label="_protected.json")
+
+
+def _manifest_for(root: str | Path, *, verify=None) -> dict:
     """Bootstrap-safe manifest load, shared by the two finalize-facing helpers.
 
     When the manifest is present it adds its extra paths (and fails closed on
-    tamper, via `load_manifest`). When it is ABSENT the gate protects only the
-    core rather than everything, so the autopilot keeps auto-merging normal work
-    during the carve-out rollout instead of stalling fleet-wide.
+    tamper, via `load_manifest`, using the real capauth check unless a caller
+    overrides `verify` for a test). When it is ABSENT the gate protects only
+    the core rather than everything, so the autopilot keeps auto-merging
+    normal work during the carve-out rollout instead of stalling fleet-wide.
     """
     mpath = Path(root) / "objects" / "_protected.json"
-    return load_manifest(root) if mpath.exists() else {"protected": []}
+    if not mpath.exists():
+        return {"protected": []}
+    return load_manifest(root, verify=verify if verify is not None else _default_verify)
 
 
-def matched_protected_paths(root: str | Path, changed_paths) -> list[str]:
+def matched_protected_paths(root: str | Path, changed_paths, *, verify=None) -> list[str]:
     """The changed paths that actually hit the floor, in input order.
 
     S17: the gate answered a bare bool, so a hold could say THAT it held but not
@@ -173,15 +197,15 @@ def matched_protected_paths(root: str | Path, changed_paths) -> list[str]:
     from an evaluation that never ran. Returning the matches makes both the hold
     and the clean pass reviewable by a human who was not there.
     """
-    manifest = _manifest_for(root)
+    manifest = _manifest_for(root, verify=verify)
     return [str(p) for p in changed_paths if is_protected([p], manifest)]
 
 
-def changed_paths_are_protected(root: str | Path, changed_paths) -> bool:
+def changed_paths_are_protected(root: str | Path, changed_paths, *, verify=None) -> bool:
     """Finalize-facing gate, bootstrap-safe.
 
     The core guardrail files (`_ALWAYS_PROTECTED`) are ALWAYS protected, with or
     without a manifest, so essential protection needs no rollout. See
     `_manifest_for` for the manifest-absent behaviour.
     """
-    return is_protected(changed_paths, _manifest_for(root))
+    return is_protected(changed_paths, _manifest_for(root, verify=verify))

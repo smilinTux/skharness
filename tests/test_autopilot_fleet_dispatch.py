@@ -121,3 +121,109 @@ def test_default_placer_frozen_skips_everything(monkeypatch, tmp_path):
     placer = fd.default_placer()
     decision = placer(_item("t-1"))
     assert decision.node is None and "frozen" in decision.reason
+
+
+# ---------------------------------------------------------------------------
+# Card P6 (coord `08963fbb`): `_freeze.json` gets the same signature check
+# `_protected.json` got in `test_autocode_protected.py`, gated by the same
+# `SKFLEET_SIGNING` flag. `off` (unset, the default) reproduces
+# `test_default_placer_frozen_skips_everything` and its unfrozen counterpart
+# unchanged; `enforce` cannot trust `frozen: false` written without a
+# signature, and "cannot trust the kill switch says off" must mean the same
+# thing `is_frozen` already means for an unreadable file: halt.
+# ---------------------------------------------------------------------------
+
+def _fake_signer(data: bytes) -> str:
+    import hashlib
+    return "sig:" + hashlib.sha256(data).hexdigest()
+
+
+def _fake_verifier(data: bytes, sig: str) -> bool:
+    import hashlib
+    return sig == "sig:" + hashlib.sha256(data).hexdigest()
+
+
+def _admit_one_node(tmp_path, monkeypatch, node="node-158"):
+    from skcapstone.fleet import sknoded, store
+    from skcapstone.fleet.paths import FleetPaths
+
+    monkeypatch.setenv("SKFLEET_ROOT", str(tmp_path / "fleet"))
+    monkeypatch.setenv("SKFLEET_NODE", node)
+    monkeypatch.setattr("skcapstone.fleet.sknoded.node_capacity",
+                        lambda: {"cores": 8, "ram_gb": 16.0, "disk_gb": 100.0,
+                                 "gpu": None, "vram_gb": None})
+    paths = FleetPaths(root=tmp_path / "fleet")
+    operator = store.Writer(role="operator", node=node, identity="")
+    sknoded.run_once(paths, node)
+    store.write_spec(paths, "node", node, {"cordoned": False}, writer=operator)
+    sknoded.run_once(paths, node)
+    return paths, operator
+
+
+@pytest.mark.needs_skcapstone
+def test_freeze_trust_off_leaves_unsigned_unfrozen_file_working(monkeypatch, tmp_path):
+    from skcapstone.fleet import signing as fleet_signing
+
+    monkeypatch.delenv(fleet_signing.SIGNING_ENV, raising=False)
+    _admit_one_node(tmp_path, monkeypatch)
+    placer = fd.default_placer()
+    decision = placer(_item("t-1"))
+    assert decision.node == "node-158"          # unsigned "frozen: false" still honored
+
+
+@pytest.mark.needs_skcapstone
+def test_freeze_trust_enforce_halts_on_unsigned_freeze_file(monkeypatch, tmp_path):
+    """The migration case: `_freeze.json` written before signing existed
+    (`writer.signature: null`) must not silently become trusted once
+    enforcement is on. Content says `frozen: false`; the dispatcher must
+    still refuse, because it cannot confirm a human wrote that."""
+    from skcapstone.fleet import signing as fleet_signing
+
+    monkeypatch.setattr(fleet_signing, "capauth_verifier", lambda: _fake_verifier)
+    _admit_one_node(tmp_path, monkeypatch)
+    monkeypatch.setenv(fleet_signing.SIGNING_ENV, "enforce")   # flip AFTER admission
+    placer = fd.default_placer()
+    decision = placer(_item("t-1"))
+    assert decision.node is None and "frozen" in decision.reason
+
+
+@pytest.mark.needs_skcapstone
+def test_freeze_trust_enforce_honors_a_validly_signed_unfrozen_file(monkeypatch, tmp_path):
+    from skcapstone.fleet import signing as fleet_signing
+    from skcapstone.fleet.paths import FleetPaths
+
+    monkeypatch.setattr(fleet_signing, "capauth_verifier", lambda: _fake_verifier)
+    paths, operator = _admit_one_node(tmp_path, monkeypatch)
+    signed = {
+        "frozen": False, "reason": "", "updatedAt": "2026-08-17T00:00:00Z",
+        "writer": {"identity": "capauth:chef@skworld.io", "node": "cli",
+                   "role": "operator", "signature": None},
+    }
+    signed["writer"]["signature"] = _fake_signer(fleet_signing.canonical_bytes(signed))
+    FleetPaths(root=paths.root).freeze_path().write_text(__import__("json").dumps(signed))
+    monkeypatch.setenv(fleet_signing.SIGNING_ENV, "enforce")
+    placer = fd.default_placer()
+    decision = placer(_item("t-1"))
+    assert decision.node == "node-158"
+
+
+@pytest.mark.needs_skcapstone
+def test_freeze_trust_enforce_still_halts_on_an_actually_frozen_signed_file(monkeypatch, tmp_path):
+    """A validly-signed freeze file that says `frozen: true` still halts:
+    signing adds trust in the content, it does not flip the content."""
+    from skcapstone.fleet import signing as fleet_signing
+    from skcapstone.fleet.paths import FleetPaths
+
+    monkeypatch.setattr(fleet_signing, "capauth_verifier", lambda: _fake_verifier)
+    paths, operator = _admit_one_node(tmp_path, monkeypatch)
+    signed = {
+        "frozen": True, "reason": "chef says stop", "updatedAt": "2026-08-17T00:00:00Z",
+        "writer": {"identity": "capauth:chef@skworld.io", "node": "cli",
+                   "role": "operator", "signature": None},
+    }
+    signed["writer"]["signature"] = _fake_signer(fleet_signing.canonical_bytes(signed))
+    FleetPaths(root=paths.root).freeze_path().write_text(__import__("json").dumps(signed))
+    monkeypatch.setenv(fleet_signing.SIGNING_ENV, "enforce")
+    placer = fd.default_placer()
+    decision = placer(_item("t-1"))
+    assert decision.node is None and "frozen" in decision.reason
