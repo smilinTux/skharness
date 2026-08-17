@@ -1,16 +1,27 @@
-"""Cross-run failure memory: the READ half (helpful forgetting).
+"""Cross-run failure AND success memory: the READ half (helpful forgetting).
 
 skcoord writes one distilled entry per terminal non-pass to
-``meta.autopilot.attempts[]``; this module turns that array into the small block
-of prior context a fresh harness session is allowed to see, or ``None``.
+``meta.autopilot.attempts[]``, and one per terminal pass to the sibling key
+``meta.autopilot.successes[]``; this module turns each array into the small
+block of prior context a fresh harness session is allowed to see, or ``None``.
+A policy or a human reading only failures learns what not to do and never what
+works, so the two readers (``build_prior_feedback`` / ``build_prior_success_feedback``)
+apply the SAME forgetting discipline to both, through their OWN renderers
+(``_render`` / ``_render_success``): the two are never one function behind a
+boolean flag, because their literal text means opposite things.
 
 The forgetting is the feature. Remembering everything is what makes a card bloat
-into an unreadable brief, and a stale flake would then haunt every future run. So
-the reader dedupes, keeps only the last few DISTINCT failures, distills each to
-one consequence line, and hard-caps the block. Raw detail (diffs, tracebacks, test
-output) is never inlined; it stays in the run journal, which ``run_id`` points at.
+into an unreadable brief, and a stale flake (or a one-off lucky pass) would then
+haunt every future run. So each reader dedupes, keeps only the last few DISTINCT
+entries, distills each to one consequence line, and hard-caps the block. Raw
+detail (diffs, tracebacks, test output) is never inlined; it stays in the run
+journal, which ``run_id`` points at.
 
-Storage cap (skcoord, 10) is a corruption guard. The bound here is the policy.
+Storage cap (skcoord, 10 per array) is a corruption guard. The bound here is the
+policy. ``successes[]`` is a SIBLING of ``attempts[]``, not a variant of it:
+skcoord's ``clear_attempts`` wipes ``attempts[]`` wholesale on every terminal
+pass, so a success stored in that same array would be destroyed by the very
+event that created it.
 """
 from __future__ import annotations
 
@@ -21,7 +32,31 @@ import re
 MAX_ATTEMPTS = 3
 MAX_CHARS = 600
 
-_HEADER = "Prior attempts on this card (distilled):"
+# S21 (card 53b8c8be), vector 2: every line under this header is model-derived
+# text, distilled from ONE previous run's grader notes by `distill_failure`. It
+# crosses attempts: a failing worker seeds the next worker's round one. That is
+# the same mechanism the 2026-08-16 red-team accepted as decisive against the
+# exploration slice (card f81d8d2d), where a weak model's misdiagnosis would have
+# corrupted the control arm through the card's failure memory.
+#
+# The DECISION recorded here: keep the channel (a card that rebuilds into the
+# same wall every run is the failure it exists to prevent), keep its existing
+# bounds (3 distinct entries, 600 chars, one distilled line each, dedup on cause,
+# and a journal pointer attributing the newest entry to its run), and fix the
+# missing piece, which was epistemic status. The block used to read as an
+# established finding. It now says what it is: an unverified report from a run
+# that FAILED, to be checked rather than believed. The prefix is unchanged so the
+# existing wiring tests keep matching on it.
+_HEADER = ("Prior attempts on this card (distilled, UNVERIFIED: these are "
+           "reports from earlier runs that FAILED, not findings, so verify each "
+           "against the code before acting on it):")
+# The success block carries the same epistemic caveat for the same reason: a
+# `why_succeeded` line is one run's account of its own pass, not a verified
+# finding, and a lucky pass repeated as gospel is the mirror image of the
+# misdiagnosis S21 guards against.
+_SUCCESS_HEADER = ("Prior successes on this card (distilled, UNVERIFIED: these "
+                   "are reports from earlier runs, not findings, so verify each "
+                   "against the code before relying on it):")
 
 
 # Longest a distilled cause may be. Well under the block ceiling so three of them
@@ -124,6 +159,97 @@ def _render(entry: dict) -> str:
     if hint:
         return f"- This failed for {why}, try {hint}."
     return f"- This previously failed for {why}; avoid repeating that approach."
+
+
+def _successes(payload) -> list[dict]:
+    """Tolerant reader for ``meta.autopilot.successes[]``, mirrors ``_attempts``
+    except for the storage key. A sibling array, not a variant of attempts[]:
+    ``clear_attempts`` (skcoord) never touches it, so a success recorded on the
+    same pass that triggers a clear survives that clear. A card predating this
+    field, or any shape that is not a real list, reads as empty rather than
+    raising."""
+    if not isinstance(payload, dict):
+        return []
+    meta = payload.get("meta")
+    if not isinstance(meta, dict):
+        return []
+    ap = meta.get("autopilot")
+    if not isinstance(ap, dict):
+        return []
+    raw = ap.get("successes")
+    if not isinstance(raw, list):
+        return []
+    return [e for e in raw if isinstance(e, dict)]
+
+
+def _distinct_newest_successes(successes: list[dict]) -> list[dict]:
+    """Dedup on (outcome, why_succeeded casefolded), keeping the NEWEST entry
+    per key, then return the last MAX_ATTEMPTS distinct successes in ts order.
+
+    Mirrors ``_distinct_newest`` exactly (same sort, same tiebreak, same bound)
+    except for the field it dedups on, so the SAME forgetting discipline the
+    failure side already has applies to successes too.
+    """
+    ordered = sorted(enumerate(successes),
+                     key=lambda p: (str(p[1].get("ts") or ""), p[0]))
+    seen: set[tuple[str, str]] = set()
+    kept: list[tuple[int, dict]] = []
+    for pos, entry in reversed(ordered):            # newest first: first seen wins
+        key = (str(entry.get("outcome") or ""),
+               _one_line(entry.get("why_succeeded")).strip().lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append((pos, entry))
+        if len(kept) >= MAX_ATTEMPTS:
+            break
+    kept.sort(key=lambda p: (str(p[1].get("ts") or ""), p[0]))   # back to oldest-first
+    return [entry for _, entry in kept]
+
+
+def _render_success(entry: dict) -> str:
+    """One consequence line per success. Its OWN renderer, not ``_render`` behind
+    a flag: the literal text is success-phrased ('succeeded', never 'failed'),
+    so a fresh session can lean on what worked instead of re-deriving it."""
+    why = _one_line(entry.get("why_succeeded"))
+    hint = _one_line(entry.get("approach_hint"))
+    if hint:
+        return f"- This succeeded via {why}, using {hint}."
+    return f"- This previously succeeded via {why}."
+
+
+def build_prior_success_feedback(payload) -> str | None:
+    """Render a card's success memory as bounded prior context, or ``None``.
+
+    ``payload`` is the card dict the executor already holds (``item.payload``).
+    Returns ``None`` when there is nothing to remember.
+
+    Mirrors ``build_prior_feedback`` exactly: the block is ALWAYS at most
+    ``MAX_CHARS``, oldest lines are dropped first, and a single oversized line
+    is hard-truncated. Reads ``meta.autopilot.successes[]``, a sibling of
+    ``attempts[]`` that ``clear_attempts`` never wipes.
+    """
+    successes = _successes(payload)
+    if not successes:
+        return None
+    kept = _distinct_newest_successes(successes)
+    if not kept:
+        return None
+
+    lines = [_render_success(e) for e in kept]
+    pointer = ""
+    newest_run = _one_line(kept[-1].get("run_id"))
+    if newest_run:
+        pointer = f"Raw history: autopilot/runs/{newest_run}"
+
+    while lines:
+        block = "\n".join([_SUCCESS_HEADER, *lines] + ([pointer] if pointer else []))
+        if len(block) <= MAX_CHARS:
+            return block
+        if len(lines) == 1:
+            break
+        lines.pop(0)
+    return block[:MAX_CHARS]
 
 
 def build_prior_feedback(payload) -> str | None:

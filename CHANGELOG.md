@@ -33,6 +33,100 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   folded into it: on a graded card the two agree on sensitivity zone and differ
   on capability class, and two rows whose classes track each other is the defect
   returning.
+### Fixed
+- **S18: `record_success` is wired, so S9's symmetric memory is no longer
+  dormant.** `Board.record_success`, the `successes[]` sibling key,
+  `build_prior_success_feedback`, its own renderer and 25 passing tests all
+  existed and NO production code path called any of it. A dormant
+  success-memory module and an absent one produce identical behaviour, which is
+  this epic's own failure mode applied to itself. `EngineeringExecutor.finalize`
+  now records a success on the pass branch, before the attempt archive so a
+  future change to `clear_attempts` cannot take it along; `DirectExecutor`
+  records too, with the UNGATED status stated in the entry so a later round
+  cannot read an unverified pass as a verified one; and `TaskBrief` carries
+  `prior_success_feedback`, seeded once per build and, unlike `prior_feedback`,
+  NOT overwritten round to round, because cross-run memory has no in-run
+  equivalent for the live grade to replace. The salvage path still records
+  nothing: it opens a CI-green human-review PR, but the grade never said 5, so
+  nothing verified the approach that would be remembered. Every acceptance test
+  drives `run()` and `finalize()`, never `record_success` directly.
+  - **Outcome vocabulary, decided rather than inherited:** success outcomes DO
+    validate against `types.GATE_OUTCOMES`. `record_attempt`'s looseness was
+    reasonable before S1, when no closed vocabulary existed. It is not now:
+    `GateResult.__post_init__` already refuses a value outside the five and the
+    S4 outcome rows are keyed on the same set, so a success row carrying a
+    sixth value could be joined against neither.
+  - **Two dependencies, stated rather than assumed.** `skcoord`'s
+    `Board.record_success` is on branch `feat/s9-success-memory` and is not on
+    the installed package, so on a node running today's skcoord the write
+    degrades to a `record_success_error` health event and the finalized PR is
+    untouched (pinned by a test). And `adapters/base.py:440` builds the model's
+    JSON payload field by field, so `prior_success_feedback` reaches the
+    `TaskBrief` but not yet the prompt; adding it there is a one-line change in
+    a file owned by a concurrent card.
+- **S17: the self-modification floor had ONE call site and it was unreachable.**
+  `changed_paths_are_protected` was called only from inside `if automerge:` in
+  `engineering.py`, and `automerge_repos` is `[]` in all four live configs, so
+  the carve-out never executed. This CHANGELOG, card 09573989 and the epic
+  935d4b61 design spec all cited it as the protection against
+  self-modification; that reasoning is correct, but the mechanism implementing
+  it did not run. The floor is now evaluated on the path that actually runs:
+  every `finalize`, before the diff is offered for merge by any route. The
+  auto-merge hold is unchanged and now names the files it held on, and a PR-only
+  review decision whose diff touches the floor says so in its prompt, because
+  PR-only work still asks a human to merge a diff. Every evaluation writes a
+  `carveout_evaluated` health event carrying the matched paths, which is the
+  observation that did not exist: "the carve-out held" and "the carve-out never
+  ran" used to produce identical silence. `protected.matched_protected_paths`
+  returns the matches rather than a bare bool, so a hold can state its reason.
+  The real control is still that auto-merge is off fleet-wide; the carve-out is
+  the backstop for the day that flag flips, which is why it must not be
+  reachable only through the flag it exists to survive. Note the manifest half
+  remains UNSIGNED (`"signature": null`, no caller passes `verify`), so the only
+  unforgeable half is the hard-coded `_ALWAYS_PROTECTED` tuple. That is exactly
+  what this call reaches with or without a manifest, so the repair does not wait
+  on the signing work. `tests/test_autocode_carveout_reachability.py` pins
+  reachability under BOTH `automerge_repos: []` and an enabled repo, so it fails
+  if auto-merge is ever turned on while the carve-out path is unreachable, and
+  also fails if the evaluation is ever re-guarded behind the auto-merge branch.
+- **S21: the coverage arm reported a CLAIM, not a measurement, and a planted
+  `coverage.xml` passed the twin gate.** `_stage_work` deliberately resets
+  `coverage.xml` out of the staged index so CI byproducts never pollute the
+  diff, and `_diff` reads `git diff --cached`, so the diff the LLM grader sees
+  is structurally incapable of containing a `coverage.xml`. `diff_coverage`
+  separately parsed whatever `coverage.xml` was on disk, with no returncode
+  check on `cov_cmd`. A worker could therefore write a fabricated report and
+  satisfy the coverage arm while the grader could not observe the reason. The
+  exclusion is correct and is unchanged (staging untracked files is what makes a
+  legitimate TDD change gradeable at all), so the repair is in `diff_coverage`:
+  any pre-existing report is deleted before `cov_cmd` runs, the returncode is
+  checked (and a hang is bounded by the local-CI ceiling), the emitted report's
+  mtime must postdate the run, and a diff whose non-test source lines are absent
+  from the report yields `None` instead of the old perfect `1.0` that an `omit`
+  rule produced. Every refusal now records a `coverage_unusable` health event
+  naming the reason, which is the observation that separates "coverage measured
+  and met" from "the instrument never ran". Negative control, in
+  `tests/test_autocode_coverage_integrity.py`: a planted `coverage.xml` claiming
+  100 percent, with a score-5 grade, a `COMPLETE` promise and green CI, is
+  driven through `EngineeringExecutor.run` and must NOT pass.
+- **S21: the coverage instrument's own configuration is now on the protected
+  floor.** `.coveragerc`, `pyproject.toml`, `pytest.ini`, `setup.cfg`,
+  `tox.ini` and `conftest.py` decide what `--cov` measures, so a diff adding an
+  `omit` rule blinds the arm that grades it without touching CI. That is the
+  rubric hazard one level down, and the floor is hard-coded for the same reason
+  the rubric is. Accepted cost, recorded rather than discovered later:
+  `pyproject.toml` and `conftest.py` change for unrelated reasons, so under
+  auto-merge these globs will route ordinary work to human review. The floor
+  never blocks work, it only refuses to merge it unattended, and auto-merge is
+  off fleet-wide today.
+- **S21: cross-attempt failure memory now declares itself unverified.**
+  `why_failed` is model-derived text distilled from one failed run's grader
+  notes and fed into the next run's round one, which is the mechanism the
+  2026-08-16 red-team accepted as decisive against the exploration slice (card
+  f81d8d2d). The channel is kept and its existing bounds are unchanged (3
+  distinct entries, 600 chars, one distilled line each, dedup, journal pointer);
+  what was missing was epistemic status, so the block now says it carries
+  reports from runs that FAILED, to be checked rather than believed.
 
 ### Added
 - **Graded dispatch: a card's grade now selects the model.** `model_class` and

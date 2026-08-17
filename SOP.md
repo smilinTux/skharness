@@ -439,6 +439,21 @@ deletes the freeze check (such a diff still passes).
   `skcapstone/fleet/store.py`, `skcapstone/itil.py`, `objects/_protected.json` (the
   manifest), and `objects/_freeze.json` (the kill switch).
 - A diff touching any of those escalates to a human **regardless of grade or green CI**.
+- **Where it runs (corrected 2026-08-16, card 53e9190c).** Until S17 the detector had
+  exactly one call site, inside `if automerge:` in `engineering.py`, and
+  `automerge_repos` is `[]` in all four live configs, so the carve-out never executed.
+  The doc above described a mechanism that was inert. It is now evaluated on **every**
+  `finalize`, before the diff is offered for merge by any route, and every evaluation
+  writes a `carveout_evaluated` health event carrying the matched paths. A PR-only
+  review decision that touches the floor says so in its prompt.
+- **What the real control is.** Auto-merge being off fleet-wide
+  (`automerge_repos: []`) is still what keeps every build in front of a human. The
+  carve-out is the backstop for the day that flag flips, which is exactly why it must not
+  be reachable only through the flag it is meant to survive.
+- **The manifest half is unsigned.** `objects/_protected.json` ships
+  `"signature": null` and no caller passes `verify`, so the only unforgeable half of the
+  floor is the hardcoded `_ALWAYS_PROTECTED` tuple. Treat manifest entries as additive
+  convenience, never as the guarantee.
 
 ### Preflight self-check (`autocode/doctor.py`)
 

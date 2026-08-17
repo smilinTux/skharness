@@ -57,6 +57,29 @@ _ALWAYS_PROTECTED: tuple[str, ...] = (
     "*autocode/data/joule-grade-vocabulary.json",
     "*/tests/data/joule-economy-golden-set-*.json",  # the calibration reference
     "*tests/data/joule-economy-golden-set-*.json",
+    # The COVERAGE INSTRUMENT'S OWN CONFIGURATION (S21, card 53b8c8be). The twin
+    # gate's third arm measures the diff with `pytest --cov`; the files below
+    # decide WHAT is measured. A diff that adds an `omit` rule blinds the
+    # instrument that grades it, without touching CI and without appearing to
+    # weaken anything. That is the rubric hazard again, one level down: an engine
+    # that can move the instrument does not need to satisfy it. Coverage config
+    # is therefore floor, not manifest, for the same reason the rubric is: the
+    # realistic failure is not that someone removes an entry, it is that nobody
+    # ever adds one.
+    #
+    # ACCEPTED COST, recorded deliberately: `pyproject.toml` and `conftest.py`
+    # change often for reasons that have nothing to do with coverage, so under
+    # auto-merge these globs will route ordinary dependency bumps to human
+    # review. That is the conservative direction (the floor never blocks work, it
+    # only refuses to merge it unattended) and auto-merge is off fleet-wide
+    # today, so the live cost is zero. If the noise ever becomes real, narrow
+    # these globs with a written reason; do not silently drop them.
+    "*/.coveragerc", "*.coveragerc",
+    "*/pyproject.toml", "*pyproject.toml",     # [tool.coverage.run] omit / [tool.pytest]
+    "*/pytest.ini", "*pytest.ini",
+    "*/setup.cfg", "*setup.cfg",               # [coverage:run] omit
+    "*/tox.ini", "*tox.ini",
+    "*/conftest.py", "*conftest.py",           # can disable plugins at import time
 )
 
 
@@ -99,16 +122,35 @@ def is_protected(changed_paths, manifest: dict) -> bool:
     return any(fnmatch(str(p), g) for p in changed_paths for g in globs)
 
 
+def _manifest_for(root: str | Path) -> dict:
+    """Bootstrap-safe manifest load, shared by the two finalize-facing helpers.
+
+    When the manifest is present it adds its extra paths (and fails closed on
+    tamper, via `load_manifest`). When it is ABSENT the gate protects only the
+    core rather than everything, so the autopilot keeps auto-merging normal work
+    during the carve-out rollout instead of stalling fleet-wide.
+    """
+    mpath = Path(root) / "objects" / "_protected.json"
+    return load_manifest(root) if mpath.exists() else {"protected": []}
+
+
+def matched_protected_paths(root: str | Path, changed_paths) -> list[str]:
+    """The changed paths that actually hit the floor, in input order.
+
+    S17: the gate answered a bare bool, so a hold could say THAT it held but not
+    WHAT it held on, and an evaluation that found nothing was indistinguishable
+    from an evaluation that never ran. Returning the matches makes both the hold
+    and the clean pass reviewable by a human who was not there.
+    """
+    manifest = _manifest_for(root)
+    return [str(p) for p in changed_paths if is_protected([p], manifest)]
+
+
 def changed_paths_are_protected(root: str | Path, changed_paths) -> bool:
     """Finalize-facing gate, bootstrap-safe.
 
     The core guardrail files (`_ALWAYS_PROTECTED`) are ALWAYS protected, with or
-    without a manifest, so essential protection needs no rollout. When the
-    manifest is present it adds its extra paths (and fails closed on tamper, via
-    `load_manifest`). When it is ABSENT the gate protects only the core rather
-    than everything, so the autopilot keeps auto-merging normal work during the
-    carve-out rollout instead of stalling fleet-wide.
+    without a manifest, so essential protection needs no rollout. See
+    `_manifest_for` for the manifest-absent behaviour.
     """
-    mpath = Path(root) / "objects" / "_protected.json"
-    manifest = load_manifest(root) if mpath.exists() else {"protected": []}
-    return is_protected(changed_paths, manifest)
+    return is_protected(changed_paths, _manifest_for(root))
