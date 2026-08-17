@@ -9,6 +9,22 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ## [Unreleased]
 
+### Fixed
+- **`revert` now works on auto-merged work.** The merge record was written as
+  `{pr, branch, ts, auto}` with no `sha`, while `_revert_impl` requires
+  `merge["sha"]`, so revert ALWAYS failed on anything autopilot merged and
+  `meta.autopilot.reverted` could never be written. The operator had no working
+  undo, and any later analysis reading "was this reverted" got a constant False
+  for a broken-tool reason, which reads as "auto-merged work is never wrong".
+  The merge commit sha is now captured immediately after the merge, which is the
+  only cheap moment: `gh pr merge --delete-branch` has already removed the
+  branch, so the commit only gets harder to find from there.
+- **A merged-but-shaless card no longer reports as never merged.** `_revert_impl`
+  raised "no recorded merge" for both cases, telling an operator the work was
+  never merged when it was. The two are now distinguished, and the merged case
+  names the PR and says to revert by hand. Every card auto-merged before this is
+  permanently in that state, so the message matters more than the fix.
+
 ### Security
 - **A card can no longer select the model that grades it** (card `0b7e3ac3`).
   The twin-gate grader took the build's bucket wholesale, so a card graded
