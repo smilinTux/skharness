@@ -79,7 +79,8 @@ def record_run(*, card_id: str, repo: str, tokens: int, cost_usd: float,
                passed: bool, pr: str, ts: str, run_id: str = "",
                outcome: str | None = None, adapter: str | None = None,
                model_requested: str | None = None,
-               model_served: str | None = None, score: int | None = None,
+               model_served: str | None = None,
+               grader_model: str | None = None, score: int | None = None,
                retries: int = 0, quality_mode: str | None = None,
                work_grade: dict | None = None,
                terminal_state: str | None = None,
@@ -107,6 +108,16 @@ def record_run(*, card_id: str, repo: str, tokens: int, cost_usd: float,
     ``work_grade`` carries the Joule Economy grade dict (``size``, ``risk``,
     ``sensitivity``, ``model_class``) exactly as stored on the card, or None
     when the card is ungraded; this module never re-derives it.
+
+    ``grader_model`` (S20, card 0b7e3ac3) names what the TWIN-GATE GRADER
+    addressed, which is a DIFFERENT model from ``model_requested`` (the build)
+    and must not be folded into it. Without it, a grade produced by a competent
+    grader and a grade produced by one the card downgraded for itself wrote
+    byte-identical rows: both a well formed score 5. Recording it is the only
+    observation that separates the two after the fact. It is expected to share
+    ``model_requested``'s sensitivity zone (the grader reads the diff) while
+    carrying a FIXED capability class (see ``grader_pin.py``); a row where the
+    two classes track each other is the defect reappearing.
 
     ``terminal_state`` (S4, card 432b81b7) names the terminal disposition of
     the run as its OWN DISPATCHER saw it, which is a different fact from
@@ -172,7 +183,7 @@ def record_run(*, card_id: str, repo: str, tokens: int, cost_usd: float,
         "passed": bool(passed), "pr": pr, "run_id": run_id,
         "outcome": outcome, "adapter": adapter,
         "model_requested": model_requested, "model_served": model_served,
-        "score": score, "retries": retries, "quality_mode": quality_mode,
+        "grader_model": grader_model, "score": score, "retries": retries, "quality_mode": quality_mode,
         "work_grade": work_grade, "terminal_state": terminal_state,
         **esc_fields,
     }

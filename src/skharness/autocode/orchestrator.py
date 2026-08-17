@@ -106,6 +106,39 @@ def _model_requested(item, harness) -> str | None:
     return model.strip() if isinstance(model, str) and model.strip() else None
 
 
+def _grader_model(item, harness) -> str | None:
+    """The model id the TWIN-GATE GRADER addressed, which is not the builder's.
+
+    Derived through the same two functions the live grade call uses
+    (``bucket_for_payload`` then ``grader_pin.grader_bucket``, over the same
+    payload), so this reads the value the grader was given rather than inventing
+    a parallel one.
+
+    This field exists because there was NO observation separating "this card was
+    graded by a competent model" from "this card downgraded its own grader":
+    both produce a well formed GateResult with score 5, and the row recorded only
+    the BUILD's model. On a graded card these two fields now agree on the
+    sensitivity zone (the grader reads the diff, so it inherits the ceiling) and
+    differ on the capability class (pinned, card-independent). Two rows whose
+    classes track each other is the defect returning.
+
+    On an UNGRADED card there is no bucket on either side, so both the build and
+    the grade run on the adapter's static model and the two fields legitimately
+    match. That is every card today. Populated rather than left null on purpose:
+    a null would read the same as a field nobody threaded.
+    """
+    try:
+        from .buckets import bucket_for_payload
+        from .grader_pin import grader_bucket
+        bucket = grader_bucket(bucket_for_payload(getattr(item, "payload", None) or {}))
+    except Exception:      # noqa: BLE001 - a corrupt grade must not break telemetry
+        bucket = None
+    if bucket:
+        return bucket
+    model = getattr(harness, "model", None)
+    return model.strip() if isinstance(model, str) and model.strip() else None
+
+
 def record_outcome_row(item, *, terminal_state: str, run_id: str, result=None,
                        harness=None, retries: int = 0, pr: str = "") -> None:
     """Append EXACTLY ONE outcome row for one item of one run (card 432b81b7).
@@ -141,6 +174,11 @@ def record_outcome_row(item, *, terminal_state: str, run_id: str, result=None,
     orchestrator's own model decision, ``_model_requested`` above, does not
     look at it.
 
+    ``grader_model`` (S20) is recorded ALONGSIDE ``model_requested``, never
+    folded into it: the twin-gate grader is a different call to a different
+    model, and keeping the two apart is what makes a downgraded grader visible
+    after the fact. See ``_grader_model``.
+
     ``pr`` is always "" here: the gated executor does not surface the PR url
     back to the orchestrator, so there is nothing to record. Rows join to a PR
     through ``run_id`` and the run journal.
@@ -166,6 +204,7 @@ def record_outcome_row(item, *, terminal_state: str, run_id: str, result=None,
             adapter=_adapter_name(harness),
             model_requested=_model_requested(item, harness),
             model_served=None,
+            grader_model=_grader_model(item, harness),
             score=getattr(result, "score", None),
             retries=int(retries or 0),
             # The mode that ACTUALLY produced the result when there is one
@@ -316,18 +355,53 @@ def _repo_floor(task: dict, config) -> QualityMode | None:
     return None if mq is None else coerce_quality(mq)
 
 
-def resolve_quality(task: dict, config=None) -> QualityMode:
-    """Resolve the effective QualityMode for a task (toggle spec 2.2 chain):
-    per-task `quality:` tag > interface default (`config.default_quality`) > gated.
-    Then RAISE to the per-repo floor if one is set (a floor can only strengthen,
-    never weaken; quality is never lowered implicitly)."""
-    q = _quality_from_tags(task)
-    if q is None:
-        q = coerce_quality(getattr(config, "default_quality", None))
+def operator_quality_baseline(task: dict, config=None) -> QualityMode:
+    """The strongest quality the OPERATOR configured for this task, ignoring the card.
+
+    Two operator-owned inputs, both from `autopilot.yaml`, neither writable by a
+    card: the interface default (`config.default_quality`) raised by the per-repo
+    floor (`RepoSpec.min_quality`, toggle spec G6). Gated when neither is set.
+    """
+    q = coerce_quality(getattr(config, "default_quality", None))
     floor = _repo_floor(task, config)
     if floor is not None and QUALITY_RANK[floor] > QUALITY_RANK[q]:
         q = floor
     return q
+
+
+def resolve_quality(task: dict, config=None) -> QualityMode:
+    """Resolve the effective QualityMode for a task: the operator baseline, which a
+    per-task `quality:` tag may only RAISE.
+
+    THE STATED AND ENFORCED CONDITION (S20, card 0b7e3ac3). A `quality:` tag is
+    CARD CONTENT. Cards on this board are written by the autopilot itself
+    (decompose, deepdive_spawn), so a tag is a value the engine can author. The
+    old chain was `tag > default > floor-raise`, which let a card carrying
+    `quality:direct` route itself to `engineering-direct`, documented in types.py
+    as NO grade, NO gate. A card could therefore switch off the twin gate that
+    judges it, which is the same closed loop as a card choosing its own grader
+    (see grader_pin.py). It was mitigated only by the repo floor being set and by
+    DirectExecutor never merging, neither of which is the stated guarantee.
+
+    So the tag is now RAISE-ONLY. It can strengthen review (`quality:gated` on a
+    direct-default interface still works, and is the useful direction: a card
+    asking for MORE scrutiny is not a self-serving request). It can never weaken
+    it. Lowering quality remains entirely possible, but only through
+    `config.default_quality` or `RepoSpec.min_quality`, both operator-owned
+    config that no card can write. That keeps the direct mode skcode and telegram
+    configure while removing the card's hand from the dial.
+
+    A refused downgrade is RECORDED, not silently coerced: a card that tried to
+    disable its own gate must be distinguishable from one that never asked.
+    """
+    baseline = operator_quality_baseline(task, config)
+    tag = _quality_from_tags(task)
+    if tag is None or QUALITY_RANK[tag] <= QUALITY_RANK[baseline]:
+        if tag is not None and QUALITY_RANK[tag] < QUALITY_RANK[baseline]:
+            health.record("quality_downgrade_refused", task=task.get("id"),
+                          requested=tag.value, effective=baseline.value)
+        return baseline
+    return tag
 
 
 def classify_kind(task: dict, config=None) -> str:
