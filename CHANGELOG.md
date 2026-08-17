@@ -12,12 +12,19 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 ### Added
 - **Graded dispatch: a card's grade now selects the model.** `model_class` and
   `sensitivity` map onto a skgateway bucket id (`sk-<class>-<sensitivity>`),
-  replacing the single static `autocode.config.harness_model`. Bucket ids are
-  validated against the gateway's exact grammar BEFORE being sent, because a
-  typo is not a loud error at the gateway: an id that fails the bucket regex is
-  still caught as `sk-*` and falls through to the difficulty classifier,
-  returning 200 from an arbitrary model with no sensitivity ceiling enforced. A
-  single typo would otherwise discard every sovereignty guarantee.
+  intended to replace the single static `autocode.config.harness_model`.
+  **Correction (2026-08-16, card S15):** that replacement has not happened yet.
+  Only the `pi` adapter implements `supports_model_override()`; `claude_code`
+  and `opencode` still raise `ModelOverrideUnsupported`, `codex` is an
+  unimplemented stub, no card currently carries a grade, and the gateway's
+  `buckets_enabled` is off. `config.harness_model` remains the only live model
+  selector today. See `docs/superpowers/specs/2026-08-16-b3-b4-closure-decisions.md`.
+  Bucket ids are validated against the gateway's exact grammar BEFORE being
+  sent, because a typo is not a loud error at the gateway: an id that fails
+  the bucket regex is still caught as `sk-*` and falls through to the
+  difficulty classifier, returning 200 from an arbitrary model with no
+  sensitivity ceiling enforced. A single typo would otherwise discard every
+  sovereignty guarantee.
 - **A per-call model override seam** in the adapters, threaded like the existing
   `light` flag. `ModelOverrideUnsupported` is raised rather than silently
   dropping an override an adapter cannot honour, since dropping it would run on
