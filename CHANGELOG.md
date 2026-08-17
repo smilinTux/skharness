@@ -10,6 +10,36 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 ## [Unreleased]
 
 ### Fixed
+- **S18: `record_success` is wired, so S9's symmetric memory is no longer
+  dormant.** `Board.record_success`, the `successes[]` sibling key,
+  `build_prior_success_feedback`, its own renderer and 25 passing tests all
+  existed and NO production code path called any of it. A dormant
+  success-memory module and an absent one produce identical behaviour, which is
+  this epic's own failure mode applied to itself. `EngineeringExecutor.finalize`
+  now records a success on the pass branch, before the attempt archive so a
+  future change to `clear_attempts` cannot take it along; `DirectExecutor`
+  records too, with the UNGATED status stated in the entry so a later round
+  cannot read an unverified pass as a verified one; and `TaskBrief` carries
+  `prior_success_feedback`, seeded once per build and, unlike `prior_feedback`,
+  NOT overwritten round to round, because cross-run memory has no in-run
+  equivalent for the live grade to replace. The salvage path still records
+  nothing: it opens a CI-green human-review PR, but the grade never said 5, so
+  nothing verified the approach that would be remembered. Every acceptance test
+  drives `run()` and `finalize()`, never `record_success` directly.
+  - **Outcome vocabulary, decided rather than inherited:** success outcomes DO
+    validate against `types.GATE_OUTCOMES`. `record_attempt`'s looseness was
+    reasonable before S1, when no closed vocabulary existed. It is not now:
+    `GateResult.__post_init__` already refuses a value outside the five and the
+    S4 outcome rows are keyed on the same set, so a success row carrying a
+    sixth value could be joined against neither.
+  - **Two dependencies, stated rather than assumed.** `skcoord`'s
+    `Board.record_success` is on branch `feat/s9-success-memory` and is not on
+    the installed package, so on a node running today's skcoord the write
+    degrades to a `record_success_error` health event and the finalized PR is
+    untouched (pinned by a test). And `adapters/base.py:440` builds the model's
+    JSON payload field by field, so `prior_success_feedback` reaches the
+    `TaskBrief` but not yet the prompt; adding it there is a one-line change in
+    a file owned by a concurrent card.
 - **S17: the self-modification floor had ONE call site and it was unreachable.**
   `changed_paths_are_protected` was called only from inside `if automerge:` in
   `engineering.py`, and `automerge_repos` is `[]` in all four live configs, so

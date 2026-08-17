@@ -17,8 +17,10 @@ from pathlib import Path
 from . import health
 from .buckets import attach_dispatch_model, bucket_for_payload
 from .ci import external_ci_verdict, diff_coverage
-from .failure_memory import build_prior_feedback, distill_failure
-from .types import DecisionItem, GateResult, GradeBrief, RepoSpec, TaskBrief, WorkItem
+from .failure_memory import (build_prior_feedback, build_prior_success_feedback,
+                             distill_failure)
+from .types import (GATE_OUTCOMES, DecisionItem, GateResult, GradeBrief, RepoSpec,
+                    TaskBrief, WorkItem)
 
 
 def _now_iso() -> str:
@@ -390,6 +392,49 @@ class EngineeringExecutor:
             health.record("record_attempt_error", task=item.ref,
                           outcome=outcome, error=str(exc)[:120])
 
+    def _record_success(self, item: WorkItem, *, round: int, outcome: str,
+                        tried: str, why_succeeded: str,
+                        approach_hint: str = "") -> None:
+        """Record one terminal PASS on the card (meta.autopilot.successes[]).
+
+        The mirror of `_record_attempt`, and the call site S9 could not add
+        (engineering.py is on the protected floor, so S9 correctly stopped at the
+        module boundary). Until this existed, failures were remembered across
+        runs and successes were not, which is the asymmetry the epic exists to
+        close: a card could only ever learn what did not work.
+
+        Call ONLY from a genuine terminal PASS. Notably NOT from the salvage
+        return: it opened a CI-green human-review PR, but the grade never said 5,
+        so nothing verified the approach that would be remembered.
+
+        OUTCOME VALIDATION, a decision recorded rather than inherited (S18):
+        the outcome DOES validate against `types.GATE_OUTCOMES`. `record_attempt`
+        is loose, which was reasonable before S1 when no closed vocabulary
+        existed. It is not now: `GateResult.__post_init__` already refuses a
+        value outside the five, and the outcome rows S4 writes are keyed on the
+        same vocabulary, so a success row carrying a sixth value could be joined
+        against neither. An unvalidated field that only ever holds one value is
+        indistinguishable from a validated one until the day it is not.
+
+        Best-effort like every other memory write: a board that predates
+        `record_success` (skcoord's half is on branch feat/s9-success-memory and
+        is not yet on the installed package everywhere) records a health event
+        and the finalized PR is untouched. Memory is an optimization and must
+        never be the reason a build dies.
+        """
+        if outcome not in GATE_OUTCOMES:
+            health.record("record_success_invalid_outcome", task=item.ref,
+                          outcome=str(outcome)[:40])
+            return
+        try:
+            self.board.record_success(
+                item.ref, run_id=getattr(self.journal, "run_id", "") or "",
+                round=round, outcome=outcome, tried=tried,
+                why_succeeded=why_succeeded, approach_hint=approach_hint)
+        except Exception as exc:      # noqa: BLE001 - never break a finalize
+            health.record("record_success_error", task=item.ref,
+                          outcome=outcome, error=str(exc)[:120])
+
     def _archive_attempts(self, item: WorkItem) -> list:
         """On a pass, clear the card's failure memory and keep it in the journal.
 
@@ -463,6 +508,12 @@ class EngineeringExecutor:
         # fresh-start behaviour. The in-run grade feedback below overwrites this
         # round to round exactly as before.
         feedback: str | None = build_prior_feedback(p)
+        # S18: the sibling seed. Read ONCE per build and carried into every round
+        # unchanged, because unlike `feedback` it has no in-run equivalent for the
+        # live grade to overwrite: what worked on a PREVIOUS run of this card stays
+        # true for round four as much as for round one. None for a card with no
+        # success memory, which is every card that predates this field.
+        success_feedback: str | None = build_prior_success_feedback(p)
         # Resolve ONCE per build, before any model call: a validated bucket id, or
         # None for an ungraded card (no override, today's exact behaviour). Every
         # round's implement and grade call carries the same one, so a card cannot
@@ -477,7 +528,8 @@ class EngineeringExecutor:
             tb = TaskBrief(task_id=item.ref, repo=repo, worktree=wt,
                            title=p.get("title", ""), description=p.get("description", ""),
                            acceptance=p.get("acceptance", []),
-                           prior_feedback=feedback, round=rnd)
+                           prior_feedback=feedback, round=rnd,
+                           prior_success_feedback=success_feedback)
             attach_dispatch_model(tb, dispatch_model)
             hr = harness.run_task(tb)
             # token/cost telemetry for the joule P&L. harness.name is the adapter
@@ -702,6 +754,22 @@ class EngineeringExecutor:
         retries = 0
         rounds_max = 0
         if result.passed:
+            # S18: write the SUCCESS before clearing the failures. skcoord's
+            # clear_attempts only ever mutates attempts[], so successes[] is
+            # structurally out of its reach, but ordering the write first means a
+            # future change to the clear cannot silently take the success with it.
+            # This is the call site S9 documented and could not make: the whole
+            # success-memory read/write path existed with 25 passing tests and no
+            # production caller, which is behaviourally identical to not having
+            # built it.
+            self._record_success(
+                item, round=1,
+                outcome=(getattr(result, "outcome", "pass") or "pass"),
+                tried=f"twin-gated build of {item.payload.get('title', item.ref)!r}",
+                why_succeeded=("the twin gate closed: grade "
+                               f"{result.score}, external CI green, diff coverage "
+                               "at or above the repo floor"),
+                approach_hint=strip_promise(result.notes)[:180])
             archived = self._archive_attempts(item)
             retries = len(archived)
             rounds_max = max((int(a.get("round") or 0) for a in archived

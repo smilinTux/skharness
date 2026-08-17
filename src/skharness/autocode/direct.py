@@ -17,7 +17,7 @@ a loosened gate.
 from __future__ import annotations
 
 from .engineering import EngineeringExecutor
-from .failure_memory import build_prior_feedback
+from .failure_memory import build_prior_feedback, build_prior_success_feedback
 from .types import GateResult, QualityMode, TaskBrief, WorkItem
 
 
@@ -56,7 +56,8 @@ class DirectExecutor(EngineeringExecutor):
         tb = TaskBrief(task_id=item.ref, repo=repo, worktree=wt,
                        title=p.get("title", ""), description=p.get("description", ""),
                        acceptance=p.get("acceptance", []),
-                       prior_feedback=build_prior_feedback(p), round=1)
+                       prior_feedback=build_prior_feedback(p), round=1,
+                       prior_success_feedback=build_prior_success_feedback(p))
         res = harness.run_task(tb)              # ONE round; no harness.grade() ever
         diff = self._diff(repo, wt)            # same staging (new files in, byproducts out)
         ok = bool(getattr(res, "ok", False))
@@ -108,6 +109,19 @@ class DirectExecutor(EngineeringExecutor):
             # Direct-mode work passed its gate + ships a reviewed PR: settle its
             # joule P&L too (inherited from EngineeringExecutor, best-effort).
             self._settle_economics(item, self._head_sha(wt))
+            # S18: direct mode's success path was untouched by S9 as well, so a
+            # card worked in direct mode remembered its failures and none of its
+            # passes. It records through the same inherited helper, with the
+            # UNGATED status stated in the entry itself: a direct pass means the
+            # harness ran and produced a reviewable diff, NOT that a twin gate
+            # verified it, and a later round must not read one as the other.
+            self._record_success(
+                item, round=1,
+                outcome=(getattr(result, "outcome", "pass") or "pass"),
+                tried=f"ungated single run of {item.payload.get('title', item.ref)!r}",
+                why_succeeded=("an UNGATED direct-mode run produced a reviewable "
+                               "diff; no grade, no twin gate, human review pending"),
+                approach_hint="")
         pr_url = self._open_pr(repo, pr_branch, item)
         self.digest.queue_decision(
             prompt=f"Merge PR {pr_url} for task {item.ref}? "
