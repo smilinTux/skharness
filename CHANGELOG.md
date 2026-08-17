@@ -10,6 +10,24 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 ## [Unreleased]
 
 ### Added
+
+- **pi now sends `x-session-id` and `x-sk-card-id` to skgateway, so a harness run
+  can be joined to the gateway row that describes it.** Measured first: pi's
+  baseline request carries no identifying header at all (host, Accept, the
+  OpenAI-JS `X-Stainless-*` block, `authorization`, and nothing else), which is
+  why `request_log.agent_id` and `session_id` are null for every harness run. pi
+  reads a provider-level `headers` map out of the same `models.json` the adapter
+  already generates per call, so this is a config change rather than new
+  plumbing. Values are baked in as LITERALS and never as `$VAR` interpolation:
+  with the variable unset pi makes NO request at all, reports an internal error,
+  and still exits 0, which `_parse` turns into `{}`, so an unset variable would
+  be a total failure invisible by exit code. Values are validated against a
+  conservative token charset and REFUSED rather than escaped, because a leading
+  `!` in a pi header value executes a shell command on every request. When no ids
+  are supplied the `headers` key is absent entirely, never an empty map: "no
+  session" and "session is empty" are different facts. `compat`'s session
+  affinity keys are deliberately never written, so the harness is the single
+  source of `x-session-id`.
 - **Graded dispatch: a card's grade now selects the model.** `model_class` and
   `sensitivity` map onto a skgateway bucket id (`sk-<class>-<sensitivity>`),
   intended to replace the single static `autocode.config.harness_model`.
