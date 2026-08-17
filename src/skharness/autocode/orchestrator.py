@@ -30,12 +30,26 @@ RUBRIC_VERSION: int = int(VOCABULARY.get("version", 1))
 
 #: PINNED sovereign grader model, used when the harness does not report its own.
 #:
+#: LAST OBSERVED SERVING: 2026-08-16, HTTP 200 from http://localhost:18780,
+#: naming itself back (no failover). Re-verify with `skharness doctor`, whose
+#: `grader-pin` check asks the gateway and reports `fail` on a dead pin and
+#: `warn` (never `ok`) when it cannot reach the gateway to tell.
+#:
 #: Deliberately NOT ``sk-default``. That alias was repointed twice in two days,
 #: most recently onto a 9B, with no announcement; a grade stamped `sk-default`
 #: records nothing about what actually graded the card. Classification against a
 #: written rubric is a fixed class M task whatever it grades, so the grader does
 #: not need to scale with the work and can be pinned once.
-GRADER_MODEL: str = "ornith-big"
+#:
+#: Was ``ornith-big`` (the chiap08 35B behind ``ornith-aeon.service``) until that
+#: service was retired, and it stays retired: a 35B beside ``llama-qwen38`` would
+#: contend for the same GPU. ``ornith-big`` and its alias ``ornith-1.0-35b`` both
+#: 404 now, so the old pin named nothing at all. Repointed to the abliterated
+#: 27B chiap08 cut over to on :11439, chosen over the surviving ``ornith-1.0-9b``
+#: because it is the larger sovereign model on Chef's own hardware, carries the
+#: 262144 context and 8192 output floor a grader working over a whole diff needs,
+#: and being abliterated will not refuse to grade a security-related change.
+GRADER_MODEL: str = "qwen3.8-27b-huihui-abliterated-q4_k_m"
 
 #: A MODEL ID IS NOT EVIDENCE OF SOVEREIGNTY, so no allowlist of model names
 #: lives here any more (card a43cac2e). The grader reads RAW card text and card
@@ -44,8 +58,9 @@ GRADER_MODEL: str = "ornith-big"
 #:
 #: The old rule was `name.startswith("ornith")`. skgateway resolves failover
 #: server side, so the id in a request is an INTENT. The live ledger holds a
-#: `ornith-big` row (this file's own pinned grader) with `backend=nvidia`,
-#: `basis=imputed_cloud`, and the old rule called it sovereign.
+#: `ornith-big` row (which was this file's own pinned grader when the rule was
+#: written) with `backend=nvidia`, `basis=imputed_cloud`, and the old rule called
+#: it sovereign.
 #:
 #: The one definition now lives in `sovereignty.py` and keys on the backend that
 #: served plus the energy basis it reported. See `is_sovereign_grader`.
