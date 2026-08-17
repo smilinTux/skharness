@@ -66,8 +66,30 @@ The two arms are not independent and the counterfactual is not measurable this w
 And a fifth ground, which is a measurement fact rather than a policy choice. From
 `09573989`: the grade causes the routing, so outcomes are not independent of predictions.
 An accurate high-risk call produces more caution, which prevents the bad outcome, which
-then reads as an overestimate. The prediction destroys its own falsifier. Supervised
-calibration on this data is invalid by construction.
+then reads as an overestimate. The prediction destroys its own falsifier.
+
+**CORRECTION 2026-08-16, and this is a correction to my own ranking.** I called ground 5
+the deepest. A red-team pass showed it is scoped to the wrong signal. The falsifier
+argument is about `risk`, an axis of the skcoord **work grade**. This epic's stated
+subject is a policy trained on **`GateResult.score`**, which is a different store with a
+different history. Ground 5 is true and it does not cover the stated target.
+
+**The load-bearing ground is number 3's CI arm**, restated: the twin gate's CI arm is
+satisfied by tests the worker itself authored, so a passing score partly measures the
+worker's ability to write a passing test. That is what defeats the strongest
+counter-argument, which is worth stating because a skeptic will build it:
+
+> Restrict the learner to what this design concedes is sound: `size`, which genuinely
+> calibrates, and model selection off the twin-gate boolean. Ground 5 is a risk-axis
+> argument and does not apply. Grounds 1, 2 and 4 are policy and revisable by whoever
+> wrote them. Ground 3's carve-out does not currently execute. So build the narrow
+> learner.
+
+That argument defeats ground 5 as written and lands ground 3's admitted limit. It loses
+on the CI arm: the label for a size learner is still pass-or-effort, pass is partly
+worker-authored, and a size learner that minimises class-for-pass is precisely the
+downward ratchet `09573989` names. The refusal holds, but through the CI arm, not
+through the falsifier argument.
 
 The epic's own acceptance criteria anticipated this: *"a documented decision NOT to close
 the loop counts as success."* This design takes that outcome deliberately, and reinvests
