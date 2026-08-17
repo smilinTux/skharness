@@ -32,6 +32,14 @@ That is not a reason for despair. It is a reason the loop stays open. An open
 loop with a human in it is not a degraded closed loop; it is the correct design
 for a reward signal that partly measures the ability to write a passing test.
 
+**The load-bearing ground is section 3.3**, the CI arm. Everything else in this
+document either supports it, bounds it, or is a policy that could in principle be
+revised by whoever wrote it. A reader with limited time should read section 3.3,
+then section 4.0, then the counter-argument and rebuttal at section 4.6. Section
+2.4 records the part of the loop that is already closed in production, which was
+discovered while this document was being written and is stronger evidence than
+anything projected.
+
 ---
 
 ## 1. Verdict summary
@@ -42,16 +50,19 @@ for a reward signal that partly measures the ability to write a passing test.
 | Weakening acceptance criteria between attempts | **No.** Nothing prevents a worker from editing the card; the next dispatch reads the edited card | same, plus `skcoord/coordination.py` write path |
 | Inflating coverage by padding unchanged lines | **Yes.** Coverage is computed over added lines only | `ci.py:127-148`, `:176-188` |
 | Inflating coverage by diffing where coverage cannot see | **No.** A changed-line set that intersects no measured class returns `1.0` | `ci.py:187-188` |
-| The CI arm | **No.** CI green is produced by running tests that live in the same diff being graded | `ci.py:115-123`, `engineering.py:229-238` |
+| The CI arm | **No.** CI green is produced by running tests that live in the same diff being graded | `ci.py:115-124`, `engineering.py:229-240` |
 | A held-out check the agent cannot see | **Does not exist.** Nothing in `src/` implements one | verified by absence, section 3.4 |
 | Human ratification outside the loop | **Exists in code, not in practice.** The channel is `digest.queue_decision`; 38 items sit unanswered, oldest 20 days | `digest.py:113-131`, GTD `waiting-for.json` |
+| Failure memory crossing attempts (not on the card's list) | **No.** A failing worker's model-authored prose seeds the next attempt's round 1, unhashed and unreviewed | `engineering.py:448-452`, `:357`, section 3.6 |
+| A card's grade selecting its own grader | **No, and it is live.** Already closed in production, card `0b7e3ac3` | `adapters/base.py:467`, section 2.4 |
 | Any policy consuming the score today | **None.** `.score` is read by the twin-gate predicate, one salvage branch, and report text | section 2.3 |
 
-Four rows say "no". Two of them get the longest treatment: the CI arm, which is
-the deepest problem in the design (section 3.3 addresses it directly rather than
-mitigating it), and human ratification, where the gap between the code and the
-observed behaviour is large enough to be worth measuring rather than asserting
-(section 3.5).
+Six rows say "no". The card asked about five vectors; two more were found while
+answering it and are marked as such. Two rows get the longest treatment: the CI
+arm, which is the load-bearing problem (section 3.3 addresses it directly rather
+than mitigating it), and human ratification, where the gap between the code and
+the observed behaviour is large enough to be worth measuring rather than
+asserting (section 3.5).
 
 ---
 
@@ -82,15 +93,24 @@ The grader is smart enough to notice at least the crudest inconsistency. A live
 decision item queued on 2026-07-27 for task `10f3d23b` records the grader saying,
 of an empty diff, that the claimed CI status and diff coverage in the task data
 are unsubstantiated and should not be trusted. So the grader does police the
-gap between the reported signals and the visible work. That is evidence of a
-partial defence, and it is a model behaviour, not a mechanism.
+gap between the reported signals and the visible work.
+
+**This is the weakest piece of evidence in this document, and it is flagged as
+such rather than left for a reader to discover.** It is a single observation, of
+the easiest possible case (an empty diff, where the inconsistency is total), of a
+model behaviour rather than a mechanism, and nothing in the harness requires the
+next grader to behave the same way. It shows the gap is *noticeable*. It does not
+show it is *noticed*, and no argument below rests on it.
 
 ### 2.2 The twin gate is a conjunction of four things, one of which is a literal
 
-`engineering.py:61-72`:
+`engineering.py:61-72`, the signature and docstring elided (the full text is at
+`:61-69`, the body at `:70-72`):
 
 ```python
-def twin_gate_passed(gr, ci_status, cov, repo) -> bool:
+def twin_gate_passed(gr: GateResult, ci_status: str, cov: float | None,
+                     repo: RepoSpec) -> bool:
+    """...the LLM 5/5 + promise ANDed with CI green and the coverage floor..."""
     cov_ok = cov is not None and cov >= repo.min_diff_coverage
     return (gr.score == 5 and is_complete(gr.notes)
             and ci_status == "green" and cov_ok)
@@ -125,9 +145,64 @@ No routing decision, no rubric update, no model selection, no wallet amount
 reads it. Card `dab87c81` acceptance criterion 3 asks that this remain true
 while this card is open. It is true at the pinned commit.
 
+Read that claim precisely. It is about `GateResult.score`, the 1-5 output score.
+It says nothing about the *other* grade, the skcoord work grade at `meta.grade`,
+which does select a model. Section 2.4 is about that, and it is the reason this
+document does not get to end on a reassuring note.
+
+### 2.4 A partial closed loop already exists, in production
+
+Found 2026-08-16 by the adversarial review of card `6ad3c9ab`, filed as card
+`0b7e3ac3` (S20, graded M/crit), and verified independently here by reading the
+chain end to end at the pinned commit:
+
+1. `orchestrator.py:244-250`: `size` and `risk` come off the phase-0 `verdict`,
+   both LLM-authored, and `model_class = model_class_for(size, risk)` is derived
+   from them. Alternatively `stored_work_grade` (`:330-345`) reads the four keys
+   straight off the card's `meta.grade`.
+2. `engineering.py:344` resolves that grade to a bucket
+   (`bucket_for_payload(item.payload)`), once per build at `:362`.
+3. `engineering.py:419` attaches it to the `GradeBrief`
+   (`attach_dispatch_model(gb, dispatch_model)`).
+4. `adapters/base.py:466-467` runs the grader with
+   `model=dispatch_model_of(brief)`.
+5. `engineering.py:71` consumes `gr.score` from that grader as one conjunct of
+   the twin gate.
+
+**So the card's own grade selects the model that grades the card's work.** A card
+graded S/low routes its own quality gate to the weakest model in the fleet. Grade
+the work easy, get an easy grader.
+
+The comment at `adapters/base.py:464-465` explains the design intent, and it is
+half right: "The grader reads the DIFF, which carries the card's content, so it
+sits in the same sensitivity zone as the build and takes the same bucket." That
+is correct for **sensitivity**, which must be inherited because the grader really
+does see the data. It is wrong for **capability**, because capability is what
+determines whether the gate can tell good work from bad.
+
+Three things about how this bears on the rest of the document:
+
+- It is a **live** instance of the exact hazard `protected.py:44-48` describes,
+  not a projection. Every other example in this document is conditional on a
+  policy that does not exist yet. This one is running.
+- Its blast radius is zero **today**, and only for a reason that is scheduled to
+  change: no card carries a grade, so `_dispatch_model` returns `None` and no
+  override is sent (`engineering.py:322-344`). Card `6dff5c17` (graded model
+  selection) has shipped precisely to start putting grades on cards.
+- It shifts the burden of proof. A future session arguing that a closed loop can
+  be built safely has to explain why this one was built without anyone noticing
+  the circularity until an adversarial pass went looking. The mechanism is four
+  ordinary-looking lines, each locally reasonable.
+
+Card `0b7e3ac3` is the place that fix belongs. It is not this card's to make.
+
 ---
 
-## 3. The five vectors
+## 3. The vectors
+
+The card named five. Sections 3.1 to 3.5 answer those five in its order. Section
+3.6 is a sixth, found while answering them, and is labelled as an addition rather
+than smuggled in as though the card had asked for it.
 
 ### 3.1 Weakening the acceptance criteria
 
@@ -200,10 +275,43 @@ measured; it is a claim about code that was never measured at all, and the twin
 gate cannot tell the two apart because it sees only a float.
 
 This is defensible as a default (a docs-only change should not be blocked by a
-coverage floor) and it is exactly the shape of thing an optimiser finds. A
-worker that wants a cheap 1.0 puts its diff where the instrument is not looking.
+coverage floor) and it is exactly the shape of thing an optimiser finds.
 
-Two further facts about coverage as it is actually configured on this node, both
+That is the **passive** form: put the diff where the instrument is not looking.
+The **active** form is stronger, and the first draft of this document missed it:
+**the instrument is itself inside the diff's reach.**
+
+- `.coveragerc`, `pyproject.toml` (`[tool.coverage]`), `pytest.ini`,
+  `setup.cfg` and `conftest.py` are on **neither** protected list. They are not
+  in the hard-coded `_ALWAYS_PROTECTED` tuple (`protected.py:29-60`, 16 entries,
+  all of them named guardrail source files or object files) and not in the live
+  manifest (`~/.skcapstone/fleet/objects/_protected.json`, 10 globs). A diff that
+  adds an `omit` rule, narrows `source`, or drops a plugin blinds `--cov` over
+  the very lines it just wrote, without touching a single test and without
+  tripping the carve-out.
+- `diff_coverage` does not check that the coverage run succeeded.
+  `ci.py:160-161` is `subprocess.run(cov_cmd, shell=True, cwd=worktree,
+  capture_output=True, text=True)` with no `check=` and no inspection of
+  `returncode`. It then reads whatever `coverage.xml` is on disk (`:163-170`).
+  Nothing deletes a pre-existing `coverage.xml` first.
+- Those two combine badly with the staging rule. `_stage_work`
+  (`engineering.py:236-240`) runs `git add -A` and then `git reset` on
+  `coverage.xml`, `.coverage` and `.pytest_cache`, so a `coverage.xml` sitting in
+  the worktree is **invisible in the diff the grader reads** while remaining
+  fully visible to `diff_coverage`, which parses it off disk. A file the gate
+  trusts and the grader cannot see is exactly the wrong shape.
+- A third, passive variant of the same join: `_changed_lines` produces
+  post-image repo-relative paths (`ci.py:135` strips a leading `b/`) and
+  `:177` looks them up against the Cobertura `class` element's `filename`
+  attribute by exact string equality. Cobertura filenames are relative to the
+  configured `<source>` root, so any repo whose coverage source root is not the
+  repo root (`src/` layouts are the common case) can produce a systematically
+  empty intersection and therefore a systematic `1.0`. Stated as a code-read
+  risk: no live coverage report was inspected to confirm it happens in a
+  specific repo, and it should be checked before anyone relies on a coverage
+  number from this path.
+
+Three further facts about coverage as it is actually configured on this node,
 read from `~/.skcapstone/config/` on 2026-08-16:
 
 - `autopilot.yaml` (`enabled: true`) maps 7 repos; 4 declare a `coverage_cmd`
@@ -211,18 +319,26 @@ read from `~/.skcapstone/config/` on 2026-08-16:
   `skharness`, `skcoord`). For those 3, `diff_coverage` returns `None` at
   `ci.py:157-158` and `twin_gate_passed` can never be true. They are
   structurally PR-only.
+- `autopilot-pi.yaml` is also `enabled: true` (harness `pi`, model
+  `ornith-1.0-35b`) and maps 4 repos, all 4 declaring a `coverage_cmd`
+  (`skos`, `skchat`, `skchat-app`, `skcapstone`). The first draft of this
+  document discussed only the other two configs, which was incomplete.
 - `autopilot-live.yaml` declares no `coverage_cmd` at all, for any of its 3
-  repos.
+  repos, and `autopilot-canary.yaml` none for its one.
 
 **What would close it:** return `None` (the honest "no coverage signal" value
 the function already uses at `:158` and `:170`) instead of `1.0` when the
-intersection is empty, and let the repo config decide whether an uninstrumented
-diff may pass. That is a one-line change to a file that is not on the protected
-floor, and it is not this card's to make.
+intersection is empty; check `returncode` on the coverage run and delete any
+stale `coverage.xml` before it; and add the coverage configuration files to the
+protected manifest, since they are part of the instrument rather than part of the
+work. Those are small changes to files that are not on the protected floor, and
+they are not this card's to make.
 
-### 3.3 The CI arm, which is the deepest problem
+### 3.3 The CI arm, which is the load-bearing problem
 
-**Mechanism: none. Stating it plainly, because this is the one that matters.**
+**Mechanism: none. Stating it plainly, because this is the ground that actually
+carries the refusal. If a future session defeats this section, the refusal is
+defeated, whatever happens to the other four grounds.**
 
 `ci_status == "green"` is one of the four conjuncts of the twin gate, and it is
 the one that feels like ground truth: an external process ran and returned zero.
@@ -232,11 +348,11 @@ CI command, over the worker's own diff.
 The mechanics, verified:
 
 - For a `local:` CI repo (6 of the 7 in `autopilot.yaml`; only `skworld-app`
-  uses `github-actions`), `ci.py:115-123` runs
+  uses `github-actions`), `ci.py:115-124` runs
   the configured command with `cwd=worktree`, that is, in the tree containing
-  the harness's uncommitted edits. Whatever test files the build round created
-  are the test files that run.
-- `engineering.py:229-238` documents that this is deliberate: the staging step
+  the harness's uncommitted edits, and returns green on exit code 0. Whatever
+  test files the build round created are the test files that run.
+- `engineering.py:229-240` documents that this is deliberate: the staging step
   explicitly includes new and untracked files, because otherwise "scoped CI +
   diff-coverage would never run the new tests (coverage reads ~0 on the new
   source). The twin gate then can NEVER pass". The design *requires* the
@@ -263,17 +379,32 @@ three times.
 
 Two things do partially constrain it, and neither is a solution:
 
-1. **GitHub-checks repos.** `autopilot.yaml` gives `skworld-app` `ci:
-   github-actions`, and `engineering.py:588` additionally requires
-   `_github_checks_verdict(...) == "green"` before any auto-merge. Those
-   workflows are defined in the repo and run on GitHub's runners, so they are
-   outside the worktree. But they are **inside the diff's reach**: the live
-   manifest at `~/.skcapstone/fleet/objects/_protected.json` protects 10 globs
-   (the detector, `engineering.py`, `fleet/store.py`, `fleet/signing.py`,
-   `itil.py`, three `operator_seat` files, and the two object files) and
+1. **The GitHub checks arm, which is mandatory for every auto-merge.**
+   `engineering.py:588-589` requires `_github_checks_verdict(...) == "green"`
+   before any auto-merge, for **every** repo, not only the one whose `ci:` key
+   says `github-actions`. That verdict polls `gh pr checks` (`:645-647`) and
+   returns green only at `:662-663`, under `if core and not pending`, where
+   `core` is the discovered checks whose names contain `lint`, `test`, `qa` or
+   `pytest` (`:623`, `:653-655`) minus anything listed in `advisory_checks`.
+   Those workflows run on GitHub's runners, outside the worktree, which makes
+   this the most independent arm in the whole gate.
+
+   And it is **inside the diff's reach**. The live manifest at
+   `~/.skcapstone/fleet/objects/_protected.json` protects 10 globs (the
+   detector, `engineering.py`, `fleet/store.py`, `fleet/signing.py`, `itil.py`,
+   three `operator_seat` files, and the two object files) and
    `.github/workflows/**` is not among them, nor is it in the hard-coded
    `_ALWAYS_PROTECTED` floor at `protected.py:29-60`. A diff that edits the
-   workflow that judges it is not path-flagged.
+   workflow that judges it is not path-flagged. Since this arm gates every
+   auto-merge rather than one repo's, that omission is more load-bearing than
+   the first draft of this document implied, not less.
+
+   Two repos carry `automerge: true` in `autopilot.yaml`: `skchat` and
+   `skcapstone`. Both do have discoverable core checks (`skchat` has jobs
+   `lint`, `pytest`, `qa`; `skcapstone` has `lint`), so for them this arm is a
+   real gate rather than a permanent timeout. That is the good news and the bad
+   news in one sentence: the arm bites, and its definition is editable by the
+   thing it judges.
 2. **The independent promise token.** `is_complete(gr.notes)`
    (`engineering.py:56-58`) requires the grader to emit
    `<promise>COMPLETE</promise>`, and the instruction at `base.py:459-460` binds
@@ -353,22 +484,44 @@ over the observed window certifies nothing at all, and a design that counts it
 as a control is counting something that does not run.
 
 The important corollary, and the reason this is not a crisis today: **nothing
-auto-merges either.** `engineering.py:560` gates auto-merge on
-`repo.name in self.config.automerge_repos`, and `automerge_repos` is the empty
-list in all four config files on this node (`autopilot.yaml`,
-`autopilot-live.yaml`, `autopilot-canary.yaml`, `autopilot-pi.yaml`). Every
-passing build opens a PR and stops. The unanswered queue is a backlog of PRs
-awaiting review, not a backlog of merges that happened without one. The failure
-mode is stalled work, not unreviewed merges.
+auto-merges either.** `engineering.py:560-561` gates auto-merge on a conjunction
+of four things, and `automerge_repos` is the empty list in all four config files
+on this node (`autopilot.yaml`, `autopilot-live.yaml`, `autopilot-canary.yaml`,
+`autopilot-pi.yaml`). Every passing build opens a PR and stops. The unanswered
+queue is a backlog of PRs awaiting review, not a backlog of merges that happened
+without one. The failure mode is stalled work, not unreviewed merges.
 
 That is exactly the asymmetry a fail-closed design should produce, and it is
 also the reason a future session must not read "human ratification is in the
 design" as "human ratification is a live control". What holds the line today is
 not the decision queue being drained. It is that nothing reaches an integration
-branch without a person running a merge by hand, because `automerge_repos` is
-empty. Turn it on and this queue, at an observed answer rate of zero over the
-window measured above, becomes the only thing standing between a self-graded
-diff and the integration branch.
+branch without a person running a merge by hand.
+
+**Correcting an overclaim from the first draft of this document.** It said that
+populating `automerge_repos` would make this queue "the only thing standing
+between a self-graded diff and the integration branch". That is false, and it
+contradicts section 3.3's own reading of the code. Auto-merge requires all of:
+
+1. `repo.name in self.config.automerge_repos` (`engineering.py:560`), the empty
+   list discussed above;
+2. `repo.ci != "none"` (`:561`);
+3. `repo.automerge`, a **second, per-repo** boolean that defaults to `False`
+   (`types.py:74`) and is set on exactly two repos in `autopilot.yaml`
+   (`skchat`, `skcapstone`);
+4. `_github_checks_verdict(...) == "green"` (`:588-589`), which per section 3.3
+   returns green only when at least one core check is discovered and none is
+   pending (`:662-663`), and otherwise polls to `_AUTOMERGE_CI_TIMEOUT` (1500
+   seconds, `:622`) and returns `timeout`, which holds;
+
+and even then `_gh_merge` (`:668-677`) can fail on a GitHub-side required check,
+in which case the caller falls back to a human decision.
+
+So populating `automerge_repos` alone opens nothing. The honest statement is the
+weaker and more useful one: **the human gate holds today through a conjunction of
+four independent conditions, three of which are configuration that a single edit
+could change, and the decision queue is not one of the four.** A design review
+that counts the queue as a control is counting the only condition in the list
+that is measurably not operating.
 
 One further observation from the same code, recorded because it bears on the
 reward specifically: `_settle_economics` runs at `engineering.py:555` on
@@ -379,14 +532,93 @@ anyway. (Today the minted amount is computed with a hardcoded `score=5` at
 `:127`, so it does not vary with grade; that constant is open question 2 in the
 reshape design.)
 
+### 3.6 A sixth vector the card did not name: failure memory crosses attempts
+
+**Mechanism: none. This one is live in production today.**
+
+The card's five vectors are all about a single attempt. There is a channel that
+runs between attempts, and it carries model-authored text with no protection at
+all.
+
+The chain, verified:
+
+1. On a terminal non-pass, `_record_attempt` (`engineering.py:281-298`) writes an
+   entry to the card's `meta.autopilot.attempts[]` via `board.record_attempt`.
+2. The `why_failed` field it writes is
+   `distill_failure(strip_promise(last.notes))` (`engineering.py:448-452`), that
+   is, the **grader model's own prose** about why the build failed, reduced to
+   one bounded line (`failure_memory.py:47-59`).
+3. `build_prior_feedback` (`failure_memory.py:129-163`, called at
+   `engineering.py:357`) renders those entries back into the prior context for
+   **round 1 of the next run of that card**, bounded to 3 distinct newest entries
+   and 600 characters (`MAX_CHARS`, `failure_memory.py:22`).
+
+So a failing worker writes prose that a later worker reads as fact about its own
+task, and nothing hashes it, signs it, reviews it, or marks it as
+model-generated once it is on the card. The bounds are real (3 entries, 600
+chars, oldest dropped first) and they bound the *volume*, not the *content*.
+
+The reason this matters more than its own severity: **it is the same mechanism
+the red team used to kill the exploration slice.** Ground 4 (section 4.4) rejects
+card `f81d8d2d` partly because a deliberately under-classed worker's
+misdiagnosis would land in `meta.autopilot.attempts` and contaminate the control
+arm's first round through this exact call site. That argument was made about a
+hypothetical experiment. The same contamination path is running in production
+right now, across ordinary retries, and no card covers it.
+
+Ground 4 is therefore stronger than it reads: it is not a prediction about what
+an experiment would do, it is an observation about a channel that already exists,
+applied to an experiment that would have amplified it.
+
+**What would close it:** mark model-authored memory as such where it is rendered,
+so a later worker reads it as a prior claim rather than as a fact, and record the
+run and model that produced it. `_render` (`failure_memory.py:119`) is the one
+place that would change. Not this card's to make.
+
 ---
 
 ## 4. The refusal, with five checkable grounds
 
 The epic asked for a learned routing policy trained on graded outcomes. It is
-refused. Each ground below names the artifact a reader can check. Four are
-policy decisions already taken; the fifth is a measurement fact and is the
-strongest of them.
+refused. Each ground below names the artifact a reader can check.
+
+Grounds 1 to 5 are the five recorded on card `dab87c81`, kept in the card's own
+numbering so a reader can check them off one by one. They are **not** in weight
+order, and an earlier draft of this document made things worse by asserting that
+ground 5 was the strongest. It is not. Section 4.0 states what actually carries
+the refusal, and the table below states the real ranking.
+
+| Ground | What it is | Weight | Scope |
+|---|---|---|---|
+| **4.0** | The outcome instrument is partly worker-authored (section 3.3) | **Load-bearing.** A property of running code, not a policy | Any learner using any pass-derived label |
+| 3 | The rubric is on the self-modification floor | Strong, with limits: merge-time only, unsigned manifest, not currently executing | The work-grade rubric files |
+| 4 | The exploration slice was rejected | Strong, and stronger than the first draft said (see 3.6) | Counterfactual experiments |
+| 1 | No autotuner | Policy, not mechanism. Revisable by whoever wrote it | Rubric changes |
+| 2 | No machine writes routing policy | Policy, not mechanism. Directly on point | `registry.yaml` model picks |
+| 5 | The prediction destroys its own falsifier | Decisive **within its scope**, and its scope is narrow | The `risk` axis of the skcoord work grade only |
+
+### 4.0 The ground that actually carries the refusal
+
+**The outcome instrument is partly authored by the thing being measured.**
+Section 3.3 is the full argument. In one paragraph: the twin gate's CI arm runs
+the repo's test command over the worker's own worktree, and
+`engineering.py:229-240` documents that including the worker's new test files is
+*required* or the gate could never pass a correct TDD change. Green CI therefore
+certifies that the assertions in the diff pass against the code in the diff.
+Any label derived from a twin-gate pass, including a plain pass-or-fail boolean,
+inherits that property. A learner maximising it is partly selecting for
+test-writing.
+
+This ground is different in kind from the other five. It is not a decision
+anyone took and it cannot be revised by re-deciding. It is a property of the
+code as it stands, it is why `protected.py:44-48` puts the rubric on the hard
+floor, it is why card `09573989` rejected the exploration slice, and it is the
+reason section 7 item 1 lists an outcome signal not authored by the worker as
+the first condition for reopening. The other five grounds each cite it or
+depend on it. It is the load-bearing member; they are the bracing.
+
+Section 2.4 is the same hazard, already realised in production on a different
+store: a card's own grade selects the model that grades it.
 
 ### Ground 1: no autotuner. A rubric change requires human review.
 
@@ -479,10 +711,22 @@ apparent oversight.
 re-proposed, because it looks like cheap data. It is not cheap; it is
 correlated data that flows into the arm it is supposed to be compared against.
 
-### Ground 5: the prediction destroys its own falsifier.
+### Ground 5: the prediction destroys its own falsifier (risk axis only).
+
+**Scope first, because the first draft of this document got this wrong.** This
+ground is about `risk`, one axis of the **skcoord work grade** stored at
+`meta.grade`. It is **not** about `GateResult.score`, and it does not by itself
+refuse a learner that never touches risk grades. Those are different stores, as
+this document's own section 6.1 notes ("the 1-5 output score has history; the
+size/risk/sensitivity work grade does not"), and presenting a risk-axis argument
+as the headline reason to refuse a `GateResult.score` learner was an overreach
+that a skeptical reader would have caught and used to discount the rest. Section
+4.6 states the counter-argument that exploits precisely this gap, and answers it.
+
+With that scope stated, within it the ground is decisive.
 
 **Check:** card `09573989`, the paragraph headed "RISK RATCHETS UP ONLY", quoted
-here verbatim because it is the deepest point in the entire design:
+here verbatim:
 
 > The grade causes the routing, so outcomes are not independent of predictions:
 > an accurate high-risk call produces more caution, which prevents the bad
@@ -513,8 +757,70 @@ thing is coverage rather than model accuracy. Only `risk` is destroyed by its
 own feedback. That distinction matters, because "we cannot calibrate risk" is
 true and "we cannot calibrate anything" is not.
 
-**Weight:** strongest of the five, and the least likely to be understood on a
-skim. If a future session only checks one ground, check this one.
+**Weight:** decisive within its scope, which is the `risk` axis, and inapplicable
+outside it. It is the least likely of the five to be understood on a skim and the
+easiest to mis-cite, which is why the scope note leads it.
+
+### 4.6 The best counter-argument, and the answer to it
+
+A refusal that has not been attacked in print is not worth much. Here is the
+strongest case for building the thing anyway, constructed against this document
+rather than against a straw version of it.
+
+> Restrict the learner to the two things this document concedes are sound.
+> First, `size`: the document itself says it "is ordinal with a real post-hoc
+> observable (effort) and genuinely calibrates". Second, model selection off the
+> twin-gate boolean rather than off the 1-5 score, which sidesteps the constant-5
+> literal at `engineering.py:428` entirely. Ground 5 is a risk-axis argument and
+> does not apply to either. Grounds 1, 2 and 4 are policy, revisable by whoever
+> wrote them. Ground 3 is a merge-time gate that, on this document's own reading,
+> does not currently execute. So build the narrow learner.
+
+The first three sentences are correct. The conclusion does not follow, and the
+reason is section 4.0.
+
+**The narrow learner has the same corrupted label.** Whatever the learner
+predicts, it has to be trained against something that says the attempt went well.
+There are two candidates and both are downstream of the twin gate:
+
+- **Pass or fail.** The twin gate's CI and coverage arms are satisfied by
+  artifacts the worker authored (sections 3.2, 3.3). Restricting the *input* to
+  `size` does nothing to the *label*. A boolean derived from a gameable gate is
+  a gameable boolean, and it is more gameable than the score, not less, because
+  it discards the grader's gradations and keeps only the arm that a passing test
+  file can force.
+- **Effort, as tokens or turns.** Section 5 lists why this is confounded:
+  `BuildUsage` folds cache reads into input tokens (`joules.py:98-106`), turns
+  clip at `_MAX_ROUNDS = 4` (`engineering.py:226`) exactly where under-grading
+  would show, and the energy record is node-local. Effort is also partly chosen
+  by the worker, which is the same problem wearing different clothes.
+
+**And a size learner has a specific failure mode that is already named.** A
+learner that maps cards to the smallest class that still passes is optimising
+"minimum capability that clears the gate". Since the gate is partly satisfiable
+by the worker's own tests, the minimum that clears it is lower than the minimum
+that does the work. Each generation records a pass, the class floor drops, and
+the next generation starts from the lower floor. Card `09573989` names this
+exact ratchet as the reason it rejected the exploration slice: a down-classed
+pass "measures the gate's gameability rather than the model's sufficiency,
+manufacturing exactly the downward pressure the design exists to prevent". The
+narrow learner manufactures the same pressure continuously instead of in a
+bounded experiment.
+
+Section 2.4 is the empirical version of this argument. A grade already selects
+its own grader, in production, and nobody intended it. That happened with no
+learner at all, from four locally reasonable lines. The prior that a narrow
+learner would stay narrow should be adjusted accordingly.
+
+**What would actually defeat the refusal**, and this is a genuine and open route
+rather than a rhetorical concession: an outcome label the worker did not author.
+Mutation testing over the changed lines, an adversarial reviewer with its own
+budget, or a held-out check (section 3.4, which records that none exists). Build
+one of those, demonstrate it on the negative control described in section 5 of
+the reshape design, and section 4.0 stops being load-bearing. Then this document
+should be reopened and the narrow learner is a reasonable first thing to try.
+Until then, the narrow learner is the broad one with a smaller input vector and
+the same corrupted target.
 
 ### The refusal is a success under the epic's own terms
 
