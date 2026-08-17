@@ -34,6 +34,31 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   on capability class, and two rows whose classes track each other is the defect
   returning.
 ### Fixed
+- **S25: the grading-floor guard now composes across a multi-card branch, without
+  being weakened** (card `3f6719e4`). `test_no_file_on_the_grading_floor_was_modified`
+  measured `origin/main...HEAD` and called the result "what this card did". True
+  for one card, false for a branch that composes nine: S12 touches no floor file,
+  S14 legitimately touches `buckets.py`, and S12's guard reported S14's work as
+  S12's violation. Every card was individually compliant and the composition was
+  red, structurally, on every future integration pass regardless of merit.
+  The rule is unchanged; only the measurement moved. A floor change is still a
+  violation unless it appears in `tests/data/grading-floor-allowances.json`, a
+  human-written list with a card and a written reason per entry. Each entry pins
+  a git BLOB SHA, not a path, so the exception covers exactly the post-image that
+  was read and dies the moment the file changes again. That list is itself on
+  `protected._ALWAYS_PROTECTED`, so a diff that adds an allowance can never
+  auto-merge; "reviewed, not automatic" is structural rather than conventional.
+  Every failure to MEASURE is now a violation too: the old form called
+  `pytest.skip` when `origin/main` was missing, which is a guard reporting success
+  over an unmeasured floor. It now raises `FloorCheckError`, and a deleted floor
+  file hashes to a sentinel no pin can match. Two negative controls mutate
+  `model_class` derivation (in `bucket_id`, inside the ALLOWED file, and in
+  `grading.model_class_for`, outside it) and prove the guard still fires.
+  DISPOSITION RECORDED: S14's `buckets.py` change (import of
+  `assert_routing_field` plus two lines in `attach_dispatch_model`) is accepted.
+  It changes no grading semantics, only which attribute name the routing layer
+  may write. Human sign-off goes to Chef with the branch and the allowance file
+  says so in the entry.
 - **S18: `record_success` is wired, so S9's symmetric memory is no longer
   dormant.** `Board.record_success`, the `successes[]` sibling key,
   `build_prior_success_feedback`, its own renderer and 25 passing tests all
