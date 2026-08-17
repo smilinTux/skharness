@@ -23,8 +23,14 @@ import pytest
 from skharness.autocode import ratify
 from skharness.autocode.direct import DirectExecutor
 from skharness.autocode.engineering import EngineeringExecutor
-from skharness.autocode.types import (GATE_OUTCOMES, UNRECORDED, GateResult,
-                                      HarnessResult, RepoSpec, WorkItem)
+from skharness.autocode.types import (
+    GATE_OUTCOMES,
+    UNRECORDED,
+    GateResult,
+    HarnessResult,
+    RepoSpec,
+    WorkItem,
+)
 
 
 def _spec(name="skrender"):
@@ -124,7 +130,7 @@ def test_each_terminal_return_carries_its_own_outcome(mocker, cfg, expected, dri
     assert res.outcome != UNRECORDED       # the sentinel must not survive a terminal
 
 
-def test_the_five_terminal_sites_produce_five_DISTINCT_outcomes(mocker, cfg):
+def test_the_five_terminal_sites_produce_five_distinct_outcomes(mocker, cfg):
     """The load-bearing assertion. A single constant satisfies "outcome is
     populated" while destroying the vocabulary, so assert the sites do not
     collapse into each other. If any two ever agree, this goes red."""
