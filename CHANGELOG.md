@@ -10,6 +10,32 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 ## [Unreleased]
 
 ### Added
+- **Autopilot digest decisions are now bound by stable id, not position**
+  (card `78409fc0`, spec `2026-08-13-unified-consent-plane-arch.md` section
+  3.2). `resolver.answer` answered by POSITION alone: the manifest renumbers
+  on every rebuild, so a reply sent against yesterday's digest could resolve
+  to a DIFFERENT item than the one actually shown, the same defect class as
+  applying a Terraform plan that drifted after it was saved.
+  `digest.build_manifest` now stamps every item with a `content_hash` (over
+  qid + prompt + options, deliberately excluding `n`) and the manifest as a
+  whole with a `generation` hash over the full ordered presentation.
+  `resolver.answer(n, generation, response)` requires that `generation`, and
+  refuses with `StaleGeneration` when the live manifest has since been
+  rebuilt into a different generation, mirroring Terraform Cloud's
+  stale-plan behaviour: the whole digest that was shown is what is
+  approved, not each line item independently. `n` remains purely a display
+  convenience once the generation check has passed. A second `answer()`
+  against an already-resolved decision now raises `AlreadyAnswered`
+  (AWS Step Functions task-token semantics: single-use, and reuse is an
+  explicit error, never a silent no-op) instead of returning a
+  success-shaped `idempotent: True`, which matters because
+  `~/.skcapstone` is Syncthing-synced and two nodes could each believe they
+  answered first. `digest.queue_decision` now stamps every decision with a
+  mandatory `expires_at` (default 24h TTL); an `answer()` against an expired
+  decision raises `DecisionExpired` and records an explicit EXPIRED state in
+  the store (CodePipeline semantics: a timeout routes to an explicit state,
+  never a silent drop), and expired items stop recirculating into future
+  digests instead of reappearing indefinitely.
 - **The shadow mutation probe is now CALLED on the live path** (card `788425b8`,
   S26). S23 built the worker-independent outcome label, gave it 43 tests and
   merged it, and nothing anywhere called `mutation.probe`: a module with no
