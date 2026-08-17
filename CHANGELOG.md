@@ -46,6 +46,21 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   module through its namespace, but may not name a state, may not import names
   out of the module, and may not READ the label back. Every other routing module
   is still scanned raw and banned outright. The label still gates NOTHING.
+- **`GRADER_MODEL` was pinned to a model that no longer exists.** `ornith-big`
+  and its alias `ornith-1.0-35b` both return HTTP 404 from skgateway: the 35B
+  behind `ornith-aeon.service` was retired off chiap08 and stays retired,
+  because a 35B beside `llama-qwen38` contends for the same GPU. The pin is now
+  `qwen3.8-27b-huihui-abliterated-q4_k_m`, verified 2026-08-16 answering HTTP
+  200 from `localhost:18780` and naming itself back (so no failover). Chosen
+  over the surviving `ornith-1.0-9b` because it is the larger sovereign model on
+  our own hardware, carries the 262144 context and 8192 output floor a grader
+  reading a whole diff needs, and being abliterated will not refuse to grade a
+  security-related change. Still deliberately a pinned id and NOT `sk-default`,
+  which moved three times in two days: a grader whose identity changes silently
+  cannot be reasoned about. This is provenance only, not permission. Sovereignty
+  is still decided by observed serving facts (`sovereignty.py`), and nothing
+  here reintroduces a name-based check.
+
 - **The default harness is now `pi`, not `claude-code`** (card `1db15e43`, A4.2).
   `BaseCliAdapter.supports_model_override()` is False and only `PiAdapter`
   overrides it to True; `_run_raw` RAISES `ModelOverrideUnsupported` on a
@@ -61,6 +76,21 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   `autopilot-pi.yaml`) name a harness explicitly and are unaffected.
 
 ### Added
+- **`skharness doctor` now PROBES the pinned grader** (`doctor.check_grader_pin`).
+  A config pinning a dead model and one pinning a live model look identical until
+  something asks, which is why `ornith-big` survived the retirement of the service
+  that served it. Nothing in this repo ever asked. It asks now, with a one-token
+  completion rather than a `/v1/models` lookup: this fleet's catalog has
+  advertised ids that 404, so a catalog hit does not distinguish live from dead.
+  Three outcomes, and the middle one is the point: `fail` when the gateway is up
+  and refuses the id, `warn` when the gateway answered under a DIFFERENT id
+  (failover, so the pin is not the grader of record), and `warn` when the gateway
+  could not be reached at all, because a pin nobody could verify is UNVERIFIED
+  and not confirmed live. **An unreachable gateway can never make this check
+  `ok`.** A checker that reports healthy on an observation it never made is the
+  failure being removed, not a check on it. Pinned by a test that replays the
+  fleet as observed on 2026-08-16, so the regression is caught offline and
+  moving the pin means re-recording a real observation.
 - **"Work that fits pi" is written down** in `autocode/config.py`, as a docstring
   section and as `fits_pi()` / `requires_pi()`. An undefined scope becomes
   whatever the first ambiguous card makes it mean. Four legs: the repo resolves
@@ -79,8 +109,98 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   raising rather than returning None. `KNOWN_HARNESSES` is a literal set (config
   sits below the adapters in the import graph) pinned to the live registry by a
   test, so the two cannot drift.
+### Added
+- **The client-to-gateway attribution join, proven from both ends** (card
+  `c7aea2e0`, A6.3). New module `autocode/attribution.py`: given a gateway
+  request id it reads the skgateway metrics store READ-ONLY and says whether the
+  run and the row are demonstrably the same event. `join_rows` is pure over
+  rows, so CI exercises the whole logic against `tests/data/
+  attribution-join-rows.json`, three cases captured verbatim from the real
+  store. `tests/test_attribution_join_live.py` repeats it against a live
+  gateway and skips with a reason naming what was missing rather than degrading
+  into a weaker check; `SKHARNESS_REQUIRE_LIVE_GATEWAY=1` turns that skip into a
+  failure, because a skip is a silence and on a box where the gateway is meant
+  to be up, silence is the wrong answer.
+
+  The load-bearing part is the CONTROL. A call with no attribution headers must
+  produce a row with a NULL session id AND a verdict that says
+  `ABSENT_AS_SENT`, never `MATCH`. The two live probes behind the fixtures are
+  the same model, prompt, ceiling and gateway, differing only in the two
+  headers, and their rows differ only in the two columns. `verify_join` names
+  four separate outcomes per axis (`MATCH`, `ABSENT_AS_SENT`, `MISSING`,
+  `INVENTED`) so a lost header, an anonymous call and a call attributed to a
+  default cannot read alike. A join that succeeds when nothing was sent is not a
+  join, so a headerless row carrying an id anyway returns `INVENTED` and fails.
+  Proven with a mutation: a `join_rows` that fills a NULL session id with
+  `"lumina"` turns three fixture tests and two live tests red.
+
+  Two facts the module refuses to manufacture, both measured rather than
+  assumed. `request_log.agent_id` is NULL on all 8,136 rows and has never once
+  been populated, so nothing here reads it. No table holds a SERVED model
+  (`token_usage.model` never once disagrees with `request_log.model` across all
+  1,445 joined rows; both are the REQUESTED id), so `model_served` is fixed at
+  None with a written reason and is never derived from the agreeing columns.
+  The gateway does tell a direct HTTP caller on `x-sk-model-served`, and pi's
+  stdout carries `responseModel` (card `04970a6e`), but neither route is this
+  one. The served backend IS recoverable, from whichever per-request tables
+  agree, and the join records which ones did; a disagreement returns no backend
+  and names the conflict rather than picking a winner by precedence.
+  `energy_log` is kept whole as the per-attempt failover chain, since collapsing
+  it to a scalar loses both the failover and, on the committed case, 99.6% of
+  the energy.
+
+### Fixed
+- **`revert` now works on auto-merged work.** The merge record was written as
+  `{pr, branch, ts, auto}` with no `sha`, while `_revert_impl` requires
+  `merge["sha"]`, so revert ALWAYS failed on anything autopilot merged and
+  `meta.autopilot.reverted` could never be written. The operator had no working
+  undo, and any later analysis reading "was this reverted" got a constant False
+  for a broken-tool reason, which reads as "auto-merged work is never wrong".
+  The merge commit sha is now captured immediately after the merge, which is the
+  only cheap moment: `gh pr merge --delete-branch` has already removed the
+  branch, so the commit only gets harder to find from there.
+- **A merged-but-shaless card no longer reports as never merged.** `_revert_impl`
+  raised "no recorded merge" for both cases, telling an operator the work was
+  never merged when it was. The two are now distinguished, and the merged case
+  names the PR and says to revert by hand. Every card auto-merged before this is
+  permanently in that state, so the message matters more than the fix.
 
 ### Security
+- **The sovereign-grader gate checked a model NAME, so it could not see the
+  fact it existed to check** (card `a43cac2e`, critical). `is_sovereign_grader`
+  ran `name.startswith("ornith")` over `harness.grader_model or harness.model`,
+  a statically configured id, under a docstring that called it "what actually
+  graded". skgateway resolves failover server side, so that id is what was
+  REQUESTED. Measured in the live ledger (`skgateway/data/metrics.db`,
+  `energy_log`, read-only): `ornith-big`, this repo's own pinned "sovereign"
+  grader, has a row with `backend=nvidia`, `basis=imputed_cloud`. So does
+  `ornith-tiny`. The old rule returned `True` for both. That gate protects raw
+  card text on a board where 1,433 cards are classified secret, and a green
+  gate was indistinguishable from a broken one.
+- **New module `autocode/sovereignty.py`: ONE definition, for the whole fleet.**
+  Sovereignty is a claim about HARDWARE AND JURISDICTION, so the discriminator
+  is the backend that served plus the energy basis it reported, never the model
+  name. `ornith-1.0-9b` served by `nvidia` is a violation; the same weights
+  served by `reg:ornith` are not. `classify()` takes no model parameter at all,
+  by construction. Evidence is ranked: `measured_gpu` with a named node is
+  physical and unforgeable, `backend` is config-grounded and correct per winning
+  attempt, and the model id is not an input. The third-party denylist is checked
+  FIRST and is not overridable, so no configuration change can relabel `nvidia`
+  or `anthropic` as sovereign.
+- **Three states, never two: `sovereign` / `violated` / `unobserved`.** Unknown
+  is NOT sovereign. A harness that cannot report which backend served it is
+  refused (fail closed) and the refusal is recorded as `unobserved`, distinct
+  from a measured `violated`, so an operator can tell "wire the observation"
+  from "fix the routing" without re-running anything. `grade_refused_nonsovereign`
+  now carries `sovereignty`, `backend_served`, `energy_basis`, `energy_node` and
+  a reason.
+- **`grader_model_for` renamed to `requested_grader_model`.** The old name
+  invited exactly the misuse that caused this bug. The value is still stamped on
+  every grade, because paired with `rubric_version` it is the only grade-drift
+  signal there is, but it is provenance, not permission. `is_sovereign_grader`
+  now takes observed serving facts and RAISES `TypeError` on a string, so an old
+  caller holding a model id cannot silently get a verdict about a name and read
+  it as a verdict about a machine.
 - **A card can no longer select the model that grades it** (card `0b7e3ac3`).
   The twin-gate grader took the build's bucket wholesale, so a card graded
   S/low routed its own quality gate to the weakest class in the fleet: grade

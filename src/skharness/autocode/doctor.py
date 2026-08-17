@@ -111,6 +111,92 @@ def check_decline_signal(threshold: float = 0.5) -> Check:
     return Check("decline-rate", "ok", f"CLI decline rate nominal ({rate:.0%})")
 
 
+def _probe_grader(model: str, base_url: str, timeout: float):
+    """Ask the gateway to serve `model` and report (status, served_id, error).
+
+    A one-token completion, NOT a `/v1/models` lookup. On this fleet the catalog
+    is not evidence of serving: it has advertised ids that 404 and hidden ids
+    that answer, so a catalog hit cannot distinguish a live pin from a dead one.
+    A response can.
+
+    `status` is None when nothing answered at all, which is the "cannot tell"
+    case and is deliberately distinct from any HTTP status.
+    """
+    import json
+    import os
+    import urllib.error
+    import urllib.request
+    url = base_url.rstrip("/") + "/v1/chat/completions"
+    body = json.dumps({"model": model, "max_tokens": 1,
+                       "messages": [{"role": "user", "content": "ping"}]}).encode()
+    req = urllib.request.Request(url, data=body, method="POST", headers={
+        "content-type": "application/json",
+        "authorization": "Bearer " + os.environ.get("SKCODE_GATEWAY_TOKEN", "sk-local")})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads((resp.read() or b"{}").decode() or "{}")
+            return resp.status, str(payload.get("model") or ""), ""
+    except urllib.error.HTTPError as exc:
+        return exc.code, "", str(exc.reason or "")
+    except Exception as exc:                       # noqa: BLE001 -- never raises into a run
+        return None, "", f"{type(exc).__name__}: {exc}"
+
+
+def check_grader_pin(model: str | None = None, base_url: str | None = None,
+                     *, probe=_probe_grader, timeout: float = 20.0) -> Check:
+    """Does the PINNED grader model still exist on the gateway we would ask?
+
+    A config pinning a dead model id is indistinguishable from one pinning a live
+    model until something asks. That is how `ornith-big` sat in
+    `orchestrator.GRADER_MODEL` for weeks after `ornith-aeon.service` was retired
+    off chiap08: nothing in this repo ever asked. This check asks.
+
+    "Cannot tell" is NOT one of the good answers:
+
+    * ``ok``   -- the gateway answered and named the pinned model back.
+    * ``fail`` -- the gateway is up and refused the id. The pin is dead, and
+      every grade this harness stamps names a model that does not exist.
+    * ``warn`` -- either the gateway could not be reached (the pin is UNVERIFIED,
+      which is not the same as confirmed live), or it answered under a DIFFERENT
+      id, meaning skgateway failed over and the pin is not the grader of record.
+
+    An unreachable gateway can never make this check ``ok``. That is the whole
+    design constraint: a checker that reports healthy when it could not observe
+    anything is the failure being removed, not a check on it.
+    """
+    import os
+    from .orchestrator import GRADER_MODEL
+    model = (model or GRADER_MODEL).strip()
+    base_url = base_url or os.environ.get("SKCODE_GATEWAY_BASE", "http://localhost:18780")
+    reverify = (f"re-verify by hand: curl -s -o /dev/null -w '%{{http_code}}' "
+                f"-X POST {base_url}/v1/chat/completions -H 'content-type: application/json' "
+                f"-d '{{\"model\":\"{model}\",\"max_tokens\":1,"
+                f"\"messages\":[{{\"role\":\"user\",\"content\":\"ping\"}}]}}'")
+    status, served, err = probe(model, base_url, timeout)
+    if status is None:
+        return Check("grader-pin", "warn",
+                     f"could not reach {base_url}, so the pinned grader {model!r} is "
+                     f"UNVERIFIED -- not confirmed live ({err[:100]})",
+                     fix=f"run this where skgateway is reachable. {reverify}")
+    if status != 200:
+        return Check("grader-pin", "fail",
+                     f"the gateway refused the pinned grader {model!r} (HTTP {status}"
+                     + (f": {err[:80]}" if err else "")
+                     + "); it does not exist, so no card can be graded and every "
+                       "grade already stamped with it names nothing",
+                     fix="repoint orchestrator.GRADER_MODEL at a model the fleet "
+                         "serves, and record the date you verified it beside the pin")
+    if served and served != model:
+        return Check("grader-pin", "warn",
+                     f"asked for {model!r} and {served!r} answered: skgateway failed "
+                     "over, so the pin is not the grader of record and a grade "
+                     "stamped with it is unattributable",
+                     fix="pin the id that actually answers, or fix the routing. "
+                         + reverify)
+    return Check("grader-pin", "ok",
+                 f"{base_url} serves the pinned grader {model} under its own id")
+
+
 #: The checks a preflight runs, cheapest/most-diagnostic first.
 def check_concurrency() -> Check:
     """Report the resource-scaled build concurrency for THIS host (informational):
@@ -127,7 +213,7 @@ def check_concurrency() -> Check:
 
 
 CHECKS = (check_shim_delegation, check_auth, check_sandbox_proxy_image,
-          check_decline_signal, check_concurrency)
+          check_grader_pin, check_decline_signal, check_concurrency)
 
 
 def preflight() -> list[Check]:

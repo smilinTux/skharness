@@ -61,11 +61,28 @@ def _board(unblocked):
     return b
 
 
+def _sovereign_harness():
+    """A harness that REPORTS having been served by hardware we own.
+
+    Card a43cac2e made the grade gate read the observed serving backend instead
+    of the requested model name, and it fails closed on `unobserved`. A bare
+    MagicMock observes nothing, so every test that expects a grade to be written
+    now has to state that it saw a sovereign serving. That is the point: the
+    observation is a precondition of grading, so a test cannot get a grade
+    without declaring one. Values are a real energy_log row.
+    """
+    h = MagicMock()
+    h.backend_served = "reg:ornith"
+    h.energy_basis = "measured_gpu"
+    h.energy_node = "ollama"
+    return h
+
+
 def test_phase0_reclaims_then_computes_unblocked(tmp_path):
     _write_task(tmp_path, "t-1", tags=["repo:skos"], acceptance_criteria=["works"])
     _write_task(tmp_path, "t-2", tags=["repo:skos"])
     board = _board(["t-1"])
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = Verdict(verdict="valid", reason="")
     cands, decisions = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
                                           caps=Caps(), run_id="r1")
@@ -83,7 +100,7 @@ def test_phase0_skips_obsolete_marked_cards(tmp_path):
     _write_task(tmp_path, "t-dead", tags=["repo:skos"], acceptance_criteria=["w"],
                 meta={"autopilot": {"obsolete": {"reason": "already on main", "ts": "x"}}})
     board = _board(["t-live", "t-dead"])
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = Verdict(verdict="valid", reason="")
     cands, _ = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
                                   caps=Caps(), run_id="r")
@@ -102,7 +119,7 @@ def _decompose_board(tmp_path, tid="t-vague", **taskkw):
 
 def test_phase0_decompose_verdict_creates_children_and_parks_parent(tmp_path, mocker):
     board, created = _decompose_board(tmp_path)
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = Verdict(verdict="decompose", reason="too coarse")
     harness.decompose.return_value = [
         {"title": "sub A", "description": "", "acceptance": ["a.py has f"]},
@@ -126,7 +143,7 @@ def test_phase0_decompose_incoherent_children_escalate_not_created(tmp_path, moc
     # Python repo) means the model misread the repo -> route to a human, create NO
     # garbage children.
     board, created = _decompose_board(tmp_path)
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = Verdict(verdict="decompose", reason="coarse")
     harness.decompose.return_value = [
         {"title": "Add OpsExecutor struct", "acceptance": ["ops_executor.go exists"]},
@@ -149,7 +166,7 @@ def test_phase0_decompose_incoherent_children_escalate_not_created(tmp_path, moc
 
 def test_phase0_decompose_empty_escalates_not_drops(tmp_path, mocker):
     board, created = _decompose_board(tmp_path)
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = Verdict(verdict="decompose", reason="too coarse")
     harness.decompose.return_value = []             # inconclusive
     mocker.patch("skharness.autocode.orchestrator._ground_card",
@@ -164,7 +181,7 @@ def test_phase0_decompose_empty_escalates_not_drops(tmp_path, mocker):
 def test_phase0_decompose_depth_ceiling_escalates(tmp_path, mocker):
     board, created = _decompose_board(
         tmp_path, meta={"autopilot": {"decomp_depth": 2}})
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = Verdict(verdict="decompose", reason="too coarse")
     mocker.patch("skharness.autocode.orchestrator._ground_card",
                  return_value=_Grounding(grounded=False))
@@ -177,7 +194,7 @@ def test_phase0_decompose_depth_ceiling_escalates(tmp_path, mocker):
 
 def test_phase0_concreteness_gate_downgrades_valid_to_decompose(tmp_path, mocker):
     board, created = _decompose_board(tmp_path)
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = Verdict(verdict="valid", reason="looks fine")  # model says valid
     harness.decompose.return_value = [{"title": "sub", "acceptance": ["x.py"]}]
     # grounded, low concreteness, not net_new -> the gate must downgrade valid->decompose
@@ -200,7 +217,7 @@ def test_phase0_decompose_skips_epic_that_already_has_children(tmp_path, mocker)
     # children, decompose() never even runs, parent never re-parked.
     board, created = _decompose_board(tmp_path)
     _write_task(tmp_path, "child-1", tags=["parent:t-vague", "autopilot"], title="sub A")
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = Verdict(verdict="decompose", reason="too coarse")
     harness.decompose.return_value = [
         {"title": "sub A", "acceptance": ["a.py has f"]},
@@ -222,7 +239,7 @@ def test_phase0_decompose_child_skips_duplicate_title(tmp_path, mocker):
     # insensitive) and still create the genuinely-new sibling.
     board, created = _decompose_board(tmp_path)
     _write_task(tmp_path, "hand-a", tags=["repo:skos"], title="Sub  A")   # unlinked dup
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = Verdict(verdict="decompose", reason="too coarse")
     harness.decompose.return_value = [
         {"title": "sub a", "description": "", "acceptance": ["a.py has f"]},   # dup -> skip
@@ -242,7 +259,7 @@ def test_phase0_decompose_new_epic_still_creates_all_children(tmp_path, mocker):
     # Genuinely-new epic (no existing children, no title collisions): the guard is
     # inert and every child is created + the parent parked.
     board, created = _decompose_board(tmp_path)
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = Verdict(verdict="decompose", reason="too coarse")
     harness.decompose.return_value = [
         {"title": "fresh A", "acceptance": ["a.py has f"]},
@@ -265,7 +282,7 @@ def test_phase0_unscoped_decompose_queues_scope_decision_not_children(tmp_path, 
     # verdict becomes a "scope it" decision, no children, so the bare triage that
     # flooded the board can no longer emit anything.
     board, created = _decompose_board(tmp_path)
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = Verdict(verdict="decompose", reason="too coarse")
     harness.decompose.return_value = [{"title": "sub A", "acceptance": ["a.py has f"]}]
     mocker.patch("skharness.autocode.orchestrator._ground_card",
@@ -286,7 +303,7 @@ def test_phase0_decompose_norepo_epic_queues_decision_not_children(tmp_path, moc
     board = _board(["t-norepo"])
     created = []
     board.create_task.side_effect = lambda task: created.append(task)
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = Verdict(verdict="decompose", reason="too coarse")
     harness.decompose.return_value = [{"title": "sub", "acceptance": ["x"]}]
     mocker.patch("skharness.autocode.orchestrator._ground_card",
@@ -306,7 +323,7 @@ def test_phase0_decompose_run_budget_defers_epic_over_budget(tmp_path, mocker):
     board = _board(["e1"])
     created = []
     board.create_task.side_effect = lambda task: created.append(task)
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = Verdict(verdict="decompose", reason="coarse")
     harness.decompose.return_value = [
         {"title": "s1", "acceptance": ["a.py"]},
@@ -326,7 +343,7 @@ def test_phase0_decompose_budget_allows_epic_that_fits(tmp_path, mocker):
     # FIX C2 (positive): an epic whose full child set fits the remaining budget is
     # split normally; the budget only defers epics that would overflow it.
     board, created = _decompose_board(tmp_path)
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = Verdict(verdict="decompose", reason="coarse")
     harness.decompose.return_value = [
         {"title": "sub A", "acceptance": ["a.py has f"]},
@@ -346,7 +363,7 @@ def test_phase0_decompose_budget_allows_epic_that_fits(tmp_path, mocker):
 
 def test_phase0_scoped_decompose_children_born_staged(tmp_path, mocker):
     board, created = _decompose_board(tmp_path)
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = Verdict(verdict="decompose", reason="coarse")
     harness.decompose.return_value = [{"title": "sub A", "acceptance": ["a.py has f"]}]
     mocker.patch("skharness.autocode.orchestrator._ground_card",
@@ -379,7 +396,7 @@ def test_release_epic_strips_stage_from_children(tmp_path):
 
 def test_phase0_net_new_card_still_builds(tmp_path, mocker):
     board, created = _decompose_board(tmp_path)
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = Verdict(verdict="valid", reason="greenfield")
     mocker.patch("skharness.autocode.orchestrator._ground_card",
                  return_value=_Grounding(grounded=True, concreteness=0.0, net_new=True,
@@ -395,7 +412,7 @@ def test_run_once_triage_only_stops_before_build(tmp_path, mocker):
     _write_task(tmp_path, "t-1", tags=["repo:skos"], acceptance_criteria=["w"])
     board = _board(["t-1"])
     board.create_task.side_effect = lambda task: None
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = Verdict(verdict="valid", reason="ok")
     mocker.patch("skharness.autocode.orchestrator._ground_card",
                  return_value=_Grounding(grounded=False))
@@ -417,7 +434,7 @@ def test_phase0_only_ids_scopes_to_the_batch(tmp_path):
     for i in "abc":
         _write_task(tmp_path, f"t-{i}", tags=["repo:skos"], acceptance_criteria=["works"])
     board = _board(["t-a", "t-b", "t-c"])
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = Verdict(verdict="valid", reason="")
     cands, _ = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
                                   caps=Caps(), run_id="r", only_ids=["t-c", "t-a"])
@@ -429,7 +446,7 @@ def test_phase0_only_tag_filters_unblocked(tmp_path):
     _write_task(tmp_path, "t-1", tags=["repo:skos", "autopilot"], acceptance_criteria=["w"])
     _write_task(tmp_path, "t-2", tags=["repo:skos"], acceptance_criteria=["w"])
     board = _board(["t-1", "t-2"])
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = Verdict(verdict="valid", reason="")
     cands, _ = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
                                   caps=Caps(), run_id="r", only_tag="autopilot")
@@ -441,7 +458,7 @@ def test_phase0_applies_verdicts(tmp_path):
     _write_task(tmp_path, "dead", tags=["repo:skos"])
     _write_task(tmp_path, "ask", tags=["repo:skos"])
     board = _board(["stale", "dead", "ask"])
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.side_effect = [
         Verdict(verdict="needs_decision", reason="which repo?"),
         Verdict(verdict="obsolete", reason="superseded"),
@@ -460,7 +477,7 @@ def test_phase0_applies_verdicts(tmp_path):
 def test_phase0_dry_run_writes_nothing(tmp_path):
     _write_task(tmp_path, "stale", tags=["repo:skos"])
     board = _board(["stale"])
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = Verdict(verdict="stale", reason="d", updated_description="n")
     orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
                        caps=Caps(), run_id="r1", dry_run=True)
@@ -856,11 +873,10 @@ def test_run_once_task_filter(tmp_path, clean_execs):
 
 def test_phase0_only_scopes_to_single_task(tmp_path):
     import skharness.autocode.orchestrator as orch
-    from unittest.mock import MagicMock
     _write_task(tmp_path, "target", tags=["repo:skos"], acceptance_criteria=["x"])
     _write_task(tmp_path, "other", tags=["repo:skos"], acceptance_criteria=["y"])
     board = _board(["target", "other"])          # both unblocked
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = Verdict(verdict="valid", reason="")
     cands, _ = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
                                   caps=Caps(), run_id="r1", dry_run=True, only="target")
@@ -939,7 +955,7 @@ def _grade_kwargs(board):
 def test_phase0_writes_the_work_grade_to_the_card(tmp_path):
     _write_task(tmp_path, "t-1", tags=["repo:skos"], acceptance_criteria=["w"])
     board = _board(["t-1"])
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = _graded_verdict(size="M", risk="high")
     orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
                        caps=Caps(), run_id="r1")
@@ -957,7 +973,7 @@ def test_model_class_is_derived_by_the_board_never_supplied(tmp_path):
     contradict the max(size_rank, risk_rank) rule the whole economy is built on."""
     _write_task(tmp_path, "t-1", tags=["repo:skos"])
     board = _board(["t-1"])
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = _graded_verdict(size="S", risk="high")
     orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
                        caps=Caps(), run_id="r1")
@@ -971,7 +987,7 @@ def test_no_joule_numbers_are_invented(tmp_path):
     if it were authoritative. Both stay None."""
     _write_task(tmp_path, "t-1", tags=["repo:skos"])
     board = _board(["t-1"])
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = _graded_verdict()
     orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
                        caps=Caps(), run_id="r1")
@@ -983,7 +999,7 @@ def test_no_joule_numbers_are_invented(tmp_path):
 def test_phase0_dry_run_writes_no_grade(tmp_path):
     _write_task(tmp_path, "t-1", tags=["repo:skos"])
     board = _board(["t-1"])
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = _graded_verdict()
     cands, _ = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
                                   caps=Caps(), run_id="r1", dry_run=True)
@@ -1002,7 +1018,7 @@ def test_ungraded_card_is_ineligible_not_pessimistically_graded(tmp_path):
     """
     _write_task(tmp_path, "t-1", tags=["repo:skos"])
     board = _board(["t-1"])
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = Verdict(verdict="valid", reason="")   # no axes
     cands, _ = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
                                   caps=Caps(), run_id="r1")
@@ -1015,7 +1031,7 @@ def test_one_bad_grade_does_not_stop_the_assess_pass(tmp_path):
     for tid in ("t-1", "t-2", "t-3"):
         _write_task(tmp_path, tid, tags=["repo:skos"])
     board = _board(["t-1", "t-2", "t-3"])
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.side_effect = [
         _graded_verdict(size="S", risk="low"),
         Verdict(verdict="valid", reason="", size="not-a-size", risk="low"),
@@ -1033,7 +1049,7 @@ def test_one_bad_grade_does_not_stop_the_assess_pass(tmp_path):
 def test_obsolete_card_is_not_graded(tmp_path):
     _write_task(tmp_path, "t-1", tags=["repo:skos"])
     board = _board(["t-1"])
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = _graded_verdict(verdict="obsolete")
     orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
                        caps=Caps(), run_id="r1")
@@ -1045,7 +1061,7 @@ def test_obsolete_card_is_not_graded(tmp_path):
 def test_work_grade_payload_contract_is_none_or_complete(tmp_path):
     _write_task(tmp_path, "t-1", tags=["repo:skos"])
     board = _board(["t-1"])
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = _graded_verdict(size="XL", risk="low")
     cands, _ = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
                                   caps=Caps(), run_id="r1")
@@ -1097,7 +1113,7 @@ def test_the_models_sensitivity_never_reaches_the_card(tmp_path):
     _write_task(tmp_path, "t-1", title="fix a typo in a capauth docstring",
                 tags=["repo:capauth"])
     board = _board(["t-1"])
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = _graded_verdict(size="S", risk="low",
                                                   sensitivity="public")
     cands, _ = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
@@ -1114,7 +1130,7 @@ def test_the_models_sensitivity_is_overridden_in_both_directions(tmp_path):
     which a merely-take-the-max implementation would fail."""
     _write_task(tmp_path, "t-1", title="bump the ruff pin", tags=["repo:skos"])
     board = _board(["t-1"])
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = _graded_verdict(size="S", risk="low",
                                                   sensitivity="secret")
     orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
@@ -1127,7 +1143,7 @@ def test_human_override_on_the_card_is_honored(tmp_path):
     _write_task(tmp_path, "t-1", title="publish the release notes", tags=["repo:skos"],
                 meta={"sensitivity_override": "public"})
     board = _board(["t-1"])
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = _graded_verdict(size="S", risk="low")
     orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
                        caps=Caps(), run_id="r1")
@@ -1138,7 +1154,7 @@ def test_human_override_on_the_card_is_honored(tmp_path):
 def test_invalid_human_override_leaves_the_card_ungraded_without_raising(tmp_path):
     _write_task(tmp_path, "t-1", tags=["repo:skos"], meta={"sensitivity_override": "publik"})
     board = _board(["t-1"])
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = _graded_verdict()
     cands, _ = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
                                   caps=Caps(), run_id="r1")
@@ -1148,43 +1164,104 @@ def test_invalid_human_override_leaves_the_card_ungraded_without_raising(tmp_pat
 
 # -- the grader itself must be sovereign ---------------------------------------
 
-def test_grade_is_refused_when_the_grader_is_not_sovereign(tmp_path):
+def test_grade_is_refused_when_a_cloud_backend_served_the_grader(tmp_path):
     """The grader reads RAW card text, and card descriptions on this board carry
     pasted credentials. A cloud grader means that text already left the fleet, so
-    the card is left ungraded rather than stamped with third-party provenance."""
+    the card is left ungraded rather than stamped with third-party provenance.
+
+    Card a43cac2e: the harness here REQUESTS `ornith-big`, which the old rule
+    accepted on the strength of the name. The live ledger has `ornith-big` rows
+    with backend=nvidia / basis=imputed_cloud, so the request is not the answer.
+    What refuses this card is the observed backend."""
     _write_task(tmp_path, "t-1", tags=["repo:skos"])
     board = _board(["t-1"])
-    harness = MagicMock()
-    harness.model = "sonnet"
+    harness = _sovereign_harness()
+    harness.model = orch.GRADER_MODEL          # a name the old rule called sovereign
     harness.grader_model = None
+    harness.backend_served = "nvidia"          # what actually answered
+    harness.energy_basis = "imputed_cloud"
+    harness.energy_node = None
     harness.assess.return_value = _graded_verdict()
     orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
                        caps=Caps(), run_id="r1")
     board.set_grade.assert_not_called()
 
 
-def test_sk_default_is_not_accepted_as_a_sovereign_grader():
+def test_grade_is_refused_when_nobody_observed_who_served_it(tmp_path):
+    """FAIL CLOSED on `unobserved`. A harness with no attribution channel has not
+    told us it ran sovereign, it has told us nothing, and assuming sovereign on
+    no evidence is the exact failure this card removes."""
+    _write_task(tmp_path, "t-1", tags=["repo:skos"])
+    board = _board(["t-1"])
+    harness = MagicMock()                      # observes nothing at all
+    harness.model = orch.GRADER_MODEL
+    harness.assess.return_value = _graded_verdict()
+    orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
+                       caps=Caps(), run_id="r1")
+    board.set_grade.assert_not_called()
+
+
+def test_a_model_id_can_no_longer_answer_the_sovereignty_question():
     """sk-default was repointed twice in two days, most recently onto a 9B, with
-    no announcement, and has silently failed over to cloud before. A grade
-    stamped with it records nothing."""
-    assert orch.is_sovereign_grader("sk-default") is False
-    assert orch.is_sovereign_grader("sonnet") is False
-    assert orch.is_sovereign_grader("") is False
-    assert orch.is_sovereign_grader(orch.GRADER_MODEL) is True
-    assert orch.is_sovereign_grader("ornith-1.0-35b") is True
+    no announcement, and has silently failed over to cloud before. `ornith-big`
+    has the same problem, measurably. So the gate no longer answers questions
+    about names at all: it raises, rather than returning a verdict a caller would
+    read as being about a machine."""
+    for name in ("sk-default", "sonnet", "", orch.GRADER_MODEL, "ornith-1.0-35b"):
+        with pytest.raises(TypeError):
+            orch.is_sovereign_grader(name)
 
 
-def test_grader_model_stamped_is_the_one_that_actually_graded():
-    assert orch.grader_model_for(SimpleNamespace(model="ornith-1.0-35b")) == "ornith-1.0-35b"
-    assert orch.grader_model_for(SimpleNamespace()) == orch.GRADER_MODEL
-    assert orch.grader_model_for(MagicMock()) == orch.GRADER_MODEL   # Mock is not a str
+def test_the_requested_grader_model_is_recorded_as_provenance():
+    """Still stamped on the grade, because paired with rubric_version it is the
+    only way to detect grade drift after the fact. It just no longer decides
+    whether the grade may be written."""
+    assert orch.requested_grader_model(
+        SimpleNamespace(model="ornith-1.0-35b")) == "ornith-1.0-35b"
+    assert orch.requested_grader_model(SimpleNamespace()) == orch.GRADER_MODEL
+    assert orch.requested_grader_model(MagicMock()) == orch.GRADER_MODEL  # Mock is not a str
+
+
+#: What skgateway at http://localhost:18780 actually did on 2026-08-16, recorded
+#: by POSTing a one-token completion per id and reading back the HTTP status and
+#: the `model` the response named. Not a catalog listing: this fleet's catalog
+#: has advertised ids that 404, so only a response is evidence of serving.
+#:
+#: Re-record it (same method) whenever GRADER_MODEL moves. An id missing from
+#: this map reads as dead on purpose, so a new pin cannot be adopted without
+#: someone observing the fleet serve it.
+FLEET_OBSERVED_2026_08_16 = {
+    "ornith-big":                            (404, ""),   # ornith-aeon.service, retired
+    "ornith-1.0-35b":                        (404, ""),   # same weights, same retirement
+    "ornith-1.0-9b":                         (200, "ornith-1.0-9b"),
+    "qwen3.8-27b-huihui-abliterated-q4_k_m": (200, "qwen3.8-27b-huihui-abliterated-q4_k_m"),
+}
+
+
+def test_the_grader_pin_names_a_model_the_fleet_actually_serves():
+    """The regression that motivated this: `ornith-big` stayed pinned for weeks
+    after the 35B was retired off chiap08, because a pin at a dead model and a
+    pin at a live one look identical until something asks.
+
+    This runs the real `doctor.check_grader_pin` against the recorded fleet
+    rather than the live one, so it is deterministic and offline while still
+    being a question about serving and not about the shape of a string. A
+    syntactically perfect id that nothing serves fails here.
+    """
+    from skharness.autocode import doctor
+
+    def replay(model, base_url, timeout):
+        status, served = FLEET_OBSERVED_2026_08_16.get(model, (404, ""))
+        return status, served, "no such model"
+    c = doctor.check_grader_pin(orch.GRADER_MODEL, "http://replay:18780", probe=replay)
+    assert c.status == "ok", c.detail
 
 
 def test_a_board_without_set_grade_does_not_break_the_pass(tmp_path):
     _write_task(tmp_path, "t-1", tags=["repo:skos"])
     board = _board(["t-1"])
     del board.set_grade
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = _graded_verdict()
     cands, _ = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
                                   caps=Caps(), run_id="r1")
@@ -1196,7 +1273,7 @@ def test_a_failing_set_grade_does_not_stop_the_board(tmp_path):
         _write_task(tmp_path, tid, tags=["repo:skos"])
     board = _board(["t-1", "t-2"])
     board.set_grade.side_effect = RuntimeError("disk full")
-    harness = MagicMock()
+    harness = _sovereign_harness()
     harness.assess.return_value = _graded_verdict()
     cands, _ = orch.phase0_assess(board=board, harness=harness, tasks_dir=tmp_path,
                                   caps=Caps(), run_id="r1")

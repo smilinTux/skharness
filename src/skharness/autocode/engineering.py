@@ -964,11 +964,34 @@ class EngineeringExecutor:
                 # CI, coverage, and the PR are already done, so the worktree is unneeded.
                 self.prune_worktree(repo, wt)
                 if self._gh_merge(repo, pr_branch):
+                    # Record the MERGE COMMIT sha, because revert needs it and this
+                    # is the only cheap moment to get it: `gh pr merge
+                    # --delete-branch` has already removed the branch, so the
+                    # commit gets harder to find from here on, not easier.
+                    #
+                    # Before this, the record was {pr, branch, ts, auto} with no
+                    # sha, while _revert_impl requires merge["sha"]. So revert
+                    # ALWAYS failed on automerged work and meta.autopilot.reverted
+                    # could never be written. The operator had no working undo, and
+                    # worse, any later analysis reading "was this reverted" got a
+                    # constant False for a broken-tool reason and would conclude
+                    # that auto-merged work is never wrong. Card 1e5be0a7.
+                    sha = self._merge_commit_sha(repo, pr_branch)
+                    merge_rec = {"pr": pr_url, "branch": pr_branch,
+                                 "ts": _now_iso(), "auto": True}
+                    if sha:
+                        merge_rec["sha"] = sha
+                    else:
+                        # Record the merge anyway (it happened) but say the sha is
+                        # missing rather than omitting the field silently, so a
+                        # later revert can tell "lookup failed" from "never merged".
+                        merge_rec["sha_unavailable"] = True
+                        print(f"autopilot[{item.ref}] merged but could not resolve the "
+                              f"merge commit sha; revert will not be available")
                     self.board._write_task_raw(
                         item.ref,
                         lambda d: d.setdefault("meta", {}).setdefault("autopilot", {})
-                                  .__setitem__("merge", {"pr": pr_url, "branch": pr_branch,
-                                                         "ts": _now_iso(), "auto": True}))
+                                  .__setitem__("merge", merge_rec))
                     with _BOARD_LOCK:           # shared agent file
                         self.board.complete_task(self.agent_name, item.ref)
                     health.record("automerge", task=item.ref, pr=pr_url, verdict="green")
@@ -1056,6 +1079,33 @@ class EngineeringExecutor:
             print(f"autopilot: gh pr merge failed for {pr_branch}: {proc.stderr.strip()}")
         return proc.returncode == 0
 
+    def _merge_commit_sha(self, repo: RepoSpec, pr_branch: str) -> str:
+        """The merge commit sha for a just-merged PR, or "" if it cannot be read.
+
+        Deliberately NOT folded into `_gh_merge`. That helper returns a bool the
+        caller uses to decide whether the merge happened, and a failure to read
+        the sha afterwards must never be mistaken for a failure to merge: the
+        merge is already done and irreversible from here. Keeping them separate
+        means a sha lookup that fails degrades the RECORD, not the outcome.
+
+        Never raises. A missing sha costs the ability to revert, which is bad,
+        but throwing here would leave a merged PR with no board record at all,
+        which is worse.
+        """
+        try:
+            proc = subprocess.run(
+                ["gh", "pr", "view", pr_branch, "--json", "mergeCommit",
+                 "-q", ".mergeCommit.oid"],
+                cwd=repo.path, capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"autopilot: merge-sha lookup errored for {pr_branch}: {exc}")
+            return ""
+        if proc.returncode != 0:
+            print(f"autopilot: merge-sha lookup failed for {pr_branch}: "
+                  f"{proc.stderr.strip()}")
+            return ""
+        return proc.stdout.strip()
+
 
 def _revert_impl(board, config, task_id: str, agent: str = "autopilot") -> dict:
     """Revert the recorded merge commit and reopen the coord task.
@@ -1066,8 +1116,21 @@ def _revert_impl(board, config, task_id: str, agent: str = "autopilot") -> dict:
     if task is None:
         raise ValueError(f"unknown task {task_id}")
     merge = (task.meta or {}).get("autopilot", {}).get("merge")
-    if not merge or not merge.get("sha"):
+    if not merge:
         raise ValueError(f"no recorded merge for {task_id}")
+    if not merge.get("sha"):
+        # Distinguish the two failures. "No recorded merge" was previously
+        # raised for BOTH cases, which told an operator the work was never
+        # merged when in fact it was merged and only the sha is missing. Every
+        # card auto-merged before the sha started being recorded is in this
+        # second state permanently, and no fix can backfill it once the PR
+        # branch is deleted. Say so, and say what to do instead.
+        raise ValueError(
+            f"{task_id} WAS merged but no merge commit sha was recorded"
+            f"{' (sha lookup failed at merge time)' if merge.get('sha_unavailable') else ''}"
+            f", so it cannot be reverted automatically. PR: {merge.get('pr') or 'unknown'}. "
+            f"Revert it by hand, or find the merge commit on "
+            f"{merge.get('branch') or 'the PR branch'} and pass it to git revert.")
     name = next((t.split(":", 1)[1] for t in task.tags if t.startswith("repo:")), None)
     repo = config.repo_map[name]
     subprocess.run(["git", "-C", repo.path, "checkout", repo.integration_branch],
