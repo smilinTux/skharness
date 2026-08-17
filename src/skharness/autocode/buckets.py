@@ -204,11 +204,19 @@ def attach_dispatch_model(brief, model_id: str | None):
     that is ever anything other than "model" -- a bad merge, a typo, a
     compromised import -- is refused on its very next use instead of
     silently landing on a twin-gate / CI / acceptance / ratification field.
+
+    The name written is the value assert_routing_field() RETURNS, never a
+    fresh read of DISPATCH_MODEL_ATTR taken after the check. Re-reading the
+    global here would be check-then-use on the very global this guard exists
+    to distrust: a module __getattr__ or a concurrent mutation (cards run
+    under a ThreadPoolExecutor) could hand the check "model" and the write
+    something else a moment later. Binding the checked value once and using
+    only that binding closes that window.
     """
     if model_id is not None:
         validate_bucket(model_id)
-    assert_routing_field(DISPATCH_MODEL_ATTR)
-    setattr(brief, DISPATCH_MODEL_ATTR, model_id)
+    field = assert_routing_field(DISPATCH_MODEL_ATTR)
+    setattr(brief, field, model_id)
     return brief
 
 
