@@ -150,6 +150,26 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   the energy.
 
 ### Fixed
+- **A concurrent settlement can no longer erase earned joules** (card `1892cf38`,
+  S28). `balance_after` in the live ledger is not a clean running total of the
+  `amount` column, and two of the breaks are lost updates: two mints 35
+  microseconds apart on 2026-08-15 both recorded `balance_after=123309`, and two
+  mints 105 ms apart on 2026-08-17 both recorded `balance_after=162168`. 25 J and
+  50 J of genuine earned credit are missing from the balance. `JouleWallet` reads
+  its snapshot once in `__init__` and guards mutations with an INSTANCE lock,
+  while `settle()` builds a fresh wallet per call, so two settlements hold two
+  snapshots and two locks that never contend and the second write erases the
+  first. `settle()` now holds an `flock` on `{wallet}/.settle.lock` across the
+  whole read-modify-write, wallet construction included, since construction is
+  the read; `flock` binds to the open file description rather than the process,
+  so one primitive covers concurrent threads and concurrent sessions alike. On
+  timeout it settles unlocked and logs, because since skcapstone `7bebcd8` the
+  journal is written before the state and so remains reconstructible, whereas
+  refusing to settle would discard the credit outright. The test forces the
+  interleaving rather than hoping for it: the snapshot read is gated so both
+  settlers rendezvous immediately after reading. This does NOT cover
+  skcapstone's `JouleEconomy.record_task_completion`, the path both live losses
+  actually came from, nor two hosts writing one replicated wallet.
 - **`revert` now works on auto-merged work.** The merge record was written as
   `{pr, branch, ts, auto}` with no `sha`, while `_revert_impl` requires
   `merge["sha"]`, so revert ALWAYS failed on anything autopilot merged and
