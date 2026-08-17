@@ -313,6 +313,26 @@ def settle(
             priority=_priority_bucket(priority),
             quality=_quality_bucket(score),
         )
+        # proof_hash is an ARTIFACT proof, and is deliberately NOT unique per
+        # settlement. It answers "which commit is this settlement evidence for",
+        # so both legs below (the mint and the matching llm-cost spend) carry the
+        # SAME value on purpose: they are one economic event, and a reader
+        # reconciling the ledger needs them joinable.
+        #
+        # Two consequences follow, and neither is a defect to fix here:
+        #   1. It cannot serve as a dedupe key, and nothing uses it as one. The
+        #      double-settle guard is autopilot_cost.already_settled(card_id),
+        #      keyed on the card, precisely because a re-dispatch of the same
+        #      card produces a FRESH commit sha and would slip a sha-based key.
+        #   2. Settling the same commit twice yields the same proof. That is the
+        #      correct reading of "proof of this artifact", not a collision.
+        #
+        # The audit that produced this card observed only two distinct proofs
+        # across 1,433 rows and reasonably asked whether that was a second bug.
+        # It was a symptom of the first one: those rows all came from the fixture
+        # ref "t1" with no commit sha, so the fallback hashed the literal "t1"
+        # (sha256 = 628b49d9...) every time. Test rows stop being minted as of
+        # this commit, so the property does not arise for real settlements.
         proof = XPBridge.compute_proof_hash(commit_sha or task_ref)
         if minted > 0:
             wallet.mint(
