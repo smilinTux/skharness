@@ -311,6 +311,83 @@ def test_run_bails_fast_on_noop_empty_diff(mocker, cfg):
     assert ex.board.score_task.call_count == 0
 
 
+# ── S11: the gated settle path needs the same double-settle guard the bridge
+# has. finalize CAN run twice: orchestrator turns a finalize failure into a
+# DecisionItem and a retry re-enters finalize with a fresh worktree and a fresh
+# commit sha, so a (card_id, sha) key cannot catch it. ────────────────────────
+
+def _settle_item():
+    return WorkItem(kind="engineering", ref="t1", source="coord", repo=None,
+                    payload={"tags": ["repo:skrender"], "title": "t"})
+
+
+def _fake_econ(recorded=True):
+    from skharness.autocode import joules
+    return joules.Economics(agent="lumina", task_ref="t1", minted=25,
+                            spent_joules=2, net_joules=23, balance_after=100,
+                            recorded=recorded)
+
+
+@pytest.mark.parametrize("cls_name", ["EngineeringExecutor", "DirectExecutor"])
+def test_settle_is_refused_a_second_time_for_the_same_card(mocker, cfg, cls_name):
+    """A finalize retry after a partial finalize must not mint the same unit of
+    work twice. Both gated and direct call the SAME inherited helper, so both
+    are pinned here."""
+    from skharness.autocode.direct import DirectExecutor
+    cls = {"EngineeringExecutor": EngineeringExecutor,
+           "DirectExecutor": DirectExecutor}[cls_name]
+    settle = mocker.patch("skharness.autocode.joules.settle",
+                          return_value=_fake_econ())
+    ex = cls(cfg, board=mocker.Mock(), journal=mocker.Mock(), agent_name="autopilot")
+    ex._settle_economics(_settle_item(), "sha1")
+    ex._settle_economics(_settle_item(), "sha2")   # retry: fresh worktree, fresh sha
+    settle.assert_called_once()
+
+
+def test_the_double_settle_guard_survives_a_new_process(mocker, cfg):
+    """A finalize retry is a NEW executor (often a new process), so an in-memory
+    flag would not catch it. The guard must read the shared settlement journal."""
+    settle = mocker.patch("skharness.autocode.joules.settle",
+                          return_value=_fake_econ())
+    first = EngineeringExecutor(cfg, board=mocker.Mock(), journal=mocker.Mock(),
+                                agent_name="autopilot")
+    first._settle_economics(_settle_item(), "sha1")
+    second = EngineeringExecutor(cfg, board=mocker.Mock(), journal=mocker.Mock(),
+                                 agent_name="autopilot")
+    second._settle_economics(_settle_item(), "sha2")
+    settle.assert_called_once()
+
+
+def test_an_unrecorded_settle_does_not_block_a_later_real_one(mocker, cfg):
+    """skjoule absent (a bare harness) means nothing was minted. Journalling that
+    as a settlement would let a no-op permanently block the real settlement, so
+    the guard must only ever be armed by a settlement that actually happened."""
+    settle = mocker.patch("skharness.autocode.joules.settle",
+                          return_value=_fake_econ(recorded=False))
+    ex = EngineeringExecutor(cfg, board=mocker.Mock(), journal=mocker.Mock(),
+                             agent_name="autopilot")
+    ex._settle_economics(_settle_item(), "sha1")
+    settle.return_value = _fake_econ(recorded=True)
+    ex._settle_economics(_settle_item(), "sha2")
+    assert settle.call_count == 2
+
+
+def test_a_refused_second_settle_still_takes_the_usage_off_the_books(mocker, cfg):
+    """The guard must not reintroduce the S5 leak: a refused settle still has to
+    clear the accrued usage and write the numbers down."""
+    mocker.patch("skharness.autocode.joules.settle", return_value=_fake_econ())
+    ex = EngineeringExecutor(cfg, board=mocker.Mock(), journal=mocker.Mock(),
+                             agent_name="autopilot")
+    ex._settle_economics(_settle_item(), "sha1")
+    ex._accrue_usage("t1", HarnessResult(ok=True, artifact=None, tokens=9,
+                                         cost_usd=0.05, raw={}), "pi")
+    rec = mocker.patch("skharness.autocode.engineering.health.record")
+    ex._settle_economics(_settle_item(), "sha2")
+    assert ex._build_usage == {}
+    ev = _unsettled(rec)
+    assert len(ev) == 1 and ev[0]["tokens"] == 9 and ev[0]["minted"] is False
+
+
 # ── S10: the accrued usage must name the adapter that ACTUALLY ran ───────────
 
 def test_accrued_usage_names_the_adapter_that_ran_on_the_wired_path(mocker, cfg):

@@ -167,12 +167,43 @@ class EngineeringExecutor:
         (`rounds_cap`) so no reader can mistake the distribution for an open one.
         """
         try:
+            from . import autopilot_cost
             from .joules import BuildUsage, settle
 
+            # Double-settle guard. finalize CAN run twice on one card: the
+            # orchestrator turns a finalize failure into a DecisionItem and a
+            # retry re-enters finalize with a FRESH worktree and a FRESH commit
+            # sha, so a (card_id, commit_sha) key would not catch it. This is the
+            # same journal-local "one settlement per card_id" rule the agent-run
+            # bridge already applies (autopilot_cost.already_settled); reuse it
+            # rather than growing a second, divergent guard.
+            #
+            # It matters beyond the wallet balance: once outcome rows exist, a
+            # double settle is a duplicate row for one unit of work, biasing any
+            # count computed from them, and the bias is invisible because both
+            # rows are individually valid.
+            if autopilot_cost.already_settled(item.ref):
+                # Still take the usage off the books and write the numbers down
+                # (S5): a refused mint must not become a silent leak.
+                self._take_usage(item.ref, "pass")
+                health.record("build_economics_skipped", task=item.ref,
+                              reason="already_settled")
+                print(f"autopilot[{item.ref}] joules already settled for this card")
+                return
             usage = self._build_usage.pop(item.ref, None) or BuildUsage()
             econ = settle(self._agent(), item.ref,
                           priority=item.payload.get("priority"),
                           score=5, usage=usage, commit_sha=sha)
+            if econ.recorded:
+                # Arm the guard ONLY on a settlement that actually happened. On a
+                # bare harness (skjoule absent) settle() is a no-op returning
+                # recorded=False; journalling that would let a no-op permanently
+                # block the real settlement on a node that does have the wallet.
+                autopilot_cost.record_settlement(
+                    card_id=item.ref, commit_sha=sha, agent=self._agent(),
+                    minted=econ.minted, spent=econ.spent_joules,
+                    net=econ.net_joules, balance_after=econ.balance_after,
+                    ts=_now_iso())
             health.record("build_economics", task=item.ref, minted=econ.minted,
                           cost_usd=econ.cost_usd, net_joules=econ.net_joules,
                           joules_per_usd=round(econ.joules_per_usd, 2),

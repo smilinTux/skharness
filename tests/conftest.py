@@ -40,6 +40,19 @@ def _isolate_health(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_cost_dir(tmp_path_factory, monkeypatch):
+    """Point the autopilot cost ledger AND the settlement journal at a throwaway
+    dir for EVERY test. The gated settle path consults the settlement journal for
+    its double-settle guard and appends to it on a real settlement, so without
+    this a finalize test would read and write the live, Syncthing-synced
+    ~/.skcapstone/autopilot-cost tree. Test suites writing to the real fleet is a
+    standing hazard here; the per-file fixtures that already set SKAI_COST_DIR
+    still win, this only closes the default."""
+    cd = tmp_path_factory.mktemp("autopilot-cost")
+    monkeypatch.setenv("SKAI_COST_DIR", str(cd))
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_fleet(monkeypatch, tmp_path):
     """Point the fleet dispatch gate at an empty tree so orchestrator tests
     never consult the live ~/.skcapstone/fleet. The gate stays inert (no
