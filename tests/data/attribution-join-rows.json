@@ -1,0 +1,222 @@
+{
+  "_provenance": {
+    "source": "skgateway/data/metrics.db, read-only",
+    "captured_at_utc": "2026-08-17T02:47:00Z",
+    "how": "verbatim SELECT * per table by req_id. No field was edited, added or removed.",
+    "why": "the join logic is pure over these rows, so CI needs no gateway"
+  },
+  "cases": {
+    "attributed": {
+      "note": "live probe 2026-08-17, headers x-session-id + x-sk-card-id sent",
+      "req_id": "6bd5bbf66f88",
+      "request_log": {
+        "id": "6bd5bbf66f88",
+        "agent_id": null,
+        "model": "sk-default",
+        "backend": "reg:ornith",
+        "session_id": "a63-probe-1786934730",
+        "started_at": 1786934730505,
+        "status_code": 200,
+        "first_byte_ms": null,
+        "total_ms": 2584,
+        "error_msg": null
+      },
+      "token_usage": [
+        {
+          "id": 1506,
+          "req_id": "6bd5bbf66f88",
+          "agent_id": null,
+          "model": "sk-default",
+          "backend": "reg:ornith",
+          "session_id": "a63-probe-1786934730",
+          "ts": 1786934733085,
+          "hour_bucket": "2026-08-17T02",
+          "day_bucket": "2026-08-17",
+          "input_tokens": 12,
+          "output_tokens": 165,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0
+        }
+      ],
+      "energy_log": [
+        {
+          "id": 1023,
+          "req_id": "6bd5bbf66f88",
+          "agent_id": null,
+          "model": "sk-default",
+          "backend": "reg:ornith",
+          "card_id": "c7aea2e0",
+          "ts": 1786934733085,
+          "day_bucket": "2026-08-17",
+          "joules": 204.98199999984354,
+          "basis": "measured_gpu",
+          "node": "ollama",
+          "concurrency_n": 1
+        }
+      ],
+      "cost_log": [
+        {
+          "id": 1506,
+          "req_id": "6bd5bbf66f88",
+          "agent_id": null,
+          "model": "sk-default",
+          "backend": "reg:ornith",
+          "session_id": "a63-probe-1786934730",
+          "ts": 1786934733085,
+          "day_bucket": "2026-08-17",
+          "input_cost": 0.0,
+          "output_cost": 0.0,
+          "cache_read_cost": 0.0,
+          "cache_write_cost": 0.0,
+          "total_cost": 0.0
+        }
+      ]
+    },
+    "control_no_headers": {
+      "note": "same prompt, same model, SAME gateway, NO attribution headers",
+      "req_id": "94d11bdd4096",
+      "request_log": {
+        "id": "94d11bdd4096",
+        "agent_id": null,
+        "model": "sk-default",
+        "backend": "reg:ornith",
+        "session_id": null,
+        "started_at": 1786934741034,
+        "status_code": 200,
+        "first_byte_ms": null,
+        "total_ms": 2765,
+        "error_msg": null
+      },
+      "token_usage": [
+        {
+          "id": 1507,
+          "req_id": "94d11bdd4096",
+          "agent_id": null,
+          "model": "sk-default",
+          "backend": "reg:ornith",
+          "session_id": null,
+          "ts": 1786934743795,
+          "hour_bucket": "2026-08-17T02",
+          "day_bucket": "2026-08-17",
+          "input_tokens": 12,
+          "output_tokens": 191,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0
+        }
+      ],
+      "energy_log": [
+        {
+          "id": 1024,
+          "req_id": "94d11bdd4096",
+          "agent_id": null,
+          "model": "sk-default",
+          "backend": "reg:ornith",
+          "card_id": null,
+          "ts": 1786934743795,
+          "day_bucket": "2026-08-17",
+          "joules": 229.68599999975413,
+          "basis": "measured_gpu",
+          "node": "ollama",
+          "concurrency_n": 1
+        }
+      ],
+      "cost_log": [
+        {
+          "id": 1507,
+          "req_id": "94d11bdd4096",
+          "agent_id": null,
+          "model": "sk-default",
+          "backend": "reg:ornith",
+          "session_id": null,
+          "ts": 1786934743795,
+          "day_bucket": "2026-08-17",
+          "input_cost": 0.0,
+          "output_cost": 0.0,
+          "cache_read_cost": 0.0,
+          "cache_write_cost": 0.0,
+          "total_cost": 0.0
+        }
+      ]
+    },
+    "failover_chain": {
+      "note": "two energy attempts (reg:ornith then nvidia); request_log.backend NULL, token_usage.backend nvidia",
+      "req_id": "185ab8359ac8",
+      "request_log": {
+        "id": "185ab8359ac8",
+        "agent_id": null,
+        "model": "sk-default",
+        "backend": null,
+        "session_id": null,
+        "started_at": 1786864964800,
+        "status_code": 200,
+        "first_byte_ms": null,
+        "total_ms": 2805,
+        "error_msg": null
+      },
+      "token_usage": [
+        {
+          "id": 1184,
+          "req_id": "185ab8359ac8",
+          "agent_id": null,
+          "model": "sk-default",
+          "backend": "nvidia",
+          "session_id": null,
+          "ts": 1786864967602,
+          "hour_bucket": "2026-08-16T07",
+          "day_bucket": "2026-08-16",
+          "input_tokens": 1116,
+          "output_tokens": 178,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0
+        }
+      ],
+      "energy_log": [
+        {
+          "id": 750,
+          "req_id": "185ab8359ac8",
+          "agent_id": null,
+          "model": "sk-default",
+          "backend": "reg:ornith",
+          "card_id": null,
+          "ts": 1786864967603,
+          "day_bucket": "2026-08-16",
+          "joules": 2.9760000000242144,
+          "basis": "measured_gpu",
+          "node": "ollama",
+          "concurrency_n": 1
+        },
+        {
+          "id": 751,
+          "req_id": "185ab8359ac8",
+          "agent_id": null,
+          "model": "sk-default",
+          "backend": "nvidia",
+          "card_id": null,
+          "ts": 1786864967603,
+          "day_bucket": "2026-08-16",
+          "joules": 825.3599999999999,
+          "basis": "imputed_cloud",
+          "node": null,
+          "concurrency_n": 1
+        }
+      ],
+      "cost_log": [
+        {
+          "id": 1184,
+          "req_id": "185ab8359ac8",
+          "agent_id": null,
+          "model": "sk-default",
+          "backend": "nvidia",
+          "session_id": null,
+          "ts": 1786864967602,
+          "day_bucket": "2026-08-16",
+          "input_cost": 0.0,
+          "output_cost": 0.0,
+          "cache_read_cost": 0.0,
+          "cache_write_cost": 0.0,
+          "total_cost": 0.0
+        }
+      ]
+    }
+  }
+}
