@@ -225,6 +225,20 @@ def test_live_wallet_is_untouched_by_a_real_settlement():
         f"  after  (size, lines, sha256) = {after}")
 
 
+@requires_skjoule
+def test_session_guard_blocks_any_direct_wallet_construction():
+    """The conftest session guard wraps JouleWallet.__init__, so it catches write
+    paths that never go through settle() at all.
+
+    Constructing the wallet is itself the write: _load_or_create_snapshot()
+    creates joules.json. So this asserts on the constructor, not on mint().
+    """
+    from skcapstone.skjoule import JouleWallet
+
+    with pytest.raises(ProductionWalletInTestError):
+        JouleWallet("lumina", home=Path.home() / ".skcapstone")
+
+
 def test_conftest_isolates_the_wallet_by_default():
     """Isolation is ON by default, not opt-in. Opt-in isolation fails exactly
     when someone forgets, which is the case that matters."""

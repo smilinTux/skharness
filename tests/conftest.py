@@ -79,50 +79,52 @@ def _isolate_joule_wallet(tmp_path_factory, monkeypatch):
     monkeypatch.setenv(joules.WALLET_HOME_ENV, str(root))
 
 
-def _wallet_fingerprints() -> dict[str, tuple[int, int]]:
-    """(size, line count) of every real wallet ledger and snapshot on this box."""
-    prints: dict[str, tuple[int, int]] = {}
-    agents = Path.home() / ".skcapstone" / "agents"
-    if not agents.is_dir():
-        return prints
-    for pattern in ("*/wallet/transactions.jsonl", "*/wallet/joules.json"):
-        for p in sorted(agents.glob(pattern)):
-            try:
-                raw = p.read_bytes()
-            except OSError:
-                continue
-            prints[str(p)] = (len(raw), raw.count(b"\n"))
-    return prints
-
-
 @pytest.fixture(scope="session", autouse=True)
-def _live_wallets_must_not_change():
-    """The negative control, wired into the suite instead of run by hand once.
+def _no_production_wallet_writes():
+    """Guard the WRITER itself for the whole session: no JouleWallet in this
+    process may ever open a directory under a real skcapstone root.
 
-    Fingerprint every real wallet before the session and assert it is unchanged
-    afterwards. Isolation asserted in a single test file stops being asserted the
-    moment someone adds a new write path, so the check belongs at the session
-    boundary where it covers every test that ran, including ones not yet written.
+    This deliberately does NOT work by fingerprinting the live ledger before and
+    after the session, which was the obvious implementation and is the wrong one.
+    Other processes on this box append to that same file (this bug is live in
+    every checkout that lacks the fix, so a parallel suite run mints into it
+    while this one is running). A check that reads a shared file cannot tell
+    "our tests leaked" from "someone else's did", and a gate that goes red for
+    reasons unrelated to the branch under test stops being read as a signal.
 
-    A caveat worth knowing before you debug a red here: this reads files another
-    process on this box can legitimately append to (a real autopilot settlement
-    during a long run). That is why the failure message prints the exact deltas
-    rather than only a boolean, so a genuine concurrent write is one read away
-    from being told apart from a leak.
+    Wrapping JouleWallet.__init__ has neither problem. It observes THIS process's
+    writer at the moment of construction, so it is deterministic, immune to
+    concurrent writers, and strictly broader than guarding settle(): it catches
+    any future code path that opens a wallet, not just the one that leaks today.
     """
-    before = _wallet_fingerprints()
-    yield
-    after = _wallet_fingerprints()
-    if after == before:
+    try:
+        from skcapstone import skjoule
+    except Exception:  # bare harness: nothing can write a wallet at all
+        yield
         return
-    deltas = []
-    for path in sorted(set(before) | set(after)):
-        b, a = before.get(path), after.get(path)
-        if b != a:
-            deltas.append(f"  {path}: {b} -> {a}")
-    raise AssertionError(
-        "a REAL joule wallet changed during this test run. The suite must never "
-        "write to the operator's ledger.\n" + "\n".join(deltas))
+
+    original = skjoule.JouleWallet.__init__
+
+    def _guarded(self, agent_name, home=None, *args, **kwargs):
+        root = Path(home) if home else Path(skjoule.SHARED_ROOT).expanduser()
+        try:
+            resolved = root.expanduser().resolve()
+        except OSError:
+            resolved = root
+        if resolved in joules._production_roots():
+            raise joules.ProductionWalletInTestError(
+                f"a test opened a PRODUCTION joule wallet: "
+                f"{resolved}/agents/{agent_name}/wallet. Constructing a wallet "
+                f"creates its snapshot, and minting into it writes fabricated "
+                f"economic history to the operator's ledger. Pass home=tmp_path, "
+                f"or let the autouse {joules.WALLET_HOME_ENV} default apply.")
+        return original(self, agent_name, home=home, *args, **kwargs)
+
+    skjoule.JouleWallet.__init__ = _guarded
+    try:
+        yield
+    finally:
+        skjoule.JouleWallet.__init__ = original
 
 
 @pytest.fixture(autouse=True)
