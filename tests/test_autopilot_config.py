@@ -37,7 +37,10 @@ def test_missing_file_returns_disabled_default(tmp_path, monkeypatch):
     monkeypatch.delenv("SKOS_AUTOPILOT_CONFIG", raising=False)
     cfg = Config.load(tmp_path / "nope.yaml")
     assert cfg.enabled is False
-    assert cfg.harness == "claude-code"
+    # Was "claude-code" until card 1db15e43 (A4.2). Changed deliberately: pi is the
+    # only adapter that can honour a per-call model override, so a claude-code default
+    # RAISES on every graded card. See config.py's "WHY THE DEFAULT HARNESS IS pi".
+    assert cfg.harness == "pi"
     assert cfg.repo_map == {}
     assert cfg.caps.max_concurrent == 3
     assert cfg.repo("anything") is None

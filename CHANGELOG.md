@@ -9,6 +9,41 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ## [Unreleased]
 
+### Changed
+- **The default harness is now `pi`, not `claude-code`** (card `1db15e43`, A4.2).
+  `BaseCliAdapter.supports_model_override()` is False and only `PiAdapter`
+  overrides it to True; `_run_raw` RAISES `ModelOverrideUnsupported` on a
+  per-call override rather than dropping it, because dropping it would run the
+  call on the statically configured model with the card's sensitivity ceiling
+  discarded. `engineering.py` attaches the graded bucket to every build round
+  and every grade call, so the day anything WRITES a grade, every graded card on
+  a `claude-code` default raises instead of building. Today 0 of ~4,890 cards
+  carry a grade, so the ungraded path is byte-identical and nothing changes in
+  production; pi-default before grading-on is inert, and the reverse order
+  breaks the gated executor. Only the DEFAULT moved: all four fleet configs
+  (`autopilot.yaml`, `autopilot-live.yaml`, `autopilot-canary.yaml`,
+  `autopilot-pi.yaml`) name a harness explicitly and are unaffected.
+
+### Added
+- **"Work that fits pi" is written down** in `autocode/config.py`, as a docstring
+  section and as `fits_pi()` / `requires_pi()`. An undefined scope becomes
+  whatever the first ambiguous card makes it mean. Four legs: the repo resolves
+  in `repo_map`; no `sandbox_image` pin outside `sandbox-pi*` (a repo pin BEATS
+  the adapter's own image, and `sandbox-claude-flutter:1` carries no `pi`
+  binary, measured); graded work fits pi and ONLY pi; session-plane work is not
+  pi work. `fits_pi` returns the REASON it does not fit, not a bare False.
+- **An unrecognised `harness:` name now fails closed at load** with `ConfigError`
+  naming the file, the value and the accepted names. `build_harness` did raise,
+  but only deep inside a run, after the board was assessed and a worktree made.
+  The check is at `load`, not `__post_init__`, on purpose: construction-time
+  validation would make `Config(harness="bogus")` impossible and delete the
+  negative control that proves the execute bridge fails closed on an
+  unresolvable harness. Same house rule as
+  `types.coerce_quality` falling to GATED on a typo and `buckets.BucketError`
+  raising rather than returning None. `KNOWN_HARNESSES` is a literal set (config
+  sits below the adapters in the import graph) pinned to the live registry by a
+  test, so the two cannot drift.
+
 ### Security
 - **A card can no longer select the model that grades it** (card `0b7e3ac3`).
   The twin-gate grader took the build's bucket wholesale, so a card graded
