@@ -76,17 +76,47 @@ def _today() -> str:
 
 
 def record_run(*, card_id: str, repo: str, tokens: int, cost_usd: float,
-               passed: bool, pr: str, ts: str, run_id: str = "") -> None:
+               passed: bool, pr: str, ts: str, run_id: str = "",
+               outcome: str | None = None, adapter: str | None = None,
+               model_requested: str | None = None,
+               model_served: str | None = None, score: int | None = None,
+               retries: int = 0, quality_mode: str | None = None,
+               work_grade: dict | None = None) -> None:
     """Append one run to the ledger. Never raises -- a cost-tracking bug must
     never turn a successful (or a well-formed failed) run into a crash.
 
     ``run_id`` (default "" for back-compat) is the bridge's own journal handle
     stamp (``airun-<card_id>-<YYYYmmddTHHMMSSZ>``), so ledger rows join cleanly
-    against the run journal and the settlement journal (design doc section 6)."""
+    against the run journal and the settlement journal (design doc section 6).
+
+    The eight parameters below (S3, card 20710266) name the same event card
+    8967bf22 (A1)'s RunRecord schema describes; field names are chosen to
+    match it where both schemas cover the same fact (``adapter``,
+    ``model_requested``, ``model_served``, ``quality_mode``, ``score``,
+    ``outcome``), so the two do not diverge:
+
+    ``model_served`` is deliberately Optional with NO default derived from
+    ``model_requested``. Defaulting it would manufacture the exact fact this
+    field exists to detect: during the .100 outage on 2026-08-16, skgateway
+    silently served a cloud model for a sovereign ``sk-default`` request. A
+    caller that does not know what actually served the run must pass None,
+    not the request it made.
+
+    ``work_grade`` carries the Joule Economy grade dict (``size``, ``risk``,
+    ``sensitivity``, ``model_class``) exactly as stored on the card, or None
+    when the card is ungraded; this module never re-derives it.
+
+    NO BACKFILL: rows written before this change carry none of these eight
+    keys at all (not even as null), and nothing on the read path invents a
+    value for them."""
     row = {
         "ts": ts, "date": ts[:10], "card_id": card_id, "repo": repo,
         "tokens": tokens, "cost_usd": cost_usd, "joules": _joules(cost_usd),
         "passed": bool(passed), "pr": pr, "run_id": run_id,
+        "outcome": outcome, "adapter": adapter,
+        "model_requested": model_requested, "model_served": model_served,
+        "score": score, "retries": retries, "quality_mode": quality_mode,
+        "work_grade": work_grade,
     }
     try:
         path = ledger_path()

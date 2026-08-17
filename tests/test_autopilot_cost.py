@@ -105,6 +105,78 @@ def test_record_run_never_raises_on_unwritable_dir(monkeypatch, tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# record_run: outcome fields (S3, card 20710266)                              #
+# --------------------------------------------------------------------------- #
+
+
+def test_record_run_writes_the_new_outcome_fields():
+    autopilot_cost.record_run(
+        card_id="s3-1", repo="skharness", tokens=500, cost_usd=0.25,
+        passed=True, pr="https://x/pr/9", ts="2026-08-17T00:00:00+00:00",
+        run_id="airun-s3-1-20260817T000000Z",
+        outcome="merged", adapter="pi", model_requested="sk-default",
+        model_served="qwen3.6-32b", score=4, retries=1,
+        quality_mode="gated", work_grade={"size": "M", "risk": "med",
+                                          "sensitivity": "internal",
+                                          "model_class": "mid"})
+    row = autopilot_cost._read_ledger()[0]
+    assert row["outcome"] == "merged"
+    assert row["adapter"] == "pi"
+    assert row["model_requested"] == "sk-default"
+    assert row["model_served"] == "qwen3.6-32b"
+    assert row["score"] == 4
+    assert row["retries"] == 1
+    assert row["quality_mode"] == "gated"
+    assert row["work_grade"] == {"size": "M", "risk": "med",
+                                 "sensitivity": "internal", "model_class": "mid"}
+
+
+def test_record_run_model_served_is_optional_and_never_defaults_to_model_requested():
+    # This is the negative control the .100 outage demanded: skgateway can
+    # silently serve a cloud model for a sovereign request. If model_served
+    # defaulted to model_requested, that exact divergence would be erased at
+    # the point of record, which is the one fact this field exists to keep.
+    autopilot_cost.record_run(
+        card_id="s3-2", repo="skharness", tokens=10, cost_usd=0.01,
+        passed=True, pr="", ts="2026-08-17T00:00:00+00:00",
+        model_requested="sk-default")
+    row = autopilot_cost._read_ledger()[0]
+    assert row["model_requested"] == "sk-default"
+    assert row["model_served"] is None
+    assert row["model_served"] != row["model_requested"]
+
+
+def test_record_run_new_fields_default_to_none_when_omitted():
+    # None of the 8 new callers exist yet at the bridge's call site, so every
+    # field must have a safe, non-inventing default.
+    autopilot_cost.record_run(card_id="s3-3", repo="r", tokens=1, cost_usd=0.1,
+                              passed=True, pr="", ts="2026-08-13T00:00:00+00:00")
+    row = autopilot_cost._read_ledger()[0]
+    for key in ("outcome", "adapter", "model_requested", "model_served",
+                "score", "quality_mode", "work_grade"):
+        assert row[key] is None, f"{key} should default to None, got {row[key]!r}"
+    assert row["retries"] == 0
+
+
+def test_read_ledger_parses_a_pre_change_fixture_row_with_no_outcome_fields():
+    # A row exactly as record_run wrote it BEFORE this change: none of the 8
+    # new keys present at all. NO BACKFILL means this must still read cleanly,
+    # and nothing on the read path may invent a value for the missing keys.
+    _write_rows([{
+        "ts": "2026-08-16T12:00:00+00:00", "date": "2026-08-16",
+        "card_id": "pre-change-1", "repo": "skharness", "tokens": 999,
+        "cost_usd": 1.23, "joules": 62, "passed": True, "pr": "",
+        "run_id": "airun-pre-change-1-20260816T120000Z",
+    }])
+    row = autopilot_cost._read_ledger()[0]
+    assert row["card_id"] == "pre-change-1"
+    assert row["passed"] is True
+    for key in ("outcome", "adapter", "model_requested", "model_served",
+                "score", "retries", "quality_mode", "work_grade"):
+        assert key not in row
+
+
+# --------------------------------------------------------------------------- #
 # day_total                                                                   #
 # --------------------------------------------------------------------------- #
 
