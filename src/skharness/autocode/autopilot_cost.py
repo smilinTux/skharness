@@ -84,7 +84,8 @@ def record_run(*, card_id: str, repo: str, tokens: int, cost_usd: float,
                retries: int = 0, quality_mode: str | None = None,
                work_grade: dict | None = None,
                terminal_state: str | None = None,
-               escalation_reason: str | None = None) -> None:
+               escalation_reason: str | None = None,
+               mutation_report: dict | None = None) -> None:
     """Append one run to the ledger. Never raises -- a cost-tracking bug must
     never turn a successful (or a well-formed failed) run into a crash.
 
@@ -158,10 +159,39 @@ def record_run(*, card_id: str, repo: str, tokens: int, cost_usd: float,
     rather than defaulting to ``within_floor``, which would report zero
     escalation forever and read as good news.
 
-    NOTHING READS THESE FIELDS TO ROUTE. They are reporting only. Feeding them
-    back into dispatch would be the autotuner card 09573989 AC6 forbids.
+    ``mutation_report`` (S23, card 33c50540) is the RAW output of the shadow
+    mutation probe (``mutation.probe``): counts of mutants executed, killed,
+    survived and unjudged, the number of mutable sites the diff had, and the
+    bounds the run was given. It is the WORKER-INDEPENDENT outcome label this
+    epic's refusal named as its own reopen condition: the twin gate's CI and
+    coverage arms are satisfied by tests the worker itself authored, whereas the
+    worker cannot author the mutants. A survivor is a changed line the worker's
+    own tests did not notice.
 
-    NO BACKFILL: rows written before this change carry none of these thirteen
+    The seven FACT keys beside it (``mutation_state``, ``mutation_mutants``,
+    ``mutation_killed``, ``mutation_survived``, ``mutation_sites``,
+    ``mutation_complete``, ``mutation_unobserved_reason``) are COMPUTED here
+    from that report rather than accepted from a caller, the same way
+    ``escalation_state`` is computed from ``work_grade`` and ``model_served``:
+    no caller can forget to stamp them, and no caller can stamp a state that
+    disagrees with its own counts. In particular a report carrying a survivor
+    can never write a ``survived_clean`` row.
+
+    Because no producer stamps a report on a ``GateResult`` yet (the one site
+    holding a live worktree at grade time is on the protected floor),
+    ``mutation_state`` is ``unobserved`` with reason ``not_run`` on essentially
+    every live row. That is the honest answer and the ledger says it out loud
+    rather than defaulting to ``survived_clean``, which would report a perfect
+    mutation score forever and read as good news.
+
+    NOTHING READS THESE FIELDS TO ROUTE. They are reporting only. Feeding them
+    back into dispatch would be the autotuner card 09573989 AC6 forbids, and for
+    the mutation label specifically it would also DESTROY the property that
+    makes it worth having: a worker graded on a mutation score writes tests
+    aimed at mutants, and the label stops being independent of the worker the
+    moment the worker is graded on it.
+
+    NO BACKFILL: rows written before this change carry none of these twenty
     keys at all (not even as null), and nothing on the read path invents a
     value for them."""
     try:
@@ -177,6 +207,19 @@ def record_run(*, card_id: str, repo: str, tokens: int, cost_usd: float,
                           "escalation_floor_class": None,
                           "escalation_served_class": None,
                           "escalation_reason": None}
+    try:
+        from . import mutation as _mut
+        mut_fields = _mut.mutation_row(mutation_report)
+    except Exception:  # noqa: BLE001 -- a shadow label must never lose the row
+        log.exception("autopilot_cost.record_run: mutation classification failed")
+        try:
+            from . import mutation as _mut2
+            mut_fields = _mut2.unobserved_row(reason="classifier_error")
+        except Exception:  # noqa: BLE001 -- last resort, still never absent keys
+            mut_fields = {"mutation_state": "unobserved", "mutation_mutants": None,
+                          "mutation_killed": None, "mutation_survived": None,
+                          "mutation_sites": None, "mutation_complete": None,
+                          "mutation_unobserved_reason": "classifier_error"}
     row = {
         "ts": ts, "date": ts[:10], "card_id": card_id, "repo": repo,
         "tokens": tokens, "cost_usd": cost_usd, "joules": _joules(cost_usd),
@@ -185,7 +228,7 @@ def record_run(*, card_id: str, repo: str, tokens: int, cost_usd: float,
         "model_requested": model_requested, "model_served": model_served,
         "grader_model": grader_model, "score": score, "retries": retries, "quality_mode": quality_mode,
         "work_grade": work_grade, "terminal_state": terminal_state,
-        **esc_fields,
+        **esc_fields, **mut_fields,
     }
     try:
         path = ledger_path()
@@ -418,6 +461,40 @@ def escalation_summary(*, since: str | None = None) -> dict:
     except Exception:  # noqa: BLE001 -- a report bug must never break a caller
         log.exception("autopilot_cost.escalation_summary: failed")
         return {"by_class": {}, "totals": {}, "ungraded_rows": 0}
+
+
+def mutation_summary(*, since: str | None = None) -> dict:
+    """Shadow mutation-label distribution over the ledger (S23, card 33c50540).
+
+    Returns ``{rows, survived_clean, mutants_survived, unobserved, observed,
+    observed_fraction, survival_rate}``.
+
+    This is the read that makes the epic's refusal FALSIFIABLE. The refusal
+    rests on "the twin gate is satisfied by tests the worker authored"; this
+    number is produced by mutants the worker did not author. Someone can now
+    point at it and argue the reopen condition is met, or point at it and argue
+    it is not. Before this, neither was possible.
+
+    Read it WITH ``observed_fraction``. ``survival_rate`` is None rather than
+    0.0 when nothing was observed, and today that is the normal case: no
+    producer stamps a report yet, so essentially every row is ``unobserved``
+    and a 0.0 survival rate would be the most reassuring possible way to say
+    nothing. NOTHING ROUTES ON THIS: it is a reporting read, like
+    ``escalation_summary`` beside it.
+
+    ``since`` optionally restricts to rows on or after an ISO date. Never
+    raises, matching the rest of this module's read helpers.
+    """
+    try:
+        from . import mutation
+        rows = _read_ledger()
+        if since:
+            rows = [r for r in rows if (r.get("date") or "") >= since]
+        return mutation.mutation_rates(rows)
+    except Exception:  # noqa: BLE001 -- a report bug must never break a caller
+        log.exception("autopilot_cost.mutation_summary: failed")
+        return {"rows": 0, "observed": 0, "observed_fraction": 0.0,
+                "survival_rate": None}
 
 
 def recent_settlements(limit: int = 20) -> list[dict]:

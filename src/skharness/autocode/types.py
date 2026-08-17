@@ -155,6 +155,16 @@ class GateResult:
     #   budget ceiling at orchestrator.py:800, which today always adds zero because
     #   GateResult never carried this field.
     cost_usd: float = 0.0             # accumulated dollar cost, same repair as tokens.
+    mutation_report: dict | None = None   # S23 (card 33c50540): the RAW report of the
+    #   shadow mutation probe (mutation.probe) over this build's changed lines, or None
+    #   when no probe ran. SHADOW ONLY: twin_gate_passed does not read it, no policy and
+    #   no dispatch decision may read it, and tests/test_autocode_mutation.py section 5
+    #   proves that statically over the whole package and behaviourally over both the
+    #   gate and the model choice. It is carried here purely so the orchestrator's
+    #   outcome row can record a label the WORKER DID NOT AUTHOR beside the score the
+    #   worker's own tests helped produce. The default None preserves every existing
+    #   construction site and, crucially, classifies as `unobserved` rather than as a
+    #   clean sweep: an unset shadow label must never read as good news.
 
     def __post_init__(self):
         if self.outcome not in GATE_OUTCOMES and self.outcome != UNRECORDED:

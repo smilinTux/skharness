@@ -215,6 +215,15 @@ def record_outcome_row(item, *, terminal_state: str, run_id: str, result=None,
                           else payload.get("quality")),
             work_grade=payload.get("work_grade"),
             escalation_reason=reason_from_payload(payload),
+            # S23 (card 33c50540): the shadow, WORKER-INDEPENDENT label. Read
+            # off the GateResult rather than computed here, because the probe
+            # needs a live worktree and this function runs at a terminal state
+            # where the worktree may already be pruned. It is None on every row
+            # today (no executor stamps it yet), and record_run classifies that
+            # as `unobserved` with reason `not_run`, never as a clean sweep.
+            # Forwarding it and nothing more is deliberate: this function WRITES
+            # the label and never reads it back, so the shadow seam stays shut.
+            mutation_report=getattr(result, "mutation_report", None),
         )
     except Exception as exc:      # noqa: BLE001 - telemetry never breaks a build
         health.record("outcome_row_error", task=getattr(item, "ref", ""),
