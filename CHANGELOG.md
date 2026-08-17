@@ -34,6 +34,31 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   on capability class, and two rows whose classes track each other is the defect
   returning.
 ### Fixed
+- **S25: the grading-floor guard now composes across a multi-card branch, without
+  being weakened** (card `3f6719e4`). `test_no_file_on_the_grading_floor_was_modified`
+  measured `origin/main...HEAD` and called the result "what this card did". True
+  for one card, false for a branch that composes nine: S12 touches no floor file,
+  S14 legitimately touches `buckets.py`, and S12's guard reported S14's work as
+  S12's violation. Every card was individually compliant and the composition was
+  red, structurally, on every future integration pass regardless of merit.
+  The rule is unchanged; only the measurement moved. A floor change is still a
+  violation unless it appears in `tests/data/grading-floor-allowances.json`, a
+  human-written list with a card and a written reason per entry. Each entry pins
+  a git BLOB SHA, not a path, so the exception covers exactly the post-image that
+  was read and dies the moment the file changes again. That list is itself on
+  `protected._ALWAYS_PROTECTED`, so a diff that adds an allowance can never
+  auto-merge; "reviewed, not automatic" is structural rather than conventional.
+  Every failure to MEASURE is now a violation too: the old form called
+  `pytest.skip` when `origin/main` was missing, which is a guard reporting success
+  over an unmeasured floor. It now raises `FloorCheckError`, and a deleted floor
+  file hashes to a sentinel no pin can match. Two negative controls mutate
+  `model_class` derivation (in `bucket_id`, inside the ALLOWED file, and in
+  `grading.model_class_for`, outside it) and prove the guard still fires.
+  DISPOSITION RECORDED: S14's `buckets.py` change (import of
+  `assert_routing_field` plus two lines in `attach_dispatch_model`) is accepted.
+  It changes no grading semantics, only which attribute name the routing layer
+  may write. Human sign-off goes to Chef with the branch and the allowance file
+  says so in the entry.
 - **S18: `record_success` is wired, so S9's symmetric memory is no longer
   dormant.** `Board.record_success`, the `successes[]` sibling key,
   `build_prior_success_feedback`, its own renderer and 25 passing tests all
@@ -173,14 +198,57 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
     suite that passes and satisfies both the CI and the coverage arm. The run
     was incomplete and the `mutants_survived` verdict still stands, which is
     the asymmetry working: a survivor found in a sample is a real survivor.
+
+- **pi now sends `x-session-id` and `x-sk-card-id` to skgateway, so a harness run
+  can be joined to the gateway row that describes it.** Measured first: pi's
+  baseline request carries no identifying header at all (host, Accept, the
+  OpenAI-JS `X-Stainless-*` block, `authorization`, and nothing else), which is
+  why `request_log.agent_id` and `session_id` are null for every harness run. pi
+  reads a provider-level `headers` map out of the same `models.json` the adapter
+  already generates per call, so this is a config change rather than new
+  plumbing. Values are baked in as LITERALS and never as `$VAR` interpolation:
+  with the variable unset pi makes NO request at all, reports an internal error,
+  and still exits 0, which `_parse` turns into `{}`, so an unset variable would
+  be a total failure invisible by exit code. Values are validated against a
+  conservative token charset and REFUSED rather than escaped, because a leading
+  `!` in a pi header value executes a shell command on every request. When no ids
+  are supplied the `headers` key is absent entirely, never an empty map: "no
+  session" and "session is empty" are different facts. `compat`'s session
+  affinity keys are deliberately never written, so the harness is the single
+  source of `x-session-id`.
+- **A per-process agent / session / node identity, so two concurrent sessions on
+  one box are no longer indistinguishable.** Every session on this fleet writes
+  to the coordination board as the same AGENT name, so the overlay log's 2,027
+  events carry only three distinct writers and four concurrent sessions collapse
+  into one. `autocode.identity.resolve_identity()` mints a uuid4 session id once
+  per process (honouring `SK_SESSION_ID` so a resumed run keeps its identity) and
+  resolves the agent through the documented `SKAGENT` > `SKCAPSTONE_AGENT` >
+  `SKMEMORY_AGENT` > `lumina` precedence. It also records WHICH variable it read,
+  as `agent_var` / `session_id_var`, because that ambiguity is real in
+  production: one systemd unit on .41 sets `SKAGENT=jarvis`,
+  `SKMEMORY_AGENT=lumina` and `SKCHAT_IDENTITY=capauth:opus@skworld.io`
+  simultaneously, and recording only the resolved value destroys information that
+  cannot be reconstructed. A variable set to an empty or whitespace value counts
+  as unset and falls through, so a bare `Environment=SKAGENT=` cannot pin the
+  agent to the empty string. `AutocodeSessionRegistry.register()` now defaults its
+  sid and host from the same resolver, so the on-disk session descriptor and the
+  run record cannot disagree. Nothing backfills: historical events never carried a
+  session id and any value written onto them now would be a guess.
 - **Graded dispatch: a card's grade now selects the model.** `model_class` and
   `sensitivity` map onto a skgateway bucket id (`sk-<class>-<sensitivity>`),
-  replacing the single static `autocode.config.harness_model`. Bucket ids are
-  validated against the gateway's exact grammar BEFORE being sent, because a
-  typo is not a loud error at the gateway: an id that fails the bucket regex is
-  still caught as `sk-*` and falls through to the difficulty classifier,
-  returning 200 from an arbitrary model with no sensitivity ceiling enforced. A
-  single typo would otherwise discard every sovereignty guarantee.
+  intended to replace the single static `autocode.config.harness_model`.
+  **Correction (2026-08-16, card S15):** that replacement has not happened yet.
+  Only the `pi` adapter implements `supports_model_override()`; `claude_code`
+  and `opencode` still raise `ModelOverrideUnsupported`, `codex` is an
+  unimplemented stub, no card currently carries a grade, and the gateway's
+  `buckets_enabled` is off. `config.harness_model` remains the only live model
+  selector today. See `docs/superpowers/specs/2026-08-16-b3-b4-closure-decisions.md`.
+  Bucket ids are validated against the gateway's exact grammar BEFORE being
+  sent, because a typo is not a loud error at the gateway: an id that fails
+  the bucket regex is still caught as `sk-*` and falls through to the
+  difficulty classifier, returning 200 from an arbitrary model with no
+  sensitivity ceiling enforced. A single typo would otherwise discard every
+  sovereignty guarantee.
 - **A per-call model override seam** in the adapters, threaded like the existing
   `light` flag. `ModelOverrideUnsupported` is raised rather than silently
   dropping an override an adapter cannot honour, since dropping it would run on
@@ -224,6 +292,43 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   follow-up once the gate has run clean).
 
 ### Fixed
+- **The sandbox egress proxy no longer sends two `Host` headers.** `_forward()`
+  built its outbound headers as a comprehension over `self.headers.items()`,
+  which preserves the CLIENT's casing, so a client's lowercase `host` survived
+  and the following `headers["Host"] = ...` added a SECOND, distinct dict key.
+  `_HOP_BY_HOP` does not list host, so nothing removed the first, and both went
+  on the wire. RFC 7230 section 5.4 says a server MUST reject that as 400; only
+  skgateway's tolerance kept it invisible. The outbound dict is now
+  `_RequestHeaders`, whose field names compare case-insensitively, so any header
+  the proxy overrides replaces the client's whatever case it arrived in. Fixing
+  the class of bug rather than special-casing Host, because the same trap was
+  waiting for the next override. Proven by capturing raw bytes at a socket
+  origin: a `BaseHTTPRequestHandler` upstream folds duplicate headers away and
+  cannot observe this defect at all.
+- **The sandbox egress proxy refuses `https://` absolute-URI forwards instead of
+  silently downgrading them to cleartext.** `_target_host()` accepted https
+  paths, but `_forward()` only ever built an `http.client.HTTPConnection` on
+  `parsed.port or 80` and the module originates no TLS, so such a request went
+  out in the clear, `Authorization` header included, by default to port 80. Not
+  reachable through today's plain-HTTP skgateway flow, and https normally
+  arrives as CONNECT (the separate blind tunnel, which is correct and stays end
+  to end), but it was a live trap for the next sandbox pointed at an https
+  endpoint. The proxy is a confinement boundary, so it fails closed: 501 with an
+  explanation pointing at CONNECT. The allowlist check still runs first, so a
+  denied host keeps its 403 rather than degrading into 501.
+- **An autopilot config key this loader does not understand now raises instead of
+  being silently dropped.** Measured on `~/.skcapstone/config/autopilot-pi.yaml`
+  (2026-08-16): the file set `new_tasks_per_run: 1` at the TOP level, but
+  `Config.load` only ever read that name out of the `caps:` block, so the key was
+  filtered away and the default of 10 applied. Nothing distinguished a misplaced
+  key from a correct one at runtime, and the operator who wrote 1 believed the run
+  was capped at 1. `Config.load` now raises `ConfigError` on an unknown key at all
+  three filtered levels (top level, `caps:`, each `repo_map:` entry), naming the
+  file and the block. This follows the same fail-closed discipline as
+  `types.coerce_quality` (falls to GATED, never to a permissive mode) and
+  `buckets.BucketError` (raises rather than returning None, because returning None
+  would silently widen). Dropping a key silently widens a cap. The known-key sets
+  are derived from the dataclass fields so the lint cannot drift from the parser.
 - **The work-grade policy is now on autocode's hard-coded protected floor.**
   `_ALWAYS_PROTECTED` covered `protected.py`, `engineering.py`, the fleet store,
   `itil.py`, the manifest and the freeze file, but not `grading.py`,

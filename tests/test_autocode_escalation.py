@@ -28,11 +28,13 @@ No em/en dashes anywhere (SKWorld hard rule).
 from __future__ import annotations
 
 import json
+import subprocess
+from fnmatch import fnmatch
 from pathlib import Path
 
 import pytest
 
-from skharness.autocode import autopilot_cost
+from skharness.autocode import autopilot_cost, protected
 from skharness.autocode import escalation as esc
 
 
@@ -423,35 +425,327 @@ def test_the_escalation_module_cannot_address_a_bucket():
     assert "match" in called and "escalation_rates" not in _ADDRESS_PRODUCERS
 
 
-#: The grading half of protected._ALWAYS_PROTECTED (protected.py:47-58): the
-#: rubric, the deterministic exposure rules, grade-to-trust-zone addressing, the
-#: vendored enums and the calibration reference. AC4 forbids touching any of them.
+# ---------------------------------------------------------------------------
+# AC4: nothing on the grading floor was modified.
+#
+# S25 (card 3f6719e4) rewrote the MEASUREMENT, not the rule. The rule is
+# unchanged and unweakened: a file on the grading floor that differs from the
+# branch's base is a violation.
+#
+# What changed is that the old form measured `origin/main...HEAD` and called the
+# result "what this card did". On one card that is true. On a branch that
+# composes nine cards it is not: card A touches no floor file, card B
+# legitimately does, and A's guard then reports B's work as A's violation. Every
+# card was individually compliant and the composition was red, for a structural
+# reason that would recur on every future integration pass regardless of merit.
+#
+# The fix is an ALLOWANCE, and the shape of the allowance is the whole point:
+#
+#   * It is enumerated and human-authored, in tests/data/grading-floor-allowances.json.
+#     There is no pattern, no "recent commits are fine", no environment variable.
+#     An unlisted floor change is a violation, exactly as before.
+#   * It is pinned to CONTENT (a git blob sha), not to a path. A path allowance
+#     would be a permanent hole that every later edit rides through. A content
+#     pin dies the moment the file changes again, so the next change gets its
+#     own review. See the negative controls below, which prove that a
+#     grading-semantic edit to the ALLOWED file is still red.
+#   * The allowance list is itself on protected._ALWAYS_PROTECTED, so a diff that
+#     adds an entry can never auto-merge. "Reviewed, not automatic" is enforced
+#     by the same machinery this guard belongs to, not by convention.
+#   * Every failure to MEASURE is a violation. No skip. A guard that passes
+#     because it could not compute the diff is worse than no guard, and this
+#     epic exists because ten mechanisms already failed that way.
+# ---------------------------------------------------------------------------
+
+#: The grading half of protected._ALWAYS_PROTECTED: the rubric, the deterministic
+#: exposure rules, grade-to-trust-zone addressing, the vendored enums and the
+#: calibration reference. AC4 forbids touching any of them.
 _GRADING_FLOOR = ("*/skharness/autocode/grading.py", "*/skharness/autocode/sensitivity.py",
                   "*/skharness/autocode/buckets.py",
                   "*/autocode/data/joule-grade-vocabulary.json",
                   "*/tests/data/joule-economy-golden-set-*.json")
 
+#: The reviewed exceptions. Repo-relative on purpose: it must be greppable and it
+#: must appear in a diff.
+_ALLOWANCES_REL = "tests/data/grading-floor-allowances.json"
+
+#: Bases tried in order. The point is not convenience, it is that a shallow or
+#: detached checkout must produce an ERROR rather than a pass.
+_BASE_REFS = ("origin/main", "origin/HEAD", "main")
+
+
+class FloorCheckError(RuntimeError):
+    """The floor check could not be COMPUTED.
+
+    Deliberately not a skip. If the base is missing, the diff fails, or the
+    allowance list is unreadable, we do not know whether the floor was touched,
+    and "we do not know" must read as red. A green that means "unmeasured" is
+    indistinguishable from a green that means "clean", which is the exact defect
+    this epic catalogued ten times over.
+    """
+
+
+def _repo_root() -> Path:
+    return _SRC.parents[2]
+
+
+def _git(repo, *args) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=True)
+
+
+def _resolve_base(repo) -> str:
+    """First ref in _BASE_REFS that actually resolves to a commit.
+
+    Raises FloorCheckError if none do (no git, not a repo, shallow clone with no
+    remote-tracking ref, ...). Fail closed.
+    """
+    for ref in _BASE_REFS:
+        proc = _git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+        if proc.returncode == 0 and proc.stdout.strip():
+            return ref
+    raise FloorCheckError(
+        f"no base ref among {_BASE_REFS} resolves in {repo}. The grading-floor "
+        "check cannot be computed, so it reports a failure rather than passing: "
+        "an unmeasured floor is not a clean floor.")
+
+
+def _on_grading_floor(path: str) -> bool:
+    """True if repo-relative *path* is on the grading floor."""
+    return any(fnmatch("/" + path, g) for g in _GRADING_FLOOR)
+
+
+def _changed_floor_paths(repo, base: str) -> list[str]:
+    """Floor files that differ from *base*, in committed history OR the worktree.
+
+    Both halves are kept from the original guard: `base...HEAD` covers the branch
+    and its own base, `diff HEAD` covers uncommitted edits, so a floor change
+    cannot hide by simply not being committed yet.
+    """
+    seen: list[str] = []
+    for args in ([f"{base}...HEAD"], []):
+        proc = _git(repo, "diff", "--name-only", *(args or ["HEAD"]))
+        if proc.returncode != 0:
+            raise FloorCheckError(
+                f"git diff {args or ['HEAD']} failed in {repo}: "
+                f"{proc.stderr.strip()[:200]}")
+        seen += proc.stdout.split()
+    return sorted({p for p in seen if _on_grading_floor(p)})
+
+
+def _content_blob(repo, path: str) -> str:
+    """git blob sha of the CURRENT content of *path*.
+
+    A path that cannot be hashed (deleted, unreadable) returns a sentinel that no
+    pinned sha can ever equal, so a floor file that was REMOVED is a violation
+    rather than an absence of evidence.
+    """
+    proc = _git(repo, "hash-object", "--", path)
+    sha = proc.stdout.strip()
+    if proc.returncode != 0 or not sha:
+        return f"<unhashable:{path}>"
+    return sha
+
+
+def _load_allowances(path) -> list[dict]:
+    """Read the reviewed-exception list, failing closed to "allow nothing"."""
+    try:
+        doc = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    entries = doc.get("allowances") if isinstance(doc, dict) else None
+    return [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
+
+
+def _floor_violations(changed_blobs: dict, allowances: list) -> list:
+    """The whole decision, as a pure function so it can be negative-controlled.
+
+    *changed_blobs* maps a repo-relative floor path to the blob sha of its
+    current content. Returns a list of (path, why); empty means clean.
+    """
+    index: dict[str, dict] = {}
+    problems: list = []
+    for entry in allowances:
+        # An entry without a path, a content pin, a card and a written reason is
+        # not a review, it is a wildcard with paperwork. Refuse the whole list.
+        missing = [f for f in ("path", "blob", "card", "reason") if not entry.get(f)]
+        if missing:
+            problems.append((_ALLOWANCES_REL,
+                             f"allowance entry is missing {missing}: {entry!r}"))
+            continue
+        if not _on_grading_floor(entry["path"]):
+            problems.append((_ALLOWANCES_REL,
+                             f"allowance names {entry['path']!r}, which is not on "
+                             "the grading floor; entries must be exact floor paths"))
+            continue
+        index[entry["path"]] = entry
+    if problems:
+        return problems
+
+    for path in sorted(changed_blobs):
+        entry = index.get(path)
+        if entry is None:
+            problems.append((path, "changed, is on the grading floor, and has no "
+                                   f"reviewed allowance in {_ALLOWANCES_REL}"))
+        elif entry["blob"] != changed_blobs[path]:
+            problems.append((path, f"changed. The allowance (card {entry['card']}) "
+                                   f"pins blob {entry['blob'][:12]}, the content is "
+                                   f"{changed_blobs[path][:12]}. A reviewed "
+                                   "exception covers ONE post-image; this is a "
+                                   "different one and needs its own review."))
+    return problems
+
 
 def test_no_file_on_the_grading_floor_was_modified():
-    """AC4, checked against origin/main so it covers this branch AND its base."""
-    import subprocess
-    from fnmatch import fnmatch
-
-    from skharness.autocode import protected
-
-    # Positive control: every glob asserted here really is on the hard floor, so
+    """AC4, measured against the branch base and reconciled with the reviewed
+    exception list. Green means: every floor file that differs from the base was
+    read by a human, who wrote down why, and the content still matches what they
+    read."""
+    # Positive control 1: every glob asserted here really is on the hard floor, so
     # a future edit to protected.py cannot quietly shrink what this test guards.
     for g in _GRADING_FLOOR:
         assert g in protected._ALWAYS_PROTECTED, g
 
-    repo = _SRC.parents[2]
-    changed: list[str] = []
-    for args in (["diff", "--name-only", "origin/main...HEAD"],
-                 ["diff", "--name-only", "HEAD"]):
-        proc = subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True)
-        if proc.returncode != 0:
-            pytest.skip(f"git unavailable or no origin/main: {proc.stderr.strip()[:80]}")
-        changed += proc.stdout.split()
-    assert changed, "empty diff means this assertion certifies nothing"
-    hits = [p for p in changed for g in _GRADING_FLOOR if fnmatch("/" + p, g)]
-    assert hits == [], hits
+    # Positive control 2: the allowance list is ITSELF protected. If it were not,
+    # the engine could grant itself permission to rewrite the rubric, and this
+    # whole mechanism would be a mute button with extra steps.
+    assert any(fnmatch("/" + _ALLOWANCES_REL, g) for g in protected._ALWAYS_PROTECTED), \
+        f"{_ALLOWANCES_REL} must be on protected._ALWAYS_PROTECTED"
+
+    # Positive control 3: the matcher demonstrably separates floor from not-floor.
+    # This replaces the old "the diff must be non-empty" control, which certified
+    # nothing on a branch whose diff is legitimately empty and would have failed
+    # on main.
+    assert _on_grading_floor("src/skharness/autocode/grading.py")
+    assert not _on_grading_floor("src/skharness/autocode/orchestrator.py")
+
+    repo = _repo_root()
+    base = _resolve_base(repo)
+    changed = {p: _content_blob(repo, p) for p in _changed_floor_paths(repo, base)}
+    violations = _floor_violations(changed, _load_allowances(repo / _ALLOWANCES_REL))
+    assert violations == [], violations
+
+
+def test_the_floor_check_composes_over_a_single_card_and_an_integration_branch():
+    """The defect this card exists to fix: the check must give the same verdict
+    on one card's branch and on the branch that composes it with others."""
+    repo = _repo_root()
+    allowances = _load_allowances(repo / _ALLOWANCES_REL)
+    buckets = "src/skharness/autocode/buckets.py"
+
+    # SINGLE-CARD shape. S12's own branch touched no floor file, so the set of
+    # changed floor files is empty and the verdict is clean.
+    assert _floor_violations({}, allowances) == []
+
+    # COMPOSED shape. The integration branch also carries S14's reviewed change
+    # to buckets.py. Same verdict, because the composition is exactly the set of
+    # reviewed exceptions and nothing else.
+    composed = {buckets: _content_blob(repo, buckets)}
+    assert _floor_violations(composed, allowances) == []
+
+    # ... and composing is not a licence. A tenth card that lands an unreviewed
+    # floor change on the same branch is still red, and the message names it.
+    plus_unreviewed = dict(composed)
+    plus_unreviewed["src/skharness/autocode/sensitivity.py"] = "0" * 40
+    hits = _floor_violations(plus_unreviewed, allowances)
+    assert [p for p, _ in hits] == ["src/skharness/autocode/sensitivity.py"], hits
+
+
+def _blob_of(text: str) -> str:
+    """Real git blob sha of *text*, so the negative controls hash real mutated
+    source rather than asserting against a made-up string."""
+    proc = subprocess.run(["git", "hash-object", "--stdin"], input=text,
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout.strip()
+
+
+def test_negative_control_a_grading_change_to_an_allowed_file_is_still_red():
+    """THE control that decides whether the allowance is a review or a mute.
+
+    buckets.py IS allowed on this branch. Mutate model_class derivation inside
+    it anyway (bucket_id is where a model_class becomes a routing address) and
+    the guard must still fire, because the allowance is pinned to the exact
+    reviewed content and this is not that content.
+    """
+    repo = _repo_root()
+    buckets = "src/skharness/autocode/buckets.py"
+    allowances = _load_allowances(repo / _ALLOWANCES_REL)
+    assert any(a.get("path") == buckets for a in allowances), \
+        "this control proves nothing unless buckets.py is actually allowed"
+    assert _floor_violations({buckets: _content_blob(repo, buckets)}, allowances) == [], \
+        "baseline must be green, or the red below is not caused by the mutation"
+
+    src = (_SRC / "buckets.py").read_text(encoding="utf-8")
+    anchor = "    cls = model_class.strip().lower()"
+    assert anchor in src, "anchor moved; re-point this negative control at bucket_id"
+    # Silently collapse the rubric's top class onto the one below it: an XL card
+    # would route a rung down, forever, and nothing else in the file changes.
+    mutated = src.replace(
+        anchor,
+        '    cls = model_class.strip().lower()\n'
+        '    cls = "l" if cls == "xl" else cls  # NEGATIVE CONTROL, never ship')
+    assert mutated != src
+
+    hits = _floor_violations({buckets: _blob_of(mutated)}, allowances)
+    assert [p for p, _ in hits] == [buckets], hits
+    assert "needs its own review" in hits[0][1], hits
+
+
+def test_negative_control_a_grading_change_to_an_unallowed_file_is_red():
+    """The same mutation class one file over, in grading.py's model_class_for,
+    which has no allowance at all."""
+    repo = _repo_root()
+    grading = "src/skharness/autocode/grading.py"
+    allowances = _load_allowances(repo / _ALLOWANCES_REL)
+    assert not any(a.get("path") == grading for a in allowances)
+
+    src = (_SRC / "grading.py").read_text(encoding="utf-8")
+    anchor = "def model_class_for(size: str, risk: str) -> str:"
+    assert anchor in src, "anchor moved; re-point this negative control"
+    mutated = src.replace(anchor, anchor + "\n    return CLASS[0]  # NEGATIVE CONTROL")
+    assert mutated != src
+
+    hits = _floor_violations({grading: _blob_of(mutated)}, allowances)
+    assert [p for p, _ in hits] == [grading], hits
+    assert "no reviewed allowance" in hits[0][1], hits
+
+
+def test_a_deleted_floor_file_is_a_violation_not_an_absence_of_evidence():
+    repo = _repo_root()
+    buckets = "src/skharness/autocode/buckets.py"
+    allowances = _load_allowances(repo / _ALLOWANCES_REL)
+    hits = _floor_violations({buckets: f"<unhashable:{buckets}>"}, allowances)
+    assert [p for p, _ in hits] == [buckets], hits
+    assert _content_blob(repo, "src/skharness/autocode/does-not-exist.py").startswith(
+        "<unhashable:")
+
+
+def test_an_unresolvable_base_fails_closed_rather_than_skipping(tmp_path):
+    """A shallow clone or a CI checkout with no origin/main must ERROR. The old
+    form called pytest.skip here, which is a guard that reports success when it
+    measured nothing."""
+    with pytest.raises(FloorCheckError) as exc:
+        _resolve_base(tmp_path)
+    assert "cannot be computed" in str(exc.value)
+
+
+def test_an_unreadable_or_tampered_allowance_list_allows_nothing(tmp_path):
+    buckets = "src/skharness/autocode/buckets.py"
+    real = _content_blob(_repo_root(), buckets)
+
+    # Missing file, unparseable file, wrong shape: all read as "allow nothing".
+    assert _load_allowances(tmp_path / "absent.json") == []
+    (tmp_path / "broken.json").write_text("{not json", encoding="utf-8")
+    assert _load_allowances(tmp_path / "broken.json") == []
+    (tmp_path / "wrong.json").write_text('{"allowances": "everything"}', encoding="utf-8")
+    assert _load_allowances(tmp_path / "wrong.json") == []
+    assert _floor_violations({buckets: real}, []) != []
+
+    # An entry with no written reason, or one that names something off the floor,
+    # invalidates the LIST rather than being ignored, so a half-filled entry
+    # cannot quietly widen the exception.
+    no_reason = [{"path": buckets, "blob": real, "card": "x", "reason": ""}]
+    assert _floor_violations({buckets: real}, no_reason) != []
+    off_floor = [{"path": "src/skharness/autocode/orchestrator.py", "blob": real,
+                  "card": "x", "reason": "y"}]
+    assert _floor_violations({}, off_floor) != []

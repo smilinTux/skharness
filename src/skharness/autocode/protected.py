@@ -59,6 +59,16 @@ _ALWAYS_PROTECTED: tuple[str, ...] = (
     "*autocode/data/joule-grade-vocabulary.json",
     "*/tests/data/joule-economy-golden-set-*.json",  # the calibration reference
     "*tests/data/joule-economy-golden-set-*.json",
+    # The REVIEWED EXCEPTIONS to the grading floor (S25, card 3f6719e4). This
+    # file is how an accepted change to grading.py / sensitivity.py / buckets.py
+    # / the vocabulary / the golden set is recorded, so it is exactly as powerful
+    # as the floor it excepts: anything that can write this list can write the
+    # rubric. It is therefore floor itself, and a diff that adds an allowance can
+    # never auto-merge, it always escalates. That is what makes the allowance
+    # mechanism REVIEWED rather than automatic, structurally rather than by
+    # convention.
+    "*/tests/data/grading-floor-allowances.json",
+    "*tests/data/grading-floor-allowances.json",
     # The COVERAGE INSTRUMENT'S OWN CONFIGURATION (S21, card 53b8c8be). The twin
     # gate's third arm measures the diff with `pytest --cov`; the files below
     # decide WHAT is measured. A diff that adds an `omit` rule blinds the
