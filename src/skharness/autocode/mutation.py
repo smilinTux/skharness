@@ -556,12 +556,16 @@ def mutation_rates(rows) -> dict:
 def main(argv: list[str] | None = None) -> int:
     """``python -m skharness.autocode.mutation --worktree ... --repo ...``
 
-    The label is only worth building if somebody can actually run it today. The
-    orchestrator cannot: the ONE site that holds a live worktree at grade time
-    is ``engineering.py``, which is on the protected floor and outside this
-    card's scope to modify. So the module carries its own entry point, and a
-    human (or a follow-up card wiring the executor) can produce real data over
-    any branch without waiting on that.
+    The label is only worth building if somebody can actually run it. When S23
+    built this module the autopilot could not: the ONE site holding a live
+    worktree at grade time is ``engineering.py``, on the protected floor and
+    outside that card's scope. S26 (card 788425b8) opened exactly that site, so
+    a gated build now produces this reading by itself.
+
+    This entry point STAYS, and not merely for history. It is the only way to
+    take a reading over an ARBITRARY branch without running a gated build, which
+    is what a human needs to check the instrument itself, and it is the negative
+    control for the live path: the two must agree on the same worktree.
 
     Prints the raw report AND the derived state as JSON. It writes no ledger
     row: recording is the caller's decision, and a probe that wrote rows by

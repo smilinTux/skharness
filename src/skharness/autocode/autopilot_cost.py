@@ -177,12 +177,15 @@ def record_run(*, card_id: str, repo: str, tokens: int, cost_usd: float,
     disagrees with its own counts. In particular a report carrying a survivor
     can never write a ``survived_clean`` row.
 
-    Because no producer stamps a report on a ``GateResult`` yet (the one site
-    holding a live worktree at grade time is on the protected floor),
-    ``mutation_state`` is ``unobserved`` with reason ``not_run`` on essentially
-    every live row. That is the honest answer and the ledger says it out loud
-    rather than defaulting to ``survived_clean``, which would report a perfect
-    mutation score forever and read as good news.
+    When S23 landed, NO producer stamped a report on a ``GateResult`` (the one
+    site holding a live worktree at grade time is on the protected floor), so
+    ``mutation_state`` was ``unobserved`` with reason ``not_run`` on every live
+    row. S26 (card 788425b8) opened that site: the gated executor now stamps a
+    real report on the rounds that end a build with a green suite. Every other
+    row is still ``not_run``, and rows written before S23 carry no mutation keys
+    at all. That is the honest answer and the ledger says it out loud rather
+    than defaulting to ``survived_clean``, which would report a perfect mutation
+    score forever and read as good news.
 
     NOTHING READS THESE FIELDS TO ROUTE. They are reporting only. Feeding them
     back into dispatch would be the autotuner card 09573989 AC6 forbids, and for

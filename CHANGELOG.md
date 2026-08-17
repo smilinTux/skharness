@@ -9,7 +9,43 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ## [Unreleased]
 
+### Added
+- **The shadow mutation probe is now CALLED on the live path** (card `788425b8`,
+  S26). S23 built the worker-independent outcome label, gave it 43 tests and
+  merged it, and nothing anywhere called `mutation.probe`: a module with no
+  caller and no module at all produce byte-identical behaviour, and the tests
+  are green either way. That is instance ELEVEN of the failure class this epic
+  catalogued (card `bb536f68`), and it had formed around the one artifact that
+  makes the epic's central refusal falsifiable instead of permanent.
+  `EngineeringExecutor._shadow_mutation_report` is the one live caller, at the
+  only grade-time site holding a live worktree and the diff. It runs at most
+  ONCE per build and only on a round about to end the build with a green suite
+  (a twin-gate pass or a salvage); both imply CI green, which is what the probe
+  needs, since it requires a green baseline and on a red build could only spend
+  a full suite run to report `baseline_red`. Bounds are the module's own
+  defaults (`max_mutants`, a wall-clock budget, a per-mutant timeout), restated
+  as overridable class attributes defaulting to None so the bound keeps exactly
+  one definition; `autopilot.yaml` gets no new knob for a probe nobody has yet
+  needed to tune.
+
 ### Changed
+- **`mutation.py` joins `protected._ALWAYS_PROTECTED`** (card `788425b8`). The
+  label's entire value is that THE WORKER CANNOT AUTHOR THE MUTANTS, so a worker
+  able to edit the operator table can weaken its own independent grader, and
+  invisibly: a smaller table yields a well-formed `survived_clean` row rather
+  than an error. Same reasoning as the rubric (S9) and the coverage config
+  (S21): an engine that can move the instrument does not need to satisfy it.
+  S23 could not add this because `protected.py` was under a sibling's guard.
+- **The no-consumer guard is TIGHTENED, not relaxed**, to admit the one
+  legitimate caller. `tests/test_autocode_mutation.py` section 5 pinned
+  `callers == []`, which was true and was the defect; it now pins the caller
+  count at exactly one AND pins it to the shadow site, so a second consumer is
+  still red. The shadow site's own guard moved from grep to AST (it must be free
+  to explain the seam in prose, and this section's own rule is that a docstring
+  naming a thing is not a use of it): it may name the raw report and reach the
+  module through its namespace, but may not name a state, may not import names
+  out of the module, and may not READ the label back. Every other routing module
+  is still scanned raw and banned outright. The label still gates NOTHING.
 - **The default harness is now `pi`, not `claude-code`** (card `1db15e43`, A4.2).
   `BaseCliAdapter.supports_model_override()` is False and only `PiAdapter`
   overrides it to True; `_run_raw` RAISES `ModelOverrideUnsupported` on a
