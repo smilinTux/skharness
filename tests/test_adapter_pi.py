@@ -106,3 +106,98 @@ def test_config_files_budget_overridable():
     # default when unset is the generous ceiling
     b = PiAdapter(Sandbox(), model="m", base_url="http://x/v1")
     assert json.loads(b._config_files()["/agent/models.json"])["providers"]["skgw"]["models"][0]["limit"]["output"] == 131072
+
+
+# -- A6.1 attribution headers -------------------------------------------------
+# pi forwards nothing identifying by default, so skgateway request_log rows carry a
+# NULL agent_id/session_id for every harness run. These tests pin BOTH directions:
+# the headers appear when we know the ids, and the `headers` key is absent entirely
+# when we do not. A test for presence alone would also pass if the adapter emitted
+# the headers unconditionally, which is the failure mode worth catching.
+
+def _skgw(a, **kw):
+    return json.loads(a._config_files(**kw)["/agent/models.json"])["providers"]["skgw"]
+
+
+def test_attribution_headers_emitted_when_ids_supplied():
+    a = _a(model="ornith-big", base_url="http://gw:18780/v1",
+           session_id="9f3c1a2b4d5e6f70", card_id="4852c56d")
+    assert _skgw(a)["headers"] == {"x-session-id": "9f3c1a2b4d5e6f70",
+                                   "x-sk-card-id": "4852c56d"}
+
+
+def test_no_ids_means_no_headers_key_at_all():
+    # NEGATIVE CONTROL for the test above. Absent, not {} and not empty strings:
+    # "no session" and "session is empty" are different facts at the gateway.
+    a = _a(model="ornith-big", base_url="http://gw:18780/v1")
+    skgw = _skgw(a)
+    assert "headers" not in skgw
+    assert a.session_id is None and a.card_id is None
+    # and the rest of the provider block is untouched by the feature
+    assert skgw["api"] == "openai-completions"
+    assert skgw["compat"] == {"supportsDeveloperRole": False}
+
+
+def test_each_id_is_independent():
+    only_sid = _a(model="m", base_url="http://gw/v1", session_id="abc123")
+    assert _skgw(only_sid)["headers"] == {"x-session-id": "abc123"}
+    only_card = _a(model="m", base_url="http://gw/v1", card_id="4852c56d")
+    assert _skgw(only_card)["headers"] == {"x-sk-card-id": "4852c56d"}
+
+
+def test_ids_may_be_supplied_per_call():
+    a = _a(model="m", base_url="http://gw/v1")
+    assert _skgw(a, session_id="s1", card_id="c1")["headers"] == {
+        "x-session-id": "s1", "x-sk-card-id": "c1"}
+    assert "headers" not in _skgw(a)                # per-call value never sticks
+
+
+def test_header_values_are_literals_never_env_interpolation():
+    # pi resolves a `$VAR` header value from the environment; with the var UNSET it
+    # makes no request at all, reports an internal error, and STILL EXITS 0, so
+    # _parse returns {} and the failure is invisible by exit code. Bake literals in.
+    a = _a(model="m", base_url="http://gw/v1",
+           session_id="9f3c1a2b", card_id="4852c56d")
+    for v in _skgw(a)["headers"].values():
+        assert not v.startswith("$") and not v.startswith("!")
+    raw = a._config_files()["/agent/models.json"]
+    assert "$" not in raw and "!" not in raw
+
+
+def test_magic_prefix_values_are_refused_not_escaped():
+    # `!cmd` in a header VALUE makes pi execute a shell command on every request and
+    # `$VAR` makes it read the environment. Our ids are hex today; assert it rather
+    # than relying on it.
+    import pytest
+    for bad in ("!echo pwned", "$SK_SESSION_ID", "has space", "a\nb", "", "x" * 201):
+        with pytest.raises(ValueError):
+            _a(model="m", base_url="http://gw/v1", session_id=bad)
+        with pytest.raises(ValueError):
+            _a(model="m", base_url="http://gw/v1", card_id=bad)
+        with pytest.raises(ValueError):
+            _a(model="m", base_url="http://gw/v1")._config_files(session_id=bad)
+
+
+def test_pi_is_the_only_source_of_x_session_id():
+    # pi can mint its own x-session-id via compat.sendSessionAffinityHeaders +
+    # sessionAffinityFormat, which would fight ours on the same header name. The
+    # harness is the single source, so neither key may appear in the generated config.
+    a = _a(model="m", base_url="http://gw/v1", session_id="abc123")
+    raw = a._config_files()["/agent/models.json"]
+    assert "sendSessionAffinityHeaders" not in raw
+    assert "sessionAffinityFormat" not in raw
+
+
+def test_attribution_does_not_disturb_the_model_agreement_invariant():
+    # the A6.1 change must not let _argv and _config_files name different models
+    a = _a(model="ornith-big", base_url="http://gw:18780/v1",
+           session_id="abc123", card_id="4852c56d")
+    for override in (None, "sk-l-internal"):
+        argv = a._argv("P", model=override)
+        declared = _skgw(a, model=override)["models"][0]["id"]
+        assert argv[argv.index("--model") + 1] == f"skgw/{declared}"
+
+
+def test_no_base_url_still_means_no_config_even_with_ids():
+    a = _a(session_id="abc123", card_id="4852c56d")
+    assert a._config_files() == {}
