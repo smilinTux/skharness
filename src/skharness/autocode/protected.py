@@ -55,6 +55,25 @@ _ALWAYS_PROTECTED: tuple[str, ...] = (
     "*skharness/autocode/buckets.py",
     "*/skharness/autocode/routing_guard.py",  # S14: routing cannot touch gate fields
     "*skharness/autocode/routing_guard.py",
+    # THE WORKER-INDEPENDENT OUTCOME LABEL (S26, card 788425b8; module built by
+    # S23, card 33c50540). The whole and only value of this label is that THE
+    # WORKER CANNOT AUTHOR THE MUTANTS: the operator table lives in the harness,
+    # fixed, which is what makes it independent of the tests the worker wrote.
+    # A worker that can edit `mutation.py` can weaken its own independent grader,
+    # and it can do so INVISIBLY, because a smaller operator table produces a
+    # perfectly well-formed `survived_clean` row rather than an error. That is
+    # the coverage-config hazard (S21) exactly: an engine that can move the
+    # instrument does not need to satisfy it.
+    #
+    # Floor rather than manifest, for the same reason as the rubric: the
+    # realistic failure is not that someone removes an entry, it is that nobody
+    # ever adds one. The label is shadow-only today and gates nothing, so this
+    # protects a measurement rather than a decision. It is on the floor
+    # ANTICIPATING that a measurement is what a future decision would be built
+    # from, and a floor added after the label starts mattering is a floor added
+    # too late.
+    "*/skharness/autocode/mutation.py",
+    "*skharness/autocode/mutation.py",
     "*/autocode/data/joule-grade-vocabulary.json",   # the vendored enums
     "*autocode/data/joule-grade-vocabulary.json",
     "*/tests/data/joule-economy-golden-set-*.json",  # the calibration reference

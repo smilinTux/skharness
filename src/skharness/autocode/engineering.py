@@ -320,6 +320,99 @@ class EngineeringExecutor:
 
     _MAX_ROUNDS = 4
 
+    #: Cost bounds for the SHADOW mutation probe (S26, card 788425b8). Class
+    #: attributes, mirroring `_MAX_ROUNDS`: that is this class's existing
+    #: convention for a build-loop bound, it is overridable by a test or a
+    #: subclass, and it invents no new config surface.
+    #:
+    #: They are DELIBERATELY the module's own defaults (mutation.DEFAULT_*)
+    #: restated as None rather than numbers: None means "whatever the module
+    #: says", so the bound has exactly ONE definition and this class cannot drift
+    #: from it by holding a stale copy. autopilot.yaml has no natural home for
+    #: them today (RepoSpec describes a repo, not a telemetry budget), and adding
+    #: one for a shadow probe nobody has yet run in anger would be config built
+    #: ahead of a need. Wire them to real config when a second caller or an
+    #: operator actually needs to tune them, not before.
+    _MUTATION_MAX_MUTANTS: int | None = None
+    _MUTATION_TIMEOUT_S: int | None = None
+    _MUTATION_PER_MUTANT_TIMEOUT: int | None = None
+
+    def _shadow_mutation_report(self, item: WorkItem, repo: RepoSpec, wt: str,
+                                diff: str) -> dict | None:
+        """The WORKER-INDEPENDENT shadow label for this build, or None.
+
+        THE ONE LIVE CALLER OF THE PROBE (S26, card 788425b8)
+        ----------------------------------------------------
+        S23 built the probe, gave it 43 tests, merged it, and nothing called it.
+        A module with no caller and no module at all produce byte-identical
+        behaviour, and the tests are green either way. This epic catalogued that
+        failure class TEN times (card bb536f68) and then grew an eleventh
+        instance around its own flagship artifact: the label that makes the
+        epic's central refusal falsifiable instead of permanent. This method is
+        the fix, and it exists here because here is the only place in the whole
+        autopilot that holds a live worktree and the diff at grade time.
+
+        SHADOW ONLY. It returns a RAW REPORT OF COUNTS, never a verdict:
+        `record_run` derives `mutation_state` from these numbers, so no producer
+        (this one included) can stamp a state that disagrees with its own
+        counts. This method's caller does exactly one thing with the return
+        value: hands it to the GateResult it is already building. It never reads
+        it back, never branches on it, and the twin gate never sees it.
+        `tests/test_autocode_mutation.py` section 5 pins all of that, statically
+        over the whole package and behaviourally over the gate and the dispatch
+        decision.
+
+        COST, and why the caller decides WHEN rather than this method
+        -------------------------------------------------------------
+        One scoped suite run per mutant is real money, so the caller invokes
+        this at most ONCE per build and only on a round that is about to END the
+        build with a green suite. That placement is not only about cost: the
+        probe requires a GREEN BASELINE (a red suite kills every mutant for
+        reasons that have nothing to do with the mutation), so on a red build
+        this would spend a full suite run to learn `baseline_red`, which is to
+        say nothing at all.
+
+        The three bounds the module already implements (`max_mutants`, the
+        wall-clock `timeout_s`, and `per_mutant_timeout`) are passed through
+        from the class attributes above. Hitting any of them marks the run
+        incomplete, and the classifier refuses to read an incomplete run as
+        clean, so a bounded run degrades to an honest `unobserved` and never to
+        a reassuring clean sweep.
+
+        NEVER RAISES, following `_record_attempt` and `record_run`
+        ----------------------------------------------------------
+        `mutation.probe` is already total and returns an `unobserved`-shaped
+        report for every failure it can see. This wrapper covers the rest (an
+        import that fails, a bound that is not a number) by returning None,
+        which `record_run` classifies as `unobserved` with reason `not_run`:
+        honest, and in particular NOT a clean sweep. The reason string cannot
+        distinguish that case from "no probe was attempted", so the WHY is
+        written to the health log instead, where the two are distinguishable.
+        A shadow label must never be the reason a real build dies.
+        """
+        try:
+            from . import mutation
+
+            bounds = {}
+            if self._MUTATION_MAX_MUTANTS is not None:
+                bounds["max_mutants"] = int(self._MUTATION_MAX_MUTANTS)
+            if self._MUTATION_TIMEOUT_S is not None:
+                bounds["timeout_s"] = int(self._MUTATION_TIMEOUT_S)
+            if self._MUTATION_PER_MUTANT_TIMEOUT is not None:
+                bounds["per_mutant_timeout"] = int(self._MUTATION_PER_MUTANT_TIMEOUT)
+            started = time.monotonic()
+            report = mutation.probe(repo, wt, diff, **bounds)
+            health.record("mutation_probe", task=item.ref,
+                          seconds=round(time.monotonic() - started, 3),
+                          reason=(report or {}).get("unobserved_reason"),
+                          mutants=(report or {}).get("mutants"),
+                          survived=(report or {}).get("survived"))
+            return report
+        except Exception as exc:      # noqa: BLE001 - a shadow label never breaks a build
+            health.record("mutation_probe_error", task=item.ref,
+                          error=str(exc)[:120])
+            return None
+
     def _stage_work(self, wt: str) -> None:
         """Stage the harness's edits INCLUDING new/untracked files, minus CI/coverage
         byproducts. The harness writes new files (e.g. fresh test files) but never
@@ -590,7 +683,32 @@ class EngineeringExecutor:
             # deterministic twin gate: LLM 5/5 + promise ANDed with CI green +
             # coverage. The predicate is the shared twin_gate_passed (also used by
             # the ratify one-shot) so the gate has one definition, never two.
-            if twin_gate_passed(gr, ci_status, cov, repo):
+            gate_ok = twin_gate_passed(gr, ci_status, cov, repo)
+            # Grade-resilience precondition, hoisted so the shadow probe below can
+            # see BOTH terminal-with-a-green-suite rounds. Byte-identical to the
+            # expression it replaces; only its position moved.
+            cov_ok = cov is None or cov >= getattr(repo, "min_diff_coverage", 0.8)
+            salvage = (not gate_ok and gr.score is None and ci_status == "green"
+                       and diff.strip() and cov_ok)
+            # THE SHADOW MUTATION LABEL (S26, card 788425b8). This is the only
+            # site in the autopilot holding a live worktree and the diff at grade
+            # time, which is why S23 could build the probe but not call it, and
+            # why its flagship artifact shipped inert.
+            #
+            # Placed here, AFTER both terminal predicates are known and BEFORE
+            # either return, so it runs at most ONCE per build and only on a
+            # round that is about to end it with a green suite. Both conditions
+            # imply ci_status == "green", which is what the probe needs: it
+            # requires a green baseline, so on a red build it could only ever
+            # spend a full suite run to report `baseline_red`.
+            #
+            # WRITE ONLY. The value goes straight into the GateResult below and
+            # is never read here. Nothing between this line and the return looks
+            # at it, the twin gate above has already decided, and `record_run`
+            # (not this method) derives the verdict from these counts.
+            shadow = (self._shadow_mutation_report(item, repo, wt, diff)
+                      if (gate_ok or salvage) else None)
+            if gate_ok:
                 # Return the score the GRADER produced, which is the same number
                 # already persisted to the board two lines up. The old literal 5
                 # was accurate (twin_gate_passed requires gr.score == 5 to reach
@@ -607,15 +725,14 @@ class EngineeringExecutor:
                 return GateResult(score=gr.score, passed=True,
                                   notes=strip_promise(gr.notes), artifact=gr.artifact,
                                   outcome="pass", tokens=u.tokens,
-                                  cost_usd=u.cost_usd)
+                                  cost_usd=u.cost_usd, mutation_report=shadow)
             # Grade-resilience: the grader could not certify (score None == the
             # adapter returned no parseable verdict even after its retries -- a
             # flaky/transient grade), BUT the DETERMINISTIC signals are strong: CI
             # green + coverage met + a real diff. Sound work must not be stranded or
             # burn the remaining rounds on a grader that will not answer. Salvage it
             # to a HUMAN-reviewed PR (never auto-merged -- the grade never said 5).
-            cov_ok = cov is None or cov >= getattr(repo, "min_diff_coverage", 0.8)
-            if gr.score is None and ci_status == "green" and diff.strip() and cov_ok:
+            if salvage:
                 health.record("grade_inconclusive_ci_green", task=item.ref, round=rnd)
                 pr_url = self._salvage_to_review(item, repo, wt, pr_branch)
                 # record what the salvaged rounds cost; no mint (the grade never
@@ -625,7 +742,8 @@ class EngineeringExecutor:
                     score=None, passed=False, artifact=pr_url,
                     notes=(f"grade inconclusive but CI green + coverage met; opened "
                            f"PR {pr_url} for human review (NOT auto-merged)."),
-                    outcome="salvage", tokens=u.tokens, cost_usd=u.cost_usd)
+                    outcome="salvage", tokens=u.tokens, cost_usd=u.cost_usd,
+                    mutation_report=shadow)
             feedback = strip_promise(gr.notes)
         # Terminal: the rounds are spent and the gate never closed. Distil the
         # cause (failing test id + assertion) rather than carrying the grader's

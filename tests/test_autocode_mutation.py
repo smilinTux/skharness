@@ -461,24 +461,142 @@ _ROUTING_MODULES = ("buckets.py", "grading.py", "sensitivity.py", "engineering.p
 _VOCAB = ("mutation_state", "mutation_report", "survived_clean", "mutants_survived",
           "from .mutation", "from skharness.autocode.mutation", "import mutation")
 
+#: The ONE live-path producer (S26, card 788425b8). engineering.py holds the
+#: single grade-time site with a live worktree and the diff in hand, so it is
+#: the only place the probe CAN run. That makes it a routing module that names
+#: the label, which is exactly the shape this section exists to forbid, so the
+#: exemption is drawn as narrowly as it can be drawn rather than by dropping the
+#: module off the list:
+#:
+#:   * it may name the raw ``mutation_report``, and reach the module through its
+#:     NAMESPACE (``from . import mutation``, then ``mutation.probe``);
+#:   * it may NOT name ``mutation_state``, the three-value vocabulary, or any
+#:     classifier entry point, and may not import names OUT of the module. It
+#:     produces COUNTS and never a verdict, so the verdict stays derived by
+#:     ``record_run``, which is what stops a producer stamping a state that
+#:     disagrees with its own numbers;
+#:   * it may not READ the label back.
+#:
+#: The last two are proved by AST rather than by grep, so the one module that
+#: has to explain this seam stays free to explain it in prose. Every other
+#: module on _ROUTING_MODULES stays banned outright and is scanned raw.
+_SHADOW_WRITE_SITE = "engineering.py"
+
 #: The ONLY files allowed to name the vocabulary: the module itself, the ledger
 #: writer that derives the column, the one orchestrator function that forwards a
-#: report to that writer, and the dataclass that carries it. All four are WRITE
-#: paths. Not one of them returns a decision.
-_ALLOWED = {"mutation.py", "autopilot_cost.py", "orchestrator.py", "types.py"}
+#: report to that writer, the dataclass that carries it, and (S26) the one
+#: executor that produces it. All five are WRITE paths. Not one of them returns
+#: a decision.
+_ALLOWED = {"mutation.py", "autopilot_cost.py", "orchestrator.py", "types.py",
+            _SHADOW_WRITE_SITE}
 
 
 def test_no_routing_module_mentions_the_mutation_vocabulary():
+    """Every routing module except the one producer, scanned RAW.
+
+    Raw text is the strictest possible scan and it is kept for all of these,
+    because none of them has any business even mentioning the label. The one
+    producer is scanned by AST instead, in the two tests below: it has to be
+    free to EXPLAIN the seam at length in prose, and this section's own rule
+    (see test_the_mutation_module_cannot_address_a_bucket_or_merge_anything) is
+    that a guard which cannot tell a docstring from an identifier ends up
+    silenced by someone deleting a comment.
+    """
     offenders = []
     for name in _ROUTING_MODULES:
         p = _SRC / name
-        if not p.exists():
+        if not p.exists() or name == _SHADOW_WRITE_SITE:
             continue
         text = p.read_text(encoding="utf-8")
         offenders += [f"{name}: {t}" for t in _VOCAB if t in text]
     assert offenders == [], (
         "mutation is a SHADOW label. These routing modules reference it, which "
         f"means something can route on it: {offenders}")
+    # The exempted module is not simply unguarded: it is guarded by AST below.
+    assert _SHADOW_WRITE_SITE in _ROUTING_MODULES
+    assert (_SRC / _SHADOW_WRITE_SITE).exists()
+
+
+def _code_names(path) -> tuple[set, list]:
+    """Every identifier, keyword-arg name and string constant that appears in
+    the CODE of *path*, plus every `from ...mutation import x` it performs.
+
+    Docstrings and comments are structurally out of reach: an `ast.Constant`
+    that is a bare expression statement (a docstring) is skipped, and comments
+    never reach the AST at all.
+    """
+    import ast
+
+    tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+    docstrings = {id(n.value) for n in ast.walk(tree)
+                  if isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)}
+    names: set = set()
+    deep_imports: list = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            names.add(node.attr)
+        elif isinstance(node, ast.keyword) and node.arg:
+            names.add(node.arg)
+        elif isinstance(node, ast.alias):
+            names.add(node.name.rsplit(".", 1)[-1])
+            names.add(node.asname or "")
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str) \
+                and id(node) not in docstrings:
+            names.add(node.value)
+        if isinstance(node, ast.ImportFrom) and (node.module or "").endswith("mutation"):
+            deep_imports.append(f"line {node.lineno}: from .{node.module} import ...")
+    return names, deep_imports
+
+
+def test_the_shadow_write_site_is_still_forbidden_the_verdict_vocabulary():
+    """Negative control for the exemption: the allowance must be a keyhole, not
+    a door.
+
+    The producer may name the raw REPORT. It must not be able to name a STATE,
+    the three-value vocabulary, or any of the classifier entry points, because
+    a producer that can compute a verdict is one line from branching on it and
+    the "derived by the writer" guarantee becomes advisory. It must also not
+    reach INTO the module (`from .mutation import ...`): going through the
+    module namespace is what keeps `classify` and the state constants out of its
+    local scope entirely.
+    """
+    names, deep = _code_names(_SRC / _SHADOW_WRITE_SITE)
+    banned = {"mutation_state", "survived_clean", "mutants_survived",
+              "MUTATION_STATES", "SURVIVED_CLEAN", "MUTANTS_SURVIVED", "UNOBSERVED",
+              "classify", "mutation_row", "unobserved_row", "mutation_rates"}
+    assert not (names & banned), names & banned
+    assert deep == [], deep
+    # Positive control: this walk really does see the tokens it is checking, so
+    # it fails loudly rather than passing vacuously if the seam is refactored.
+    assert "mutation_report" in names and "probe" in names
+
+
+def test_the_shadow_write_site_writes_the_label_and_never_reads_it():
+    """The structural proof that the ONE producer cannot become a consumer.
+
+    ``mutation_report`` may appear ONLY as a keyword argument (constructing the
+    GateResult that carries it outward). An attribute load, or the name used as
+    a string key, would be a READ, and a read is the first half of a routing
+    decision.
+    """
+    import ast
+
+    tree = ast.parse((_SRC / _SHADOW_WRITE_SITE).read_text(encoding="utf-8"))
+    writes, reads = 0, []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.keyword) and node.arg == "mutation_report":
+            writes += 1
+        elif isinstance(node, ast.Attribute) and node.attr == "mutation_report":
+            reads.append(f"attribute access at line {node.lineno}")
+        elif isinstance(node, ast.Constant) and node.value in (
+                "mutation_report", "mutation_state"):
+            reads.append(f"string key {node.value!r} at line {node.lineno}")
+    assert reads == [], (
+        f"{_SHADOW_WRITE_SITE} READS the shadow label: {reads}. It is a "
+        "producer; a producer that reads is one refactor from a consumer.")
+    assert writes >= 1, "the producer stopped stamping the label at all"
 
 
 def test_the_routing_module_list_is_not_silently_empty():
@@ -567,10 +685,22 @@ def test_the_mutation_module_cannot_address_a_bucket_or_merge_anything():
     assert "mutation_row" in called       # positive control: the walk sees calls
 
 
-def test_the_probe_is_never_invoked_from_any_gate_or_dispatch_path():
-    """A shadow label that the gate RUNS is still a gate cost and one refactor
-    away from being a gate input. No module outside the label's own tests may
-    call probe()."""
+def test_exactly_one_module_invokes_the_probe_and_it_is_the_shadow_write_site():
+    """The caller count is PINNED, not merely bounded below.
+
+    This assertion used to read ``callers == []``, which was true and was the
+    problem: S23 shipped the probe with no caller at all, so the epic's flagship
+    artifact was inert (instance ELEVEN of the very failure class this epic
+    catalogued, card bb536f68). S26 added the one legitimate caller, so the
+    assertion is TIGHTENED rather than deleted: exactly one caller, and it is
+    the shadow write site.
+
+    Both halves matter. ``len == 1`` is what keeps the probe from becoming a
+    cost paid on several paths; ``== [_SHADOW_WRITE_SITE]`` is what keeps it
+    from moving to a path that decides something. A second consumer appearing
+    anywhere in the package is still red, which is the property the original
+    assertion was protecting.
+    """
     import ast
 
     callers = []
@@ -580,15 +710,265 @@ def test_the_probe_is_never_invoked_from_any_gate_or_dispatch_path():
         for node in ast.walk(ast.parse(p.read_text(encoding="utf-8", errors="replace"))):
             if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "probe":
                 callers.append(p.name)
-    assert callers == [], callers
+    assert callers == [_SHADOW_WRITE_SITE], callers
 
 
 def test_the_module_runs_standalone_so_a_human_can_produce_real_data():
-    """The label is only worth building if somebody can actually run it today.
-    The orchestrator cannot (the one site holding a worktree is on the
-    protected floor), so the module carries its own entry point."""
+    """The label is worth building only if somebody can actually run it. Since
+    S26 the autopilot runs it too, but the standalone entry point stays: it is
+    how a human produces a reading over an arbitrary branch without waiting for
+    a gated build, and section 6 does not make it redundant."""
     proc = subprocess.run([sys.executable, "-m", "skharness.autocode.mutation", "--help"],
                           capture_output=True, text=True,
                           env={**os.environ, "PYTHONPATH": str(Path(_SRC).parents[1])})
     assert proc.returncode == 0, proc.stderr
     assert "--worktree" in proc.stdout
+
+
+# --------------------------------------------------------------------------- #
+# 6. S26 (card 788425b8): the LIVE PATH                                       #
+# --------------------------------------------------------------------------- #
+#
+# Section 2 already proves the probe works when called. That is NOT what was
+# missing. What was missing is that nothing called it: `grep` across the package
+# returned only docstring references, so 43 green tests and a merged module
+# produced byte-identical behaviour to the module not existing at all. This epic
+# catalogued that exact class ten times over (card bb536f68) and then formed an
+# eleventh instance around its own flagship deliverable.
+#
+# So a test here that calls `probe()` directly would prove nothing S23's tests
+# did not already prove. Every test in this section drives
+# `EngineeringExecutor.run()`, over a REAL worktree with REAL source and REAL
+# tests, and reads the result off the LEDGER ROW the orchestrator writes.
+# ---------------------------------------------------------------------------
+
+
+def _live_gated_build(tmp_path, monkeypatch, tests_source: str):
+    """One REAL gated build through `run()`, then its outcome row.
+
+    Only the outside world is stubbed (git worktree creation, the diff, the head
+    sha, external CI, the coverage instrument, and the LLM). The executor, the
+    twin gate, the probe and the ledger writer are all the real thing, and the
+    worktree on disk really does hold the source the probe mutates and the tests
+    that judge the mutants.
+
+    Returns (GateResult, [ledger rows]).
+    """
+    import types as _t
+    from unittest.mock import MagicMock
+
+    from skharness.autocode import engineering as eng
+    from skharness.autocode import orchestrator as orch
+    from skharness.autocode.types import GateResult, HarnessResult, RepoSpec, WorkItem
+
+    wt = _wt(tmp_path, _GOOD_SRC, tests_source)
+    repo = RepoSpec(
+        name="calc", path=str(tmp_path), base_branch="main",
+        integration_branch="main", test_cmd="pytest",
+        ci=f"local:{sys.executable} -m pytest -q -p no:cacheprovider")
+    cfg = _t.SimpleNamespace(repo_map={"calc": repo}, automerge_repos=[])
+    ex = eng.EngineeringExecutor(cfg, board=MagicMock(), journal=MagicMock(),
+                                 digest=MagicMock(), agent_name="autopilot")
+    ex.journal.run_id = "run-s26"
+    monkeypatch.setattr(ex, "make_worktree", lambda item, repo: str(wt))
+    monkeypatch.setattr(ex, "_diff", lambda repo, w: _DIFF)
+    monkeypatch.setattr(ex, "_head_sha", lambda w: "sha1")
+    monkeypatch.setattr(eng, "external_ci_verdict", lambda *a, **k: "green")
+    monkeypatch.setattr(eng, "diff_coverage", lambda *a, **k: 0.95)
+
+    harness = MagicMock(name="harness")
+    harness.name = "claude-code"
+    harness.run_task.return_value = HarnessResult(ok=True, artifact=None, tokens=1,
+                                                  cost_usd=0.0, raw={})
+    harness.grade.return_value = GateResult(
+        score=5, passed=True, notes="done <promise>COMPLETE</promise>", artifact="pr")
+
+    item = WorkItem(kind="engineering", ref="s26-live", source="coord", repo=None,
+                    payload={"tags": ["repo:calc"], "title": "over()",
+                             "description": "d", "acceptance": ["a"]})
+    # The ledger goes to tmp_path. Nothing in this suite may write to the real
+    # fleet ledger or the real wallet; run() never settles, and finalize (the one
+    # path that mints) is deliberately not called.
+    monkeypatch.setenv("SKAI_COST_DIR", str(tmp_path / "cost"))
+    monkeypatch.setattr(orch, "_now_iso", lambda: "2026-08-17T00:00:00Z")
+
+    result = ex.run(item, harness)
+    orch.record_outcome_row(item, terminal_state="finalized", run_id="run-s26",
+                            result=result)
+    ledger = tmp_path / "cost" / "ledger.jsonl"
+    rows = [json.loads(ln)
+            for ln in ledger.read_text(encoding="utf-8").splitlines() if ln]
+    return result, rows
+
+
+def test_a_real_gated_build_produces_a_non_null_report_on_the_outcome_row(
+        tmp_path, monkeypatch):
+    """THE acceptance test for this card (AC1).
+
+    A real gated build, driven through `run()`, must reach the ledger carrying a
+    label the worker did not author. Before S26 this row read `unobserved` with
+    reason `not_run` on every build that ever ran, forever, because no caller
+    existed. Delete the probe call in `engineering.py` and this test goes red.
+    """
+    result, rows = _live_gated_build(tmp_path, monkeypatch, _GOOD_TESTS)
+
+    assert result.passed is True and result.outcome == "pass"
+    # The GateResult really carries a report, and the probe really ran.
+    assert result.mutation_report is not None, "no probe ran on the live path"
+    assert result.mutation_report["unobserved_reason"] is None, result.mutation_report
+    assert result.mutation_report["mutants"] >= 1, result.mutation_report
+
+    # And it survives the journey to the row a human actually reads.
+    row = rows[0]
+    assert row["card_id"] == "s26-live"
+    assert row["mutation_state"] == mut.SURVIVED_CLEAN, row
+    assert row["mutation_unobserved_reason"] is None, row
+    assert row["mutation_killed"] >= 1 and row["mutation_survived"] == 0, row
+
+
+def test_the_live_label_discriminates_between_two_builds_the_gate_cannot_tell_apart(
+        tmp_path, monkeypatch):
+    """The negative control, and the whole reason the label exists.
+
+    Same source, same green CI, same coverage, same 5/5 grade, same twin-gate
+    pass. The ONLY difference is the quality of the tests the worker wrote, and
+    the twin gate is structurally blind to it because its CI and coverage arms
+    are satisfied BY those tests. The mutation label is not: it says
+    `mutants_survived` where the gate says pass.
+
+    If this test ever agrees with the one above, the live path has stopped
+    measuring anything and is only decorating rows.
+    """
+    result, rows = _live_gated_build(tmp_path, monkeypatch, _WEAK_TESTS)
+
+    assert result.passed is True and result.outcome == "pass"   # the gate agrees
+    assert rows[0]["mutation_state"] == mut.MUTANTS_SURVIVED, rows[0]
+    assert rows[0]["mutation_survived"] >= 1, rows[0]
+
+
+def test_a_build_the_probe_cannot_observe_records_unobserved_and_still_passes(
+        tmp_path, monkeypatch):
+    """Cost/robustness (AC4). A repo whose CI cannot serve the probe (nothing
+    local to run) must still finish its build normally and write an HONEST
+    `unobserved`, never a clean sweep and never an exception.
+    """
+    import types as _t
+    from unittest.mock import MagicMock
+
+    from skharness.autocode import engineering as eng
+    from skharness.autocode import orchestrator as orch
+    from skharness.autocode.types import GateResult, HarnessResult, RepoSpec, WorkItem
+
+    wt = _wt(tmp_path, _GOOD_SRC, _GOOD_TESTS)
+    repo = RepoSpec(name="calc", path=str(tmp_path), base_branch="main",
+                    integration_branch="main", test_cmd="pytest", ci="none")
+    cfg = _t.SimpleNamespace(repo_map={"calc": repo}, automerge_repos=[])
+    ex = eng.EngineeringExecutor(cfg, board=MagicMock(), journal=MagicMock(),
+                                 digest=MagicMock(), agent_name="autopilot")
+    ex.journal.run_id = "run-s26"
+    monkeypatch.setattr(ex, "make_worktree", lambda item, repo: str(wt))
+    monkeypatch.setattr(ex, "_diff", lambda repo, w: _DIFF)
+    monkeypatch.setattr(ex, "_head_sha", lambda w: "sha1")
+    monkeypatch.setattr(eng, "external_ci_verdict", lambda *a, **k: "green")
+    monkeypatch.setattr(eng, "diff_coverage", lambda *a, **k: 0.95)
+    harness = MagicMock(name="harness")
+    harness.name = "claude-code"
+    harness.run_task.return_value = HarnessResult(ok=True, artifact=None, tokens=1,
+                                                  cost_usd=0.0, raw={})
+    harness.grade.return_value = GateResult(
+        score=5, passed=True, notes="done <promise>COMPLETE</promise>", artifact="pr")
+    item = WorkItem(kind="engineering", ref="s26-blind", source="coord", repo=None,
+                    payload={"tags": ["repo:calc"], "title": "over()",
+                             "description": "d", "acceptance": ["a"]})
+    monkeypatch.setenv("SKAI_COST_DIR", str(tmp_path / "cost"))
+    monkeypatch.setattr(orch, "_now_iso", lambda: "2026-08-17T00:00:00Z")
+
+    result = ex.run(item, harness)
+    assert result.passed is True                      # the build is unaffected
+    orch.record_outcome_row(item, terminal_state="finalized", run_id="run-s26",
+                            result=result)
+    row = json.loads((tmp_path / "cost" / "ledger.jsonl")
+                     .read_text(encoding="utf-8").splitlines()[0])
+    assert row["mutation_state"] == mut.UNOBSERVED
+    assert row["mutation_unobserved_reason"] == "no_test_command"
+
+
+def test_a_build_the_gate_rejects_pays_nothing_for_the_probe(tmp_path, monkeypatch):
+    """Cost bound (AC4), stated as an observation rather than a promise.
+
+    The probe costs one scoped suite run per mutant, so it must run at most once
+    per BUILD and only on a round that is about to end it with a green suite. A
+    red-CI build never converges and never reaches a terminal green round, so it
+    must pay ZERO probe runs. It also cannot produce a verdict even in
+    principle: the probe requires a green baseline, so paying for it there would
+    buy an `unobserved` row at the price of a full suite run per round.
+    """
+    import types as _t
+    from unittest.mock import MagicMock
+
+    from skharness.autocode import engineering as eng
+    from skharness.autocode import mutation as live_mut
+    from skharness.autocode.types import GateResult, HarnessResult, RepoSpec, WorkItem
+
+    calls = []
+    real_probe = live_mut.probe
+    monkeypatch.setattr(live_mut, "probe",
+                        lambda *a, **k: (calls.append(1), real_probe(*a, **k))[1])
+
+    wt = _wt(tmp_path, _GOOD_SRC, _GOOD_TESTS)
+    repo = RepoSpec(
+        name="calc", path=str(tmp_path), base_branch="main",
+        integration_branch="main", test_cmd="pytest",
+        ci=f"local:{sys.executable} -m pytest -q -p no:cacheprovider")
+    cfg = _t.SimpleNamespace(repo_map={"calc": repo}, automerge_repos=[])
+    ex = eng.EngineeringExecutor(cfg, board=MagicMock(), journal=MagicMock(),
+                                 digest=MagicMock(), agent_name="autopilot")
+    ex.journal.run_id = "run-s26"
+    monkeypatch.setattr(ex, "make_worktree", lambda item, repo: str(wt))
+    monkeypatch.setattr(ex, "_diff", lambda repo, w: _DIFF)
+    monkeypatch.setattr(ex, "_head_sha", lambda w: "sha1")
+    monkeypatch.setattr(eng, "external_ci_verdict", lambda *a, **k: "red")
+    monkeypatch.setattr(eng, "diff_coverage", lambda *a, **k: 0.95)
+    harness = MagicMock(name="harness")
+    harness.name = "claude-code"
+    harness.run_task.return_value = HarnessResult(ok=True, artifact=None, tokens=1,
+                                                  cost_usd=0.0, raw={})
+    harness.grade.return_value = GateResult(score=3, passed=False, notes="nope",
+                                            artifact=None)
+    item = WorkItem(kind="engineering", ref="s26-red", source="coord", repo=None,
+                    payload={"tags": ["repo:calc"], "title": "over()",
+                             "description": "d", "acceptance": ["a"]})
+
+    result = ex.run(item, harness)
+    assert result.passed is False
+    assert calls == [], f"the probe ran {len(calls)} times on a build that never passed"
+    assert result.mutation_report is None
+
+
+def test_the_probe_is_called_at_most_once_per_build(tmp_path, monkeypatch):
+    """Positive control for the cost bound above: on a build that DOES pass,
+    the probe runs exactly once, not once per round and not once per return."""
+    from skharness.autocode import mutation as live_mut
+
+    calls = []
+    real_probe = live_mut.probe
+    monkeypatch.setattr(live_mut, "probe",
+                        lambda *a, **k: (calls.append(1), real_probe(*a, **k))[1])
+    _live_gated_build(tmp_path, monkeypatch, _GOOD_TESTS)
+    assert calls == [1], f"expected exactly one probe per build, got {len(calls)}"
+
+
+def test_a_probe_that_explodes_never_breaks_the_build(tmp_path, monkeypatch):
+    """The never-raises discipline `_record_attempt` and `record_run` already
+    follow, extended to the probe. A shadow telemetry bug must never turn a
+    passing build into a crash, and it must never leave a reassuring row."""
+    from skharness.autocode import mutation as live_mut
+
+    def boom(*a, **k):
+        raise RuntimeError("probe bug")
+
+    monkeypatch.setattr(live_mut, "probe", boom)
+    result, rows = _live_gated_build(tmp_path, monkeypatch, _GOOD_TESTS)
+    assert result.passed is True and result.outcome == "pass"
+    assert rows[0]["mutation_state"] == mut.UNOBSERVED
+    assert rows[0]["mutation_state"] != mut.SURVIVED_CLEAN
