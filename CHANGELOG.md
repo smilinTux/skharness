@@ -10,6 +10,31 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 ## [Unreleased]
 
 ### Fixed
+- **S17: the self-modification floor had ONE call site and it was unreachable.**
+  `changed_paths_are_protected` was called only from inside `if automerge:` in
+  `engineering.py`, and `automerge_repos` is `[]` in all four live configs, so
+  the carve-out never executed. This CHANGELOG, card 09573989 and the epic
+  935d4b61 design spec all cited it as the protection against
+  self-modification; that reasoning is correct, but the mechanism implementing
+  it did not run. The floor is now evaluated on the path that actually runs:
+  every `finalize`, before the diff is offered for merge by any route. The
+  auto-merge hold is unchanged and now names the files it held on, and a PR-only
+  review decision whose diff touches the floor says so in its prompt, because
+  PR-only work still asks a human to merge a diff. Every evaluation writes a
+  `carveout_evaluated` health event carrying the matched paths, which is the
+  observation that did not exist: "the carve-out held" and "the carve-out never
+  ran" used to produce identical silence. `protected.matched_protected_paths`
+  returns the matches rather than a bare bool, so a hold can state its reason.
+  The real control is still that auto-merge is off fleet-wide; the carve-out is
+  the backstop for the day that flag flips, which is why it must not be
+  reachable only through the flag it exists to survive. Note the manifest half
+  remains UNSIGNED (`"signature": null`, no caller passes `verify`), so the only
+  unforgeable half is the hard-coded `_ALWAYS_PROTECTED` tuple. That is exactly
+  what this call reaches with or without a manifest, so the repair does not wait
+  on the signing work. `tests/test_autocode_carveout_reachability.py` pins
+  reachability under BOTH `automerge_repos: []` and an enabled repo, so it fails
+  if auto-merge is ever turned on while the carve-out path is unreachable, and
+  also fails if the evaluation is ever re-guarded behind the auto-merge branch.
 - **S21: the coverage arm reported a CLAIM, not a measurement, and a planted
   `coverage.xml` passed the twin gate.** `_stage_work` deliberately resets
   `coverage.xml` out of the staged index so CI byproducts never pollute the

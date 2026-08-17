@@ -726,16 +726,40 @@ class EngineeringExecutor:
         # cannot catch a diff that deletes a guardrail check, so this path-level
         # gate is the backstop. The core guardrails are protected with or without
         # the signed manifest; the manifest adds more.
+        #
+        # S17 (card 53e9190c): this evaluation used to live INSIDE `if automerge:`,
+        # and `automerge_repos` is `[]` in all four live configs, so the floor had
+        # exactly one call site and that call site never ran. The real protection
+        # today is that auto-merge is globally off, which is genuine but is one
+        # config flag away, and the backstop meant to catch that flag was the
+        # inert part. It is now evaluated on the path that ACTUALLY runs: every
+        # finalize, before the diff is offered for merge by any route.
+        #
+        # The manifest half is unsigned (`"signature": null`, and no caller passes
+        # `verify`), so the only unforgeable half is the hard-coded
+        # `_ALWAYS_PROTECTED` tuple. That is exactly what this call reaches with
+        # or without a manifest, which is why moving the call site is sufficient
+        # and does not wait on the signing work.
+        from . import protected
+        guardrails = protected.matched_protected_paths(
+            self._fleet_root(), self._changed_paths(repo, pr_branch))
+        # THE OBSERVATION (S17's negative control): before this event, "the
+        # carve-out held" and "the carve-out never ran" produced identical
+        # silence. A clean evaluation is now written down as a clean evaluation,
+        # so the absence of a hold is evidence rather than an assumption.
+        health.record("carveout_evaluated", task=item.ref, pr=pr_url,
+                      protected=bool(guardrails), paths=guardrails[:20],
+                      automerge=bool(automerge))
         if automerge:
-            from . import protected
-            if protected.changed_paths_are_protected(
-                    self._fleet_root(), self._changed_paths(repo, pr_branch)):
-                health.record("carveout_held", task=item.ref, pr=pr_url)
+            if guardrails:
+                health.record("carveout_held", task=item.ref, pr=pr_url,
+                              paths=guardrails[:20])
                 self.digest.queue_decision(
                     prompt=(f"CARVE-OUT HELD: PR {pr_url} task {item.ref} touches "
                             "protected guardrail files (freeze / twin gate / signing / "
                             "escalation / carve-out). Never auto-merges regardless of "
-                            "grade or CI; review then merge by hand."),
+                            "grade or CI; review then merge by hand. Files: "
+                            + ", ".join(guardrails[:20])),
                     options={"reviewed": "merge", "no": "close"},
                     action_ref=f"carveout:{item.ref}", priority="high")
                 print(f"autopilot[{item.ref}] CARVE-OUT HELD {pr_url} (touches guardrails)")
@@ -773,8 +797,17 @@ class EngineeringExecutor:
             print(f"autopilot[{item.ref}] auto-merge held ({verdict}); {pr_url} queued for review")
             return
         # PR-only (auto-merge off for this repo): queue the review decision.
+        # S17: PR-only work still writes a diff and still asks a human to merge
+        # it, so the floor's verdict must reach the human making that decision.
+        # This prompt used to be the same sentence whether or not the diff
+        # rewrote the twin gate itself.
+        carveout_note = ""
+        if guardrails:
+            carveout_note = (" TOUCHES PROTECTED GUARDRAILS (self-modification "
+                             "carve-out): " + ", ".join(guardrails[:20])
+                             + ". Review these files by hand before merging.")
         self.digest.queue_decision(
-            prompt=f"Merge PR {pr_url} for task {item.ref}?",
+            prompt=f"Merge PR {pr_url} for task {item.ref}?{carveout_note}",
             options={"yes": "merge", "no": "close", "defer": "later"},
             action_ref=f"merge:{item.ref}", priority="high")
         # leave the task claimed (not completed) until the operator approves
