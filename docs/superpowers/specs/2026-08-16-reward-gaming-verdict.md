@@ -233,6 +233,10 @@ limits:
    criteria on round 4 of a failing run has weakened them for the next dispatch,
    which reads the card fresh. `_MAX_ROUNDS = 4` (`engineering.py:226`) makes a
    terminal non-pass a routine event, so "the next dispatch" is not a rare path.
+   And the card is not the only thing that crosses that boundary: section 3.6
+   documents a second cross-attempt channel, the failure memory, which carries
+   model-authored prose into the next attempt's first round with no protection
+   at all.
 3. **Criteria authored before the attempt is a convention, not a check.**
    Nothing in the harness compares the criteria it graded against to the criteria
    that existed when the card was created. Cards are edited by humans and by the
@@ -577,7 +581,7 @@ place that would change. Not this card's to make.
 
 ---
 
-## 4. The refusal, with five checkable grounds
+## 4. The refusal, and the grounds that carry it
 
 The epic asked for a learned routing policy trained on graded outcomes. It is
 refused. Each ground below names the artifact a reader can check.
@@ -710,6 +714,14 @@ apparent oversight.
 **Weight:** strong on its own terms, and it is the ground most likely to be
 re-proposed, because it looks like cheap data. It is not cheap; it is
 correlated data that flows into the arm it is supposed to be compared against.
+
+**Stronger than the first draft of this document said.** Ground 4's contamination
+argument was written as a prediction about what an exploration arm would do.
+Section 3.6 shows the same channel running in production today, across ordinary
+retries: `distill_failure` writes the grader model's prose onto the card and
+`build_prior_feedback` reads it into the next attempt's first round. The
+exploration slice would not have introduced the contamination path. It would have
+pointed a deliberately weakened worker at one that already exists.
 
 ### Ground 5: the prediction destroys its own falsifier (risk axis only).
 
@@ -948,7 +960,9 @@ first principles again.
 1. **An outcome signal not authored by the worker.** Mutation testing over
    changed lines, an adversarial reviewer with its own budget, or a held-out
    check the worker cannot see. Without one of these, section 3.3 stands and any
-   trained policy partly optimises test-writing.
+   trained policy partly optimises test-writing. This is the load-bearing
+   condition. It is first because it is the one that cannot be argued around, and
+   a proposal that meets the other five and not this one has met none of them.
 2. **A ratification channel with a measured answer rate above zero.** Section
    3.5's numbers are the baseline to beat. Re-measure `waiting-for.json` before
    claiming a human is in the loop.
@@ -958,14 +972,20 @@ first principles again.
    something.
 5. **A golden set that is ground truth.** Chef-reviewed, per `09573989`. Today
    its metadata says `graded_by: "opus (pre-grade, awaiting Chef correction)"`.
-6. **An argument that survives ground 5.** Grounds 1 through 4 are decisions and
-   could be revisited by whoever made them. Ground 5 is a property of feedback
-   under intervention, and reopening requires either an identification strategy
-   (natural experiments where model assignment varied for reasons unrelated to
-   the grade, which `09573989` suggests mining) or an explicit restriction to
-   `size`, which is the one axis with a real post-hoc observable.
+6. **An argument that survives ground 5, if risk grades are in scope.** Grounds
+   1 through 4 are decisions and could be revisited by whoever made them. Ground
+   5 is a property of feedback under intervention on the `risk` axis, so a
+   proposal touching risk grades needs either an identification strategy (natural
+   experiments where model assignment varied for reasons unrelated to the grade,
+   which `09573989` suggests mining) or an explicit restriction away from risk. A
+   proposal that never touches risk grades does not have to answer ground 5 at
+   all, and still has to answer condition 1, which is the point of section 4.6.
+7. **Section 2.4 fixed, or explicitly accepted.** A card's grade currently
+   selects the model that grades it (card `0b7e3ac3`). Building a learner on top
+   of a gate that is already partly self-selecting compounds two loops rather
+   than opening one.
 
-Meeting all six is a real project. Meeting fewer and shipping anyway is the
+Meeting all seven is a real project. Meeting fewer and shipping anyway is the
 failure this document exists to prevent.
 
 ---
@@ -973,15 +993,21 @@ failure this document exists to prevent.
 ## 8. What this document does not claim
 
 - It does not claim the harness is being gamed. No evidence of that was found,
-  and no policy consumes the score, so there is currently nothing to game *for*.
-  The argument is about what would happen if a reward were attached, not about
-  present behaviour.
+  and no policy consumes `GateResult.score`, so there is currently nothing to
+  game *for*. The argument is about what would happen if a reward were attached,
+  not about present behaviour. Section 2.4 is the one exception in kind: a
+  self-selecting path that exists today, with zero blast radius only because no
+  card carries a grade yet.
 - It does not claim the twin gate is weak. It catches a great deal. It is
   claimed to be an insufficient basis for **training a policy**, which is a much
   narrower claim.
 - It does not claim the grader is credulous. Section 2.1 records the grader
   correctly refusing to trust reported CI and coverage figures against an empty
-  diff.
+  diff, and also flags that observation as the weakest evidence in this document:
+  one instance, of the easiest case, of a model behaviour rather than a mechanism.
+- It does not claim a narrow learner restricted to `size` is safe. Section 4.6
+  argues the opposite, and that argument is the one to attack if you disagree
+  with this document.
 - It does not claim the protected floor fails. It claims the floor is a
   merge-time gate whose manifest half is unsigned, which is exactly what the
   floor's own docstring says it is.
@@ -992,23 +1018,30 @@ failure this document exists to prevent.
 
 **Verified by reading at skharness `2e8affdc`, on 2026-08-16:**
 `protected.py:10-14`, `:29-60`, `:92-114`;
-`engineering.py:56-58`, `:61-72`, `:226`, `:229-238`, `:300-312`, `:349`, `:357`,
-`:367`, `:371`, `:413-421`, `:428`, `:436-443`, `:453-456`, `:552-581`, `:588`,
-`:596-600`, `:607-612`, `:688-690`, `:704`;
+`engineering.py:56-58`, `:61-72`, `:226`, `:229-240`, `:242-248`, `:281-298`,
+`:300-312`, `:322-344`, `:349`, `:357`, `:362`, `:367`, `:371`, `:413-421`,
+`:428`, `:436-443`, `:448-452`, `:453-456`, `:552-581`, `:588-589`, `:596-600`,
+`:607-612`, `:622-624`, `:626-666`, `:668-677`, `:688-690`, `:704`;
 `ci.py:61-73`, `:115-124`, `:127-148`, `:151-188`;
 `adapters/base.py:453-469`;
-`types.py:66-76`, `:111-129`;
+`buckets.py:203-205`;
+`failure_memory.py:22`, `:47-59`, `:95`, `:119`, `:129-163`;
+`types.py:66-80`, `:111-129`;
 `digest.py:113-131`; `resolver.py:47-80`;
-`orchestrator.py:303-327`, `:805`, `:819`, `:824`, `:844-846`;
+`orchestrator.py:236-257`, `:303-327`, `:330-345`, `:805`, `:819`, `:824`,
+`:844-846`;
 `joules.py:92-106`; `config.py:17-21`, `:83`;
-`tests/data/joule-economy-golden-set-v1.json` (42 cards, `graded_by` metadata).
+`tests/data/joule-economy-golden-set-v1.json` (42 cards, `graded_by` metadata);
+`.github/workflows/ci.yml` job names in `skchat`, `skcapstone` and `skharness`
+(checked against the `_AUTOMERGE_CORE` substrings).
 Outside skharness: `skcoord/src/skcoord/coordination.py` `set_grade` (411-498);
 `skgateway/docs/specs/2026-08-08-model-ranking-routing-intelligence-arch.md:605-613`;
 `skcapstone/docs/superpowers/specs/2026-08-14-joule-economy-design.md` sections 0,
 3.3, 3.4, 3.5, 6.4, 9.
 
 **Measured on this node on 2026-08-16:** the four `~/.skcapstone/config/autopilot*.yaml`
-files (repo maps, `coverage_cmd` presence, `automerge_repos` empty in all four);
+files (repo maps, `coverage_cmd` presence, per-repo `automerge` flags, and
+`automerge_repos` empty in all four);
 `~/.skcapstone/fleet/objects/_protected.json` (10 globs, unsigned);
 `~/.skcapstone/coordination/gtd/waiting-for.json` (42 items, 38 autopilot, 38
 unanswered, 2026-07-27 to 2026-08-06); `archive.json` (82 autopilot decision
@@ -1031,6 +1064,33 @@ should be `42-59` (grounds, section 3); `engineering.py:564`/`:655` in card
 lives in `skgateway/docs/specs/`, not under `docs/superpowers/specs/`
 (ground 2).
 
+**Corrections this document makes to itself**, after an adversarial review on
+2026-08-16 that spot-checked its citations and attacked its structure:
+
+- Ground 5 was ranked first and presented as the strongest. It is scoped to the
+  `risk` axis of the work grade and cannot by itself refuse a learner trained on
+  `GateResult.score`. Section 4.0 now names section 3.3 as the load-bearing
+  ground, and ground 5 leads with its scope. **This was the review's critical
+  finding**, and the mis-ranking originated in the reshape design's own ordering,
+  not only here.
+- Section 3.5 claimed that populating `automerge_repos` would leave the decision
+  queue as "the only thing" between a self-graded diff and the integration
+  branch. Corrected: auto-merge is a conjunction of four conditions plus a
+  `_gh_merge` that can fail, and the queue is none of them.
+- Section 3.2 gave only the passive form of the coverage hole. The active form
+  (the instrument's own config files are unprotected, `cov_cmd`'s return code is
+  unchecked, and a stale `coverage.xml` is invisible to the grader but parsed by
+  the gate) is now stated.
+- Sections 2.4 and 3.6 are new: a live partial closed loop, and a live
+  cross-attempt channel that the exploration-slice rejection had treated as
+  hypothetical.
+- Section 4.6 is new: the best counter-argument to this refusal, in print, with
+  the answer to it.
+- Minor: `twin_gate_passed` was quoted with a retyped signature and no elision
+  marker; `ci.py:115-123` cut one line before the verdict return; only two of the
+  four autopilot configs were discussed; and the section 2.1 grader observation
+  is now explicitly labelled the weakest evidence in the document.
+
 ---
 
 ## 10. Related material
@@ -1039,7 +1099,13 @@ lives in `skgateway/docs/specs/`, not under `docs/superpowers/specs/`
   reshape. This document is the detailed argument behind its section 1.
 - Card `09573989`: the grade-calibration design, the recording-point finding, the
   risk-ratchet rule, the rejected exploration slice, the golden-set caveat.
+- Card `0b7e3ac3` (S20, M/crit): a card's own grade selects the model that grades
+  it. Open, and the place the section 2.4 fix belongs.
+- Card `f81d8d2d` (B4): the exploration budget and counterfactual logging.
+  Refused by ground 4.
 - Card `1e5be0a7`: the dead revert sensor. Open.
+- Card `6dff5c17`: graded model selection, shipped. It is what puts grades on
+  cards, which is what gives section 2.4 a blast radius.
 - Card `dab87c81`: this deliverable.
 - Epic `935d4b61`: the parent epic, whose acceptance criterion 5 this satisfies.
 - `2026-08-14-joule-economy-design.md` (skcapstone): D2 soft ceiling, D6
