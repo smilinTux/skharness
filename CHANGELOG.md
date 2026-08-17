@@ -9,7 +9,73 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ## [Unreleased]
 
+### Fixed
+- **The test suite is no longer able to append to the operator's live cost
+  ledger, and the writer that was doing it was never in this repo's suite**
+  (card `60245d49`, S29). The card's hypothesis was that a `ThreadPoolExecutor`
+  worker in `phase2_swarm` outlived its test and wrote once `monkeypatch` had
+  restored `SKAI_COST_DIR`. Refuted: `phase2_swarm` calls `f.result()` on every
+  future inside the `with ThreadPoolExecutor` block, so no worker outlives the
+  call; the only rows this suite writes from a worker thread are `t-0..t-3`
+  under `run_id="rp"`, and not one of them has ever reached the live ledger;
+  and instrumenting `record_run` for three full sessions recorded 89 writes, all
+  of them to isolated directories.
+  The writer is `~/clawd/skos`, which still carries the pre-extraction copy of
+  `test_autopilot_orchestrator.py` and drives this package through the
+  `skos.autopilot.orchestrator` shim with no `_isolate_cost_dir` of its own. Its
+  suite appended seven rows per run. The card's own measurement, a before/after
+  row count on a file several agents write to at once, could not attribute a
+  write, and the "only the aggregate leaks" signal was DURATION rather than
+  aggregation: the full suite runs twenty times longer than one file and so is
+  twenty times likelier to overlap a concurrent skos run. Six suspects were
+  each cleared honestly and all six were innocent. Full attribution in
+  `docs/S29-cost-ledger-leak-attribution.md`.
+  The fix is therefore in the WRITER, not in a fixture:
+  `autopilot_cost.assert_not_production_ledger_in_test` refuses an append to a
+  production cost tree from any pytest-resident process, on both the ledger and
+  the settlement journal, and is re-raised past the catch-alls in `record_run`,
+  `record_settlement` and `orchestrator.record_outcome_row` because a swallowed
+  refusal is a silently dropped row and a green suite. A fixture protects the
+  suite that defines it; a guard on the writer protects every suite that reaches
+  the writer, including the next consumer of the shim that inherits the engine
+  and forgets the isolation. This is the same posture `joules.py` already takes
+  with `ProductionWalletInTestError` for the wallet half of the same store.
+  `SKAI_ALLOW_PRODUCTION_LEDGER_WRITE=1` is the deliberate escape hatch.
+
 ### Added
+- **A session-scoped guard over both append-only production stores**
+  (card `60245d49`, S29). `tests/conftest.py` fingerprints
+  `~/.skcapstone/autopilot-cost/ledger.jsonl` and
+  `~/.skcapstone/agents/lumina/wallet/transactions.jsonl` at session start and
+  asserts them unchanged at session finish, setting the session exit status and
+  printing a banner if either moved. It fails rather than warns because a
+  warning in a 1500-test run is invisible.
+  It counts FIXTURE-SIGNATURE rows rather than comparing whole files, and that
+  choice is the lesson of the bug it comes from. Other sessions on this box
+  legitimately append to both files while the suite runs, so a whole-file
+  comparison both false-alarms and, worse, invites the wrong inference: a row
+  count on a shared file cannot say who wrote the row, which is precisely how
+  this card came to blame our own executor. The ledger's signature is a
+  conjunction of a card id no real card can have and a run id no real run can
+  have; the wallet's is the exact description string the finalize fixtures mint.
+  A genuine row appended by another session moves neither count.
+- **`skharness.autocode.ledger_correction`**, the disposition of the fixture
+  rows already in the ledger (card `60245d49`, S29). Shaped after S27's
+  `wallet_correction` and, like it, it NEVER writes to the store it corrects:
+  the correction is published as a sidecar `ledger.correction.json` beside the
+  ledger, because rewriting an append-only, Syncthing-synced file in place would
+  be a second unlogged corruption of the exact store being corrected and would
+  destroy the evidence of the first. Where the wallet needed a per-row balance
+  series (`balance_after` is a running total, so one fabricated mint poisons
+  every later row), the cost ledger carries no running total, so the correction
+  is the corrected AGGREGATES, overall and per day, which is what the daily cap
+  and `overview` actually read.
+  Measured against the live ledger: 253 of 253 rows are fixture output (183
+  `task-abc`/`skrender` from the agent-run bridge tests, 70 `t-*`/`skos` from
+  the orchestrator tests) and there are ZERO genuine rows. The corrected ledger
+  is empty. Every fabricated row carries `tokens=0` and `cost_usd=0.0`, which is
+  why no consumer that reads the aggregates instead of the row count ever saw
+  anything wrong.
 - **The shadow mutation probe is now CALLED on the live path** (card `788425b8`,
   S26). S23 built the worker-independent outcome label, gave it 43 tests and
   merged it, and nothing anywhere called `mutation.probe`: a module with no

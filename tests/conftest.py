@@ -1,12 +1,139 @@
 import importlib.util
+import json
+import sys
 from pathlib import Path
 
 import pytest
 
 from skharness.autocode import joules
+from skharness.autocode import ledger_correction
+from skharness.autocode import wallet_correction
 
 
 _HAVE_SKCAPSTONE = importlib.util.find_spec("skcapstone") is not None
+
+
+# --------------------------------------------------------------------------- #
+# Session-scoped production-store guard (S29, card 60245d49)                   #
+# --------------------------------------------------------------------------- #
+#
+# Fingerprint BOTH append-only production stores at session start and assert
+# them unchanged at session end.
+#
+# WHY A SESSION GUARD AND NOT A UNIT TEST. The leak this closes was invisible to
+# every per-file check: each suspect file ran clean on its own, so six files
+# were each cleared honestly and all six were innocent. A defect that only
+# exists in the aggregate needs a check that only runs in the aggregate.
+#
+# WHY A FIXTURE-SIGNATURE COUNT AND NOT A WHOLE-FILE COMPARISON. Several agents
+# run suites on this box at once and other processes legitimately append to both
+# files while this suite is running, so a naive before/after byte or row
+# comparison produces false alarms. Worse, it produces the WRONG INFERENCE: the
+# card this guard comes from concluded from exactly such a count that our own
+# ThreadPoolExecutor was leaking, when the writer was a different repo's suite
+# entirely (docs/S29-cost-ledger-leak-attribution.md). A row count on a shared
+# file cannot attribute a write. So the fingerprint counts only rows carrying a
+# TEST FIXTURE signature: for the ledger a card id no real card can have, for
+# the wallet the exact description string the finalize fixtures mint. A genuine
+# row appended by another session moves neither count.
+#
+# WHY IT FAILS AND DOES NOT WARN. A warning in a 1500-test run is invisible;
+# that is a fact about attention, not about pytest. This sets the session exit
+# status and prints a banner.
+
+_LIVE_LEDGER = Path("~/.skcapstone/autopilot-cost/ledger.jsonl").expanduser()
+_LIVE_WALLET = Path("~/.skcapstone/agents/lumina/wallet/transactions.jsonl").expanduser()
+
+
+def _wallet_fixture_rows(path: Path) -> int:
+    """Count wallet rows carrying the fixture mint signature. READ ONLY, and
+    never raises: a guard that can break the suite it guards is a liability."""
+    if not path.exists():
+        return 0
+    total = 0
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if (isinstance(row, dict)
+                        and str(row.get("description", "")).strip()
+                        == wallet_correction.FIXTURE_DESCRIPTION):
+                    total += 1
+    except OSError:
+        return total
+    return total
+
+
+def _production_fixture_counts() -> dict:
+    try:
+        return {
+            "cost ledger": (str(_LIVE_LEDGER),
+                            ledger_correction.count_fixture_rows(_LIVE_LEDGER)),
+            "joule wallet": (str(_LIVE_WALLET), _wallet_fixture_rows(_LIVE_WALLET)),
+        }
+    except Exception:  # noqa: BLE001 -- never let the guard break the suite
+        return {}
+
+
+def pytest_sessionstart(session):
+    session.config._s29_store_baseline = _production_fixture_counts()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    before = getattr(session.config, "_s29_store_baseline", None)
+    if not before:
+        return
+    after = _production_fixture_counts()
+    moved = [
+        (name, path, before[name][1], count)
+        for name, (path, count) in after.items()
+        if name in before and count > before[name][1]
+    ]
+    if not moved:
+        return
+
+    # Attribution, so the failure says WHICH process wrote. This one is
+    # deterministic where the file count is not: the writer guard in
+    # autopilot_cost refuses a production append from any pytest process, so a
+    # row that appears while this suite runs came from a checkout that does not
+    # have that guard yet. Saying so is the difference between a red that
+    # teaches and a red that gets muted.
+    banner = [
+        "",
+        "=" * 78,
+        "PRODUCTION STORE CORRUPTED DURING THIS TEST SESSION",
+        "=" * 78,
+    ]
+    for name, path, was, now in moved:
+        banner.append(f"  {name}: fixture rows {was} -> {now}  (+{now - was})")
+        banner.append(f"    {path}")
+    banner += [
+        "",
+        "  These stores are append-only and Syncthing-synced. A fixture row",
+        "  written into them cannot be taken back; it can only be corrected",
+        "  beside them (skharness.autocode.ledger_correction,",
+        "  skharness.autocode.wallet_correction).",
+        "",
+        "  If this suite wrote them, an isolation fixture in tests/conftest.py",
+        "  regressed. If it did not, another checkout on this box is running a",
+        "  suite without the writer guard: ~/clawd/skos drives this package",
+        "  through the skos.autopilot.orchestrator shim and its tests/conftest.py",
+        "  has no _isolate_cost_dir. See docs/S29-cost-ledger-leak-attribution.md.",
+        "=" * 78,
+        "",
+    ]
+    print("\n".join(banner), file=sys.stderr)
+    # wrap_session returns session.exitstatus AFTER this hook runs, so setting
+    # it here is what actually turns the run red. Only ever raises the status;
+    # a real test failure must not be downgraded into this one.
+    if not exitstatus:
+        session.exitstatus = 1
 
 
 def pytest_collection_modifyitems(config, items):

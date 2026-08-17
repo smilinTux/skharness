@@ -207,8 +207,12 @@ def record_outcome_row(item, *, terminal_state: str, run_id: str, result=None,
     body is guarded besides: a telemetry bug must never turn a real build into
     a crash.
     """
+    # Imported OUTSIDE the try below, because the first except clause names an
+    # exception off this module: if the import lived inside the try, a failed
+    # import would raise NameError while pytest was evaluating that clause,
+    # turning a missing module into a confusing crash on the telemetry path.
+    from . import autopilot_cost
     try:
-        from . import autopilot_cost
         from .escalation import reason_from_payload
         from .types import UNRECORDED
         payload = getattr(item, "payload", None) or {}
@@ -247,6 +251,14 @@ def record_outcome_row(item, *, terminal_state: str, run_id: str, result=None,
             # the label and never reads it back, so the shadow seam stays shut.
             mutation_report=getattr(result, "mutation_report", None),
         )
+    except autopilot_cost.ProductionLedgerInTestError:
+        # The ONE exception this catch-all must not eat. Swallowing it would
+        # convert "a test suite is corrupting the operator's append-only cost
+        # ledger" into a health event nobody reads, and a green suite. That is
+        # exactly how the leak this guard closes survived: the isolation was
+        # missing in a consumer repo and every signal stayed green. A build
+        # never reaches this branch, because a build is not a test run.
+        raise
     except Exception as exc:      # noqa: BLE001 - telemetry never breaks a build
         health.record("outcome_row_error", task=getattr(item, "ref", ""),
                       terminal_state=terminal_state, error=str(exc)[:120])

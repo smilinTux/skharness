@@ -21,11 +21,23 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 from datetime import date as _date_cls
 from datetime import timedelta
 from pathlib import Path
 
 log = logging.getLogger("skharness.autocode.autopilot_cost")
+
+#: The one env var that moves the whole cost tree, ledger and settlement journal
+#: together. Named here so the guard below and its error message cannot drift
+#: from the resolver.
+COST_DIR_ENV = "SKAI_COST_DIR"
+
+#: Escape hatch for the (currently hypothetical) case where a process that has
+#: imported pytest genuinely needs to append to the operator's real ledger. It
+#: exists so the guard is an obstacle rather than a wall, and it has to be set
+#: deliberately: nothing in any suite sets it.
+ALLOW_PRODUCTION_WRITE_ENV = "SKAI_ALLOW_PRODUCTION_LEDGER_WRITE"
 
 # Joules are the canonical SKWorld cost unit; USD is secondary/derived. Rate
 # comes from the real skjoule knob (joules.DEFAULT_JOULE_PER_USD); the literal
@@ -50,10 +62,101 @@ def _joules(cost_usd: float) -> int:
 # --------------------------------------------------------------------------- #
 
 
+class ProductionLedgerInTestError(RuntimeError):
+    """A test run was about to append to the operator's real cost tree.
+
+    Deliberately loud, and deliberately re-raised past the catch-alls that guard
+    every other failure on this write path, because the failure it replaces was
+    silent. See :func:`assert_not_production_ledger_in_test`.
+    """
+
+
+def _production_cost_dirs() -> set[Path]:
+    """Every directory that holds the operator's real, Syncthing-synced cost
+    tree. ``SKCAPSTONE_HOME`` is honoured because the fleet sets it on some
+    nodes, so "production" is not only the literal ``~/.skcapstone``."""
+    roots: set[Path] = set()
+    homes = [Path.home() / ".skcapstone"]
+    override = os.environ.get("SKCAPSTONE_HOME")
+    if override:
+        homes.append(Path(override))
+    for home in homes:
+        try:
+            roots.add((home / "autopilot-cost").expanduser().resolve())
+        except Exception:  # noqa: BLE001 -- an unresolvable candidate is not a root
+            continue
+    return roots
+
+
+def _in_test_run() -> bool:
+    """True while pytest is driving this process.
+
+    Same predicate ``joules._in_test_run`` uses, restated locally rather than
+    imported so a broken or absent joules import cannot silently disable this
+    guard (that module is imported in a bare ``try/except`` above). The
+    ``sys.modules`` half is the load-bearing one: ``PYTEST_CURRENT_TEST`` is
+    unset between tests and during session teardown, which are precisely the
+    windows an escaped write would land in.
+    """
+    return bool(os.environ.get("PYTEST_CURRENT_TEST")) or "pytest" in sys.modules
+
+
+def assert_not_production_ledger_in_test(path: Path) -> None:
+    """Refuse, loudly, to append to the real cost tree from a test run.
+
+    WHY THIS IS IN THE WRITER AND NOT IN A CONFTEST FIXTURE. This repo already
+    had the fixture: ``tests/conftest.py`` points ``SKAI_COST_DIR`` at a
+    throwaway dir for every test. It worked, for this repo's suite, and the
+    ledger kept filling with fixture rows anyway, because
+    ``skos/autopilot/orchestrator.py`` is a shim over this package and
+    ``skos/tests/`` still carries the pre-extraction copy of the orchestrator
+    tests. Those tests drive THIS writer with none of this repo's isolation, so
+    every skos suite run appended seven rows to the operator's ledger (see
+    docs/S29-cost-ledger-leak-attribution.md).
+
+    A fixture protects the suite that defines it. A guard on the writer protects
+    every suite that reaches the writer, including the ones in repos this one
+    cannot see, and including the next consumer of the shim that inherits the
+    engine and forgets the isolation. That asymmetry is the whole argument, and
+    it is the same one ``joules.ProductionWalletInTestError`` already makes for
+    the wallet half of the same store.
+
+    WHAT IT COSTS. A production module now behaves differently when pytest is
+    resident in the process. That is real coupling and it is not free: a genuine
+    autopilot run that somehow imported pytest would be refused, which is why
+    :data:`ALLOW_PRODUCTION_WRITE_ENV` exists. Weighed against it, the failure
+    being prevented is an append-only, Syncthing-synced store that is currently
+    253 rows of pytest output and zero real runs.
+    """
+    if not _in_test_run():
+        return
+    if os.environ.get(ALLOW_PRODUCTION_WRITE_ENV) == "1":
+        return
+    try:
+        target = Path(path).expanduser().resolve().parent
+    except Exception:  # noqa: BLE001 -- unresolvable means not a production root
+        return
+    if target in _production_cost_dirs():
+        raise ProductionLedgerInTestError(
+            f"refusing to append to the PRODUCTION cost tree from a test run: {path}. "
+            f"This store is append-only and Syncthing-synced, so a fixture row written "
+            f"here cannot be taken back. Set {COST_DIR_ENV} to a throwaway directory "
+            f"for the whole suite (skharness tests/conftest.py does this for every test "
+            f"via the autouse _isolate_cost_dir fixture; a consumer repo driving "
+            f"skharness.autocode needs its own copy of it). "
+            f"See docs/S29-cost-ledger-leak-attribution.md."
+        )
+
+
 def cost_dir() -> Path:
     """The cost ledger directory, created if missing. Overridable via
-    ``SKAI_COST_DIR`` (tests never touch the live Syncthing-synced path)."""
-    p = Path(os.environ.get("SKAI_COST_DIR", "~/.skcapstone/autopilot-cost")).expanduser()
+    ``SKAI_COST_DIR`` (tests never touch the live Syncthing-synced path).
+
+    Resolving is not writing, so this is deliberately NOT guarded: reads,
+    aggregates and the ``overview`` CLI must keep working under pytest. The
+    guard sits on the two append paths instead.
+    """
+    p = Path(os.environ.get(COST_DIR_ENV, "~/.skcapstone/autopilot-cost")).expanduser()
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -235,8 +338,16 @@ def record_run(*, card_id: str, repo: str, tokens: int, cost_usd: float,
     }
     try:
         path = ledger_path()
+        # OUTSIDE the swallow below, by re-raise. A best-effort write that
+        # quietly drops a row is the right posture for a full disk or a bad
+        # permission; it is the wrong posture for "this row must not exist",
+        # because a swallowed refusal reads as a clean suite and the next
+        # consumer repo repeats the omission.
+        assert_not_production_ledger_in_test(path)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+    except ProductionLedgerInTestError:
+        raise
     except Exception:  # noqa: BLE001 -- ledger writes are best-effort
         log.exception("autopilot_cost.record_run: failed to append ledger row")
 
@@ -332,8 +443,15 @@ def record_settlement(*, card_id: str, commit_sha: str, agent: str, minted: int,
     }
     try:
         path = settlements_path()
+        # Guarded on the same terms as the ledger, and for a sharper reason: a
+        # fixture row here is not merely noise, it is a double-settle guard that
+        # will refuse a REAL settlement later, because already_settled() matches
+        # on card_id alone.
+        assert_not_production_ledger_in_test(path)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+    except ProductionLedgerInTestError:
+        raise
     except Exception:  # noqa: BLE001 -- settlement-journal writes are best-effort
         log.exception("autopilot_cost.record_settlement: failed to append settlement row")
 
