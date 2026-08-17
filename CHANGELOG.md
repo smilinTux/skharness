@@ -28,6 +28,24 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   session" and "session is empty" are different facts. `compat`'s session
   affinity keys are deliberately never written, so the harness is the single
   source of `x-session-id`.
+- **A per-process agent / session / node identity, so two concurrent sessions on
+  one box are no longer indistinguishable.** Every session on this fleet writes
+  to the coordination board as the same AGENT name, so the overlay log's 2,027
+  events carry only three distinct writers and four concurrent sessions collapse
+  into one. `autocode.identity.resolve_identity()` mints a uuid4 session id once
+  per process (honouring `SK_SESSION_ID` so a resumed run keeps its identity) and
+  resolves the agent through the documented `SKAGENT` > `SKCAPSTONE_AGENT` >
+  `SKMEMORY_AGENT` > `lumina` precedence. It also records WHICH variable it read,
+  as `agent_var` / `session_id_var`, because that ambiguity is real in
+  production: one systemd unit on .41 sets `SKAGENT=jarvis`,
+  `SKMEMORY_AGENT=lumina` and `SKCHAT_IDENTITY=capauth:opus@skworld.io`
+  simultaneously, and recording only the resolved value destroys information that
+  cannot be reconstructed. A variable set to an empty or whitespace value counts
+  as unset and falls through, so a bare `Environment=SKAGENT=` cannot pin the
+  agent to the empty string. `AutocodeSessionRegistry.register()` now defaults its
+  sid and host from the same resolver, so the on-disk session descriptor and the
+  run record cannot disagree. Nothing backfills: historical events never carried a
+  session id and any value written onto them now would be a guess.
 - **Graded dispatch: a card's grade now selects the model.** `model_class` and
   `sensitivity` map onto a skgateway bucket id (`sk-<class>-<sensitivity>`),
   intended to replace the single static `autocode.config.harness_model`.

@@ -27,6 +27,7 @@ import os
 import time
 from pathlib import Path
 
+from skharness.autocode.identity import resolve_identity
 from skharness.harness import SessionDescriptor
 
 SOURCE_AUTOCODE = "autocode"
@@ -55,9 +56,26 @@ class AutocodeSessionRegistry:
     def __init__(self, *, root: Path | None = None) -> None:
         self.root = Path(root) if root is not None else sessions_root()
 
-    def register(self, *, sid: str, host: str = "", repo: str = "",
+    def register(self, *, sid: str | None = None, host: str = "", repo: str = "",
                 model: str = "", last_message: str = "") -> SessionDescriptor:
-        """Create (or overwrite) sid's descriptor as a running autocode session."""
+        """Create (or overwrite) sid's descriptor as a running autocode session.
+
+        ``sid`` and ``host`` default to the process identity from
+        ``autocode.identity.resolve_identity`` (card A2.1) rather than to a
+        locally minted id. That is the whole point of the default: the sid in
+        this descriptor is then byte-identical to the one the run record
+        carries, because both read the same memoized value. Two ids for one
+        session would rebuild the very ambiguity A2.1 removes.
+
+        Per this module's convention, the resolve call is NOT wrapped: a real
+        failure surfaces to the caller, which decides how much protection it
+        wants (``orchestrator._register_session`` already wraps this whole
+        call).
+        """
+        if not sid or not host:
+            identity = resolve_identity()
+            sid = sid or identity.session_id
+            host = host or identity.node
         desc = SessionDescriptor(
             sid=sid, host=host, harness="autocode", repo=repo, model=model,
             state="running", last_activity=time.time(),
