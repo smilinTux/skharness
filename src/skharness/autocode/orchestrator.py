@@ -130,7 +130,16 @@ def record_outcome_row(item, *, terminal_state: str, run_id: str, result=None,
 
     ``model_served`` is ALWAYS None here, on purpose. The orchestrator does not
     observe what skgateway actually served; echoing ``model_requested`` would
-    manufacture the exact fact that field exists to detect.
+    manufacture the exact fact that field exists to detect. A consequence worth
+    stating plainly: because of it, ``record_run`` classifies the escalation
+    state of every row this function writes as ``unobserved``, which is the
+    honest verdict and not a defect of the classifier.
+
+    The ``escalation_reason`` passed through is whatever a HUMAN wrote on the
+    card (Joule Economy D2). It is carried to the ledger for a human to read
+    later and is never consulted by anything that selects a model; the
+    orchestrator's own model decision, ``_model_requested`` above, does not
+    look at it.
 
     ``pr`` is always "" here: the gated executor does not surface the PR url
     back to the orchestrator, so there is nothing to record. Rows join to a PR
@@ -142,6 +151,7 @@ def record_outcome_row(item, *, terminal_state: str, run_id: str, result=None,
     """
     try:
         from . import autopilot_cost
+        from .escalation import reason_from_payload
         from .types import UNRECORDED
         payload = getattr(item, "payload", None) or {}
         autopilot_cost.record_run(
@@ -165,6 +175,7 @@ def record_outcome_row(item, *, terminal_state: str, run_id: str, result=None,
             quality_mode=(getattr(result, "mode", None) if result is not None
                           else payload.get("quality")),
             work_grade=payload.get("work_grade"),
+            escalation_reason=reason_from_payload(payload),
         )
     except Exception as exc:      # noqa: BLE001 - telemetry never breaks a build
         health.record("outcome_row_error", task=getattr(item, "ref", ""),

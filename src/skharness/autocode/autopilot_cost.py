@@ -82,7 +82,8 @@ def record_run(*, card_id: str, repo: str, tokens: int, cost_usd: float,
                model_served: str | None = None, score: int | None = None,
                retries: int = 0, quality_mode: str | None = None,
                work_grade: dict | None = None,
-               terminal_state: str | None = None) -> None:
+               terminal_state: str | None = None,
+               escalation_reason: str | None = None) -> None:
     """Append one run to the ledger. Never raises -- a cost-tracking bug must
     never turn a successful (or a well-formed failed) run into a crash.
 
@@ -125,9 +126,46 @@ def record_run(*, card_id: str, repo: str, tokens: int, cost_usd: float,
     the row says "this item ended, and no gate outcome exists", which is
     neither a pass nor a null.
 
-    NO BACKFILL: rows written before this change carry none of these nine
+    ``escalation_reason`` (S12, card 9a7c0a86) is the WRITTEN justification a
+    human put on the card for using a model above its ``model_class`` floor;
+    Joule Economy design D2 makes it the one sanctioned feedback channel, the
+    corpus a human reads to decide a rubric was wrong. It is carried verbatim
+    and never synthesised: a machine-written reason would poison the exact
+    corpus it exists to fill.
+
+    The three FACT keys beside it (``escalation_state``,
+    ``escalation_floor_class``, ``escalation_served_class``) are COMPUTED here
+    from ``work_grade`` and ``model_served``, two arguments this function
+    already receives, rather than accepted from a caller. Deliberate on both
+    sides: no caller can forget to stamp them, and no caller can stamp a state
+    that disagrees with the row's own grade and served model. This does not
+    re-derive the grade; ``escalation`` reads the precomputed ``model_class``.
+
+    Because ``model_served`` is None on every row written today and no card
+    carries a grade, ``escalation_state`` is ``unobserved`` on essentially
+    every live row. That is the honest answer and the ledger says it out loud
+    rather than defaulting to ``within_floor``, which would report zero
+    escalation forever and read as good news.
+
+    NOTHING READS THESE FIELDS TO ROUTE. They are reporting only. Feeding them
+    back into dispatch would be the autotuner card 09573989 AC6 forbids.
+
+    NO BACKFILL: rows written before this change carry none of these thirteen
     keys at all (not even as null), and nothing on the read path invents a
     value for them."""
+    try:
+        from . import escalation as _esc
+        esc_fields = _esc.escalation_row(work_grade, model_served, escalation_reason)
+    except Exception:  # noqa: BLE001 -- a verdict bug must never lose the row
+        log.exception("autopilot_cost.record_run: escalation classification failed")
+        try:
+            from . import escalation as _esc2
+            esc_fields = _esc2.unobserved_row(reason=escalation_reason)
+        except Exception:  # noqa: BLE001 -- last resort, still never absent keys
+            esc_fields = {"escalation_state": "unobserved",
+                          "escalation_floor_class": None,
+                          "escalation_served_class": None,
+                          "escalation_reason": None}
     row = {
         "ts": ts, "date": ts[:10], "card_id": card_id, "repo": repo,
         "tokens": tokens, "cost_usd": cost_usd, "joules": _joules(cost_usd),
@@ -136,6 +174,7 @@ def record_run(*, card_id: str, repo: str, tokens: int, cost_usd: float,
         "model_requested": model_requested, "model_served": model_served,
         "score": score, "retries": retries, "quality_mode": quality_mode,
         "work_grade": work_grade, "terminal_state": terminal_state,
+        **esc_fields,
     }
     try:
         path = ledger_path()
@@ -338,6 +377,36 @@ def daily_series(*, today: str, days: int = 30) -> list[dict]:
     except Exception:  # noqa: BLE001 -- a chart-read bug must never break the page
         log.exception("autopilot_cost.daily_series: failed")
         return []
+
+
+def escalation_summary(*, since: str | None = None) -> dict:
+    """Escalation rate PER MODEL CLASS over the ledger (design section 9).
+
+    The phase 2 exit gate is "escalation rate per class is stable and
+    EXPLAINABLE", explainable by a human. So this returns a per-class
+    stratification and never a single blended number: an XL-floor card
+    escalating means almost nothing (there is barely any ceiling above it),
+    while an S-floor card escalating constantly says the S rubric is wrong, and
+    averaged together those two facts cancel.
+
+    Read this WITH ``observed_fraction``, which travels beside every rate. The
+    rate's denominator is observed rows only, and ``escalation_rate`` is None
+    rather than 0.0 when nothing was observed. Today that is the normal case:
+    ``model_served`` is None on every row, so almost everything classifies as
+    ``unobserved`` and a 0.0 would be a reassuring lie.
+
+    ``since`` optionally restricts to rows on or after an ISO date. Never
+    raises, matching the rest of this module's read helpers.
+    """
+    try:
+        from . import escalation
+        rows = _read_ledger()
+        if since:
+            rows = [r for r in rows if (r.get("date") or "") >= since]
+        return escalation.escalation_rates(rows)
+    except Exception:  # noqa: BLE001 -- a report bug must never break a caller
+        log.exception("autopilot_cost.escalation_summary: failed")
+        return {"by_class": {}, "totals": {}, "ungraded_rows": 0}
 
 
 def recent_settlements(limit: int = 20) -> list[dict]:
