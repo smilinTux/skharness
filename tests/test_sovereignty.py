@@ -24,6 +24,10 @@ from skharness.autocode import sovereignty as sov
 
 CLOUD_SERVED_ALLOWLISTED_NAME = ("nvidia", "imputed_cloud", None,
                                  "meta/llama-3.3-70b-instruct")
+#: `ornith-big` was `orchestrator.GRADER_MODEL` when this card was written. The
+#: pin has since moved (the 35B was retired and the id 404s), but the fixture
+#: does NOT move with it: it is a row the ledger actually holds, and repointing
+#: it at whatever is pinned today would replace recorded evidence with a guess.
 CLOUD_SERVED_THE_PINNED_GRADER = ("nvidia", "imputed_cloud", None, "ornith-big")
 GENUINELY_SOVEREIGN = ("reg:ornith", "measured_gpu", "ollama", "sk-default")
 SOVEREIGN_IMPUTED = ("reg:ornith", "imputed_local", None, "sk-default")
@@ -45,12 +49,19 @@ def test_a_cloud_served_model_with_an_allowlisted_name_is_not_sovereign():
 
 
 def test_the_pinned_grader_model_served_by_cloud_is_not_sovereign():
-    """`ornith-big` IS orchestrator.GRADER_MODEL, the id this repo pinned as
+    """`ornith-big` was `orchestrator.GRADER_MODEL`, the id this repo pinned as
     "sovereign". The ledger has it on backend=nvidia, basis=imputed_cloud. The
     old prefix rule returned True for that row, which means raw card text went
-    to a cloud provider behind a green gate."""
+    to a cloud provider behind a green gate.
+
+    The pin has since been repointed (the 35B behind it was retired and the id
+    404s) and this fixture deliberately did not follow it. The row is evidence,
+    and the guard that matters is not "the fixture matches today's pin" but that
+    the verdict does not depend on the pin at all: `classify` never sees a model
+    id, so the same row is refused whatever is pinned.
+    """
     backend, basis, node, model = CLOUD_SERVED_THE_PINNED_GRADER
-    assert model == orch.GRADER_MODEL, "fixture drifted from the pin it targets"
+    assert model != orch.GRADER_MODEL, "the retired 35B must not be re-pinned"
     assert sov.classify(backend, basis, node).state == sov.VIOLATED
 
 

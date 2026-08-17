@@ -1222,6 +1222,41 @@ def test_the_requested_grader_model_is_recorded_as_provenance():
     assert orch.requested_grader_model(MagicMock()) == orch.GRADER_MODEL  # Mock is not a str
 
 
+#: What skgateway at http://localhost:18780 actually did on 2026-08-16, recorded
+#: by POSTing a one-token completion per id and reading back the HTTP status and
+#: the `model` the response named. Not a catalog listing: this fleet's catalog
+#: has advertised ids that 404, so only a response is evidence of serving.
+#:
+#: Re-record it (same method) whenever GRADER_MODEL moves. An id missing from
+#: this map reads as dead on purpose, so a new pin cannot be adopted without
+#: someone observing the fleet serve it.
+FLEET_OBSERVED_2026_08_16 = {
+    "ornith-big":                            (404, ""),   # ornith-aeon.service, retired
+    "ornith-1.0-35b":                        (404, ""),   # same weights, same retirement
+    "ornith-1.0-9b":                         (200, "ornith-1.0-9b"),
+    "qwen3.8-27b-huihui-abliterated-q4_k_m": (200, "qwen3.8-27b-huihui-abliterated-q4_k_m"),
+}
+
+
+def test_the_grader_pin_names_a_model_the_fleet_actually_serves():
+    """The regression that motivated this: `ornith-big` stayed pinned for weeks
+    after the 35B was retired off chiap08, because a pin at a dead model and a
+    pin at a live one look identical until something asks.
+
+    This runs the real `doctor.check_grader_pin` against the recorded fleet
+    rather than the live one, so it is deterministic and offline while still
+    being a question about serving and not about the shape of a string. A
+    syntactically perfect id that nothing serves fails here.
+    """
+    from skharness.autocode import doctor
+
+    def replay(model, base_url, timeout):
+        status, served = FLEET_OBSERVED_2026_08_16.get(model, (404, ""))
+        return status, served, "no such model"
+    c = doctor.check_grader_pin(orch.GRADER_MODEL, "http://replay:18780", probe=replay)
+    assert c.status == "ok", c.detail
+
+
 def test_a_board_without_set_grade_does_not_break_the_pass(tmp_path):
     _write_task(tmp_path, "t-1", tags=["repo:skos"])
     board = _board(["t-1"])

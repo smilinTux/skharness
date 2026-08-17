@@ -10,6 +10,21 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 ## [Unreleased]
 
 ### Changed
+- **`GRADER_MODEL` was pinned to a model that no longer exists.** `ornith-big`
+  and its alias `ornith-1.0-35b` both return HTTP 404 from skgateway: the 35B
+  behind `ornith-aeon.service` was retired off chiap08 and stays retired,
+  because a 35B beside `llama-qwen38` contends for the same GPU. The pin is now
+  `qwen3.8-27b-huihui-abliterated-q4_k_m`, verified 2026-08-16 answering HTTP
+  200 from `localhost:18780` and naming itself back (so no failover). Chosen
+  over the surviving `ornith-1.0-9b` because it is the larger sovereign model on
+  our own hardware, carries the 262144 context and 8192 output floor a grader
+  reading a whole diff needs, and being abliterated will not refuse to grade a
+  security-related change. Still deliberately a pinned id and NOT `sk-default`,
+  which moved three times in two days: a grader whose identity changes silently
+  cannot be reasoned about. This is provenance only, not permission. Sovereignty
+  is still decided by observed serving facts (`sovereignty.py`), and nothing
+  here reintroduces a name-based check.
+
 - **The default harness is now `pi`, not `claude-code`** (card `1db15e43`, A4.2).
   `BaseCliAdapter.supports_model_override()` is False and only `PiAdapter`
   overrides it to True; `_run_raw` RAISES `ModelOverrideUnsupported` on a
@@ -25,6 +40,21 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   `autopilot-pi.yaml`) name a harness explicitly and are unaffected.
 
 ### Added
+- **`skharness doctor` now PROBES the pinned grader** (`doctor.check_grader_pin`).
+  A config pinning a dead model and one pinning a live model look identical until
+  something asks, which is why `ornith-big` survived the retirement of the service
+  that served it. Nothing in this repo ever asked. It asks now, with a one-token
+  completion rather than a `/v1/models` lookup: this fleet's catalog has
+  advertised ids that 404, so a catalog hit does not distinguish live from dead.
+  Three outcomes, and the middle one is the point: `fail` when the gateway is up
+  and refuses the id, `warn` when the gateway answered under a DIFFERENT id
+  (failover, so the pin is not the grader of record), and `warn` when the gateway
+  could not be reached at all, because a pin nobody could verify is UNVERIFIED
+  and not confirmed live. **An unreachable gateway can never make this check
+  `ok`.** A checker that reports healthy on an observation it never made is the
+  failure being removed, not a check on it. Pinned by a test that replays the
+  fleet as observed on 2026-08-16, so the regression is caught offline and
+  moving the pin means re-recording a real observation.
 - **"Work that fits pi" is written down** in `autocode/config.py`, as a docstring
   section and as `fits_pi()` / `requires_pi()`. An undefined scope becomes
   whatever the first ambiguous card makes it mean. Four legs: the repo resolves

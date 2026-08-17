@@ -78,11 +78,60 @@ def test_decline_signal_ok_when_low(tmp_path, monkeypatch):
     assert doctor.check_decline_signal().status == "ok"
 
 
+def test_grader_pin_ok_when_the_gateway_names_the_pin_back():
+    c = doctor.check_grader_pin("m-1", "http://gw:18780",
+                                probe=lambda *a: (200, "m-1", ""))
+    assert c.status == "ok"
+
+
+def test_grader_pin_fails_when_the_gateway_refuses_the_id():
+    """The `ornith-big` case: the gateway is up and the pinned model is gone."""
+    c = doctor.check_grader_pin("ornith-big", "http://gw:18780",
+                                probe=lambda *a: (404, "", "model not found"))
+    assert c.status == "fail"
+    assert "ornith-big" in c.detail and "404" in c.detail
+    assert "GRADER_MODEL" in c.fix
+
+
+def test_grader_pin_cannot_report_ok_when_it_could_not_reach_the_gateway():
+    """The load-bearing negative control. A checker that says healthy when it
+    observed nothing is the exact failure this check exists to remove, so an
+    unreachable gateway must warn LOUDLY and can never come back ok."""
+    c = doctor.check_grader_pin("m-1", "http://gw:18780",
+                                probe=lambda *a: (None, "", "URLError: refused"))
+    assert c.status == "warn" and c.ok is False
+    assert "UNVERIFIED" in c.detail
+
+
+def test_grader_pin_warns_when_a_different_model_answered():
+    """skgateway resolves failover server side. A 200 from something else means
+    the pin is not the grader of record, so the grade it stamps is a fiction."""
+    c = doctor.check_grader_pin("m-1", "http://gw:18780",
+                                probe=lambda *a: (200, "m-9", ""))
+    assert c.status == "warn"
+    assert "m-9" in c.detail
+
+
+def test_grader_pin_defaults_to_the_orchestrator_pin(monkeypatch):
+    from skharness.autocode import orchestrator as orch
+    seen = {}
+
+    def _probe(model, base_url, timeout):
+        seen["model"], seen["base"] = model, base_url
+        return 200, model, ""
+    monkeypatch.setenv("SKCODE_GATEWAY_BASE", "http://elsewhere:18780")
+    assert doctor.check_grader_pin(probe=_probe).status == "ok"
+    assert seen == {"model": orch.GRADER_MODEL, "base": "http://elsewhere:18780"}
+
+
 def test_preflight_runs_all_and_records(tmp_path, monkeypatch):
     monkeypatch.setenv("SKHARNESS_HEALTH_PATH", str(tmp_path / "h.jsonl"))
+    # Point the grader probe at a closed port: preflight must not put real
+    # traffic on the live fleet from a test run. It warns, which is correct.
+    monkeypatch.setenv("SKCODE_GATEWAY_BASE", "http://127.0.0.1:1")
     results = doctor.preflight()
-    assert {r.name for r in results} == {"shim-delegation", "auth",
-                                         "proxy-image", "decline-rate", "concurrency"}
+    assert {r.name for r in results} == {"shim-delegation", "auth", "proxy-image",
+                                         "grader-pin", "decline-rate", "concurrency"}
     assert health.recent("preflight")               # verdict recorded
 
 
