@@ -18,7 +18,7 @@ These are settled. Re-open them only with a written reason on the card.
 | D3 | Outcome recording is **append-only, from the orchestrator, at every terminal state**. Never at settle time. Inherited verbatim from card `09573989`. |
 | D4 | The recorder is `autopilot_cost.record_run`, **extended**, never a new store. "Do NOT create a parallel grade store" is load-bearing in this ecosystem. |
 | D5 | `GateResult` gains an `outcome` field. The terminal-state vocabulary must survive above `engineering.py`, where it is currently destroyed. |
-| D6 | Every card touching `engineering.py` is risk `high` and cannot be autopilot-merged. `engineering.py` is on `_ALWAYS_PROTECTED`. This is a feature. |
+| D6 | Every card touching `engineering.py` is risk `high` and cannot be autopilot-merged. **Corrected 2026-08-16:** the reason is that `automerge_repos` is `[]` in every live config, so all work is PR-only. It is NOT the `_ALWAYS_PROTECTED` carve-out, whose sole call site is unreachable (card `53e9190c`). The effect is the same today; the mechanism is not the documented one. |
 | D7 | No backfill. Rows written before this lands carry no outcome vocabulary, and nothing invents one for them. |
 
 ---
@@ -36,10 +36,24 @@ human review, and `rubric_version` increments only when the golden set changes.
 **2. No machine writes to routing policy.** `2026-08-08-model-ranking-routing-intelligence-arch.md`
 section 10: the system suggests, humans commit.
 
-**3. The rubric is already on the self-modification floor.** `protected.py:42-51`
-unconditionally protects `grading.py`, `sensitivity.py`, `buckets.py`, the vocabulary and
+**3. The rubric is nominally on the self-modification floor.** `protected.py:42-59`
+lists `grading.py`, `sensitivity.py`, `buckets.py`, the vocabulary and
 `golden-set-*.json`, because an engine routed by that rubric could edit it and merge the
 change behind a twin gate whose CI arm it satisfies with tests it wrote itself.
+
+**CORRECTION 2026-08-16, and this ground is weaker than it reads.** The S13 verdict
+pass found, and I independently verified, that `changed_paths_are_protected` has
+**exactly one call site in the whole source tree** (`engineering.py:570`) and it sits
+inside `if automerge:` (`:568`). `automerge` requires `repo.name in
+self.config.automerge_repos`, and that list is `[]` in all four live configs. **So the
+carve-out never runs today.** The real protection is that automerge is globally off, so
+every diff reaches a human PR. That is genuine, but it is one config flag away from
+disappearing, and the backstop meant to catch that case is the inert part. The manifest
+half is also unsigned (`"signature": null`) with no caller passing `verify`, so the only
+unforgeable component is the hard-coded tuple. Tracked as card `53e9190c` (S17).
+
+Ground 3 therefore supports the refusal on *intent* and on *present effect*, but not on
+*mechanism*. Grounds 1, 2, 4 and 5 are unaffected and are sufficient on their own.
 
 **4. The exploration slice was proposed and rejected.** That is card B4 by another name.
 The recorded reasoning: the outcome instrument is a twin gate whose CI and coverage arms
