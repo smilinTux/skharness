@@ -36,7 +36,7 @@
       "card": "6ad3c9ab",
       "epic": "935d4b61",
       "recorded_by": "lumina, epic 935d4b61 integration pass, 2026-08-16",
-      "human_signoff": "PENDING: goes to Chef with the branch. Recorded here so the disposition is visible in the diff rather than decided silently by whoever runs the suite next.",
+      "human_signoff": "APPROVED by Chef 2026-08-16, epic 935d4b61 integration. Asked for an assessment and approved acting on it. Assessment recorded: the change is an import plus two lines validating the attribute NAME before the write; it touches no grading semantics (not the bucket grammar, not the class mapping, not model_class derivation, not sensitivity). It makes the routing write path stricter, not looser. Rejecting it would mean reverting a security fix to satisfy a guard about security fixes.",
       "reason": [
         "S14 (card 6ad3c9ab) added, to buckets.py, one import of",
         "routing_guard.assert_routing_field and two lines inside",
