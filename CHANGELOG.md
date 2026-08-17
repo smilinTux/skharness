@@ -43,6 +43,45 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   raising rather than returning None. `KNOWN_HARNESSES` is a literal set (config
   sits below the adapters in the import graph) pinned to the live registry by a
   test, so the two cannot drift.
+### Added
+- **The client-to-gateway attribution join, proven from both ends** (card
+  `c7aea2e0`, A6.3). New module `autocode/attribution.py`: given a gateway
+  request id it reads the skgateway metrics store READ-ONLY and says whether the
+  run and the row are demonstrably the same event. `join_rows` is pure over
+  rows, so CI exercises the whole logic against `tests/data/
+  attribution-join-rows.json`, three cases captured verbatim from the real
+  store. `tests/test_attribution_join_live.py` repeats it against a live
+  gateway and skips with a reason naming what was missing rather than degrading
+  into a weaker check; `SKHARNESS_REQUIRE_LIVE_GATEWAY=1` turns that skip into a
+  failure, because a skip is a silence and on a box where the gateway is meant
+  to be up, silence is the wrong answer.
+
+  The load-bearing part is the CONTROL. A call with no attribution headers must
+  produce a row with a NULL session id AND a verdict that says
+  `ABSENT_AS_SENT`, never `MATCH`. The two live probes behind the fixtures are
+  the same model, prompt, ceiling and gateway, differing only in the two
+  headers, and their rows differ only in the two columns. `verify_join` names
+  four separate outcomes per axis (`MATCH`, `ABSENT_AS_SENT`, `MISSING`,
+  `INVENTED`) so a lost header, an anonymous call and a call attributed to a
+  default cannot read alike. A join that succeeds when nothing was sent is not a
+  join, so a headerless row carrying an id anyway returns `INVENTED` and fails.
+  Proven with a mutation: a `join_rows` that fills a NULL session id with
+  `"lumina"` turns three fixture tests and two live tests red.
+
+  Two facts the module refuses to manufacture, both measured rather than
+  assumed. `request_log.agent_id` is NULL on all 8,136 rows and has never once
+  been populated, so nothing here reads it. No table holds a SERVED model
+  (`token_usage.model` never once disagrees with `request_log.model` across all
+  1,445 joined rows; both are the REQUESTED id), so `model_served` is fixed at
+  None with a written reason and is never derived from the agreeing columns.
+  The gateway does tell a direct HTTP caller on `x-sk-model-served`, and pi's
+  stdout carries `responseModel` (card `04970a6e`), but neither route is this
+  one. The served backend IS recoverable, from whichever per-request tables
+  agree, and the join records which ones did; a disagreement returns no backend
+  and names the conflict rather than picking a winner by precedence.
+  `energy_log` is kept whole as the per-attempt failover chain, since collapsing
+  it to a scalar loses both the failover and, on the committed case, 99.6% of
+  the energy.
 
 ### Security
 - **A card can no longer select the model that grades it** (card `0b7e3ac3`).
