@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import re
 
+from .routing_guard import assert_routing_field
+
 #: Byte-for-byte the gateway's grammar (``src/policy/buckets.mjs``). Case-insensitive
 #: on input, exactly as the gateway is; we nonetheless CONSTRUCT lowercase only, and
 #: `validate_bucket` additionally refuses a non-lowercase id so the wire form has one
@@ -193,10 +195,28 @@ def attach_dispatch_model(brief, model_id: str | None):
 
     Validates before attaching, so an unvalidated string cannot be parked on a brief
     and picked up later by the adapter. Returns the brief for chaining.
+
+    Also re-validates DISPATCH_MODEL_ATTR itself, EVERY call, against
+    routing_guard's allowlist (S14, card 6ad3c9ab): this is the routing
+    layer's only write into a brief, and the write is generic (`setattr` on
+    whatever name the constant currently holds). Re-checking here rather
+    than trusting the constant once at import means a DISPATCH_MODEL_ATTR
+    that is ever anything other than "model" -- a bad merge, a typo, a
+    compromised import -- is refused on its very next use instead of
+    silently landing on a twin-gate / CI / acceptance / ratification field.
+
+    The name written is the value assert_routing_field() RETURNS, never a
+    fresh read of DISPATCH_MODEL_ATTR taken after the check. Re-reading the
+    global here would be check-then-use on the very global this guard exists
+    to distrust: a module __getattr__ or a concurrent mutation (cards run
+    under a ThreadPoolExecutor) could hand the check "model" and the write
+    something else a moment later. Binding the checked value once and using
+    only that binding closes that window.
     """
     if model_id is not None:
         validate_bucket(model_id)
-    setattr(brief, DISPATCH_MODEL_ATTR, model_id)
+    field = assert_routing_field(DISPATCH_MODEL_ATTR)
+    setattr(brief, field, model_id)
     return brief
 
 
