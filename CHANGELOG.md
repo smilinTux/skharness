@@ -41,6 +41,32 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   shell; shell is root-equivalent on these nodes, so anything that can invoke
   `gpg`/capauth the way the operator can could still sign a false state. See
   `plane_trust.py`'s module docstring.
+- **Autopilot digest decisions are now bound by stable id, not position**
+  (card `78409fc0`, spec `2026-08-13-unified-consent-plane-arch.md` section
+  3.2). `resolver.answer` answered by POSITION alone: the manifest renumbers
+  on every rebuild, so a reply sent against yesterday's digest could resolve
+  to a DIFFERENT item than the one actually shown, the same defect class as
+  applying a Terraform plan that drifted after it was saved.
+  `digest.build_manifest` now stamps every item with a `content_hash` (over
+  qid + prompt + options, deliberately excluding `n`) and the manifest as a
+  whole with a `generation` hash over the full ordered presentation.
+  `resolver.answer(n, generation, response)` requires that `generation`, and
+  refuses with `StaleGeneration` when the live manifest has since been
+  rebuilt into a different generation, mirroring Terraform Cloud's
+  stale-plan behaviour: the whole digest that was shown is what is
+  approved, not each line item independently. `n` remains purely a display
+  convenience once the generation check has passed. A second `answer()`
+  against an already-resolved decision now raises `AlreadyAnswered`
+  (AWS Step Functions task-token semantics: single-use, and reuse is an
+  explicit error, never a silent no-op) instead of returning a
+  success-shaped `idempotent: True`, which matters because
+  `~/.skcapstone` is Syncthing-synced and two nodes could each believe they
+  answered first. `digest.queue_decision` now stamps every decision with a
+  mandatory `expires_at` (default 24h TTL); an `answer()` against an expired
+  decision raises `DecisionExpired` and records an explicit EXPIRED state in
+  the store (CodePipeline semantics: a timeout routes to an explicit state,
+  never a silent drop), and expired items stop recirculating into future
+  digests instead of reappearing indefinitely.
 - **The shadow mutation probe is now CALLED on the live path** (card `788425b8`,
   S26). S23 built the worker-independent outcome label, gave it 43 tests and
   merged it, and nothing anywhere called `mutation.probe`: a module with no
@@ -181,6 +207,26 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   the energy.
 
 ### Fixed
+- **A concurrent settlement can no longer erase earned joules** (card `1892cf38`,
+  S28). `balance_after` in the live ledger is not a clean running total of the
+  `amount` column, and two of the breaks are lost updates: two mints 35
+  microseconds apart on 2026-08-15 both recorded `balance_after=123309`, and two
+  mints 105 ms apart on 2026-08-17 both recorded `balance_after=162168`. 25 J and
+  50 J of genuine earned credit are missing from the balance. `JouleWallet` reads
+  its snapshot once in `__init__` and guards mutations with an INSTANCE lock,
+  while `settle()` builds a fresh wallet per call, so two settlements hold two
+  snapshots and two locks that never contend and the second write erases the
+  first. `settle()` now holds an `flock` on `{wallet}/.settle.lock` across the
+  whole read-modify-write, wallet construction included, since construction is
+  the read; `flock` binds to the open file description rather than the process,
+  so one primitive covers concurrent threads and concurrent sessions alike. On
+  timeout it settles unlocked and logs, because since skcapstone `7bebcd8` the
+  journal is written before the state and so remains reconstructible, whereas
+  refusing to settle would discard the credit outright. The test forces the
+  interleaving rather than hoping for it: the snapshot read is gated so both
+  settlers rendezvous immediately after reading. This does NOT cover
+  skcapstone's `JouleEconomy.record_task_completion`, the path both live losses
+  actually came from, nor two hosts writing one replicated wallet.
 - **`revert` now works on auto-merged work.** The merge record was written as
   `{pr, branch, ts, auto}` with no `sha`, while `_revert_impl` requires
   `merge["sha"]`, so revert ALWAYS failed on anything autopilot merged and
