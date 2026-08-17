@@ -467,6 +467,34 @@ def test_finalize_escalates_when_worktree_missing(mocker):
     commit.assert_not_called()                       # never reaches the None-path subprocess
 
 
+def test_finalize_does_not_wipe_failure_memory_when_worktree_missing(mocker):
+    """S8: two `if result.passed` guards straddle the worktree raise. A pass
+    whose worktree was pruned used to clear the card's accumulated failure
+    memory, then die before settling or recording anything, so the next run of
+    that card started blind and rebuilt into the wall the memory existed to
+    prevent. Never clear memory before an operation that can abort."""
+    spec = _spec("skrender")
+    cfg = _t.SimpleNamespace(repo_map={"skrender": spec}, automerge_repos=[])
+    ex, item = _final_ex(mocker, cfg, "skrender")
+    ex.journal.worktree_for.return_value = None          # worktree pruned / lost
+    with pytest.raises(RuntimeError, match="worktree.*missing"):
+        ex.finalize(item, GateResult(score=5, passed=True, notes="", artifact="pr"))
+    ex.board.clear_attempts.assert_not_called()          # the memory survives
+    ex.journal.archive_attempts.assert_not_called()
+
+
+def test_finalize_still_archives_failure_memory_on_a_normal_pass(mocker):
+    """Positive control for the move above: the archive must still happen on the
+    ordinary pass path, or S8 would have 'fixed' the bug by disabling it."""
+    spec = _spec("skrender")
+    cfg = _t.SimpleNamespace(repo_map={"skrender": spec}, automerge_repos=[])
+    ex, item = _final_ex(mocker, cfg, "skrender")
+    ex.board.clear_attempts.return_value = [{"round": 1, "outcome": "ci_red"}]
+    ex.finalize(item, GateResult(score=5, passed=True, notes="", artifact="pr"))
+    ex.board.clear_attempts.assert_called_once_with("t1")
+    ex.journal.archive_attempts.assert_called_once()
+
+
 def test_finalize_automerges_when_whitelisted_and_green(mocker):
     spec = _spec("skrender")
     spec.automerge = True

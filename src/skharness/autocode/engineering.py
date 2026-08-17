@@ -585,11 +585,6 @@ class EngineeringExecutor:
                 "EngineeringExecutor cannot finalize a non-gated result; "
                 "non-gated work is finalized by its own executor "
                 "(toggle spec G1/G2/G4).")
-        # The twin gate closed, so whatever this card failed for before is stale.
-        # Clear it here (not after the PR mechanics) so the memory is dropped on
-        # the strength of the PASS itself, independent of how the PR lands.
-        if result.passed:
-            self._archive_attempts(item)
         repo = self.resolve_repo(item)
         wt = self.journal.worktree_for(item.ref)
         # The worktree can be missing (None) or already pruned off disk if a
@@ -604,6 +599,20 @@ class EngineeringExecutor:
                 f"finalize: worktree for {item.ref} is missing "
                 f"({wt!r}); it was pruned or the journal lost it. The gate passed "
                 "but the built diff is not on disk to commit. Retry to rebuild.")
+        # The twin gate closed, so whatever this card failed for before is stale.
+        # Clear it AFTER the worktree check and BEFORE the PR mechanics: the
+        # memory is still dropped on the strength of the PASS itself, independent
+        # of how the PR lands, but it is no longer destroyed by an abort.
+        #
+        # It used to run above, so the two `if result.passed` guards straddled
+        # the raise: a pass whose worktree had been pruned wiped the card's
+        # accumulated failure memory, then died before settling or recording
+        # anything. All that survived was a "finalize failed" journal line, and
+        # the next run of that card started blind, rebuilding into exactly the
+        # wall the memory existed to prevent. Do not clear memory before an
+        # operation that can abort.
+        if result.passed:
+            self._archive_attempts(item)
         pr_branch = f"autopilot/{item.ref}"
         self._commit_and_push(repo, wt, pr_branch, item)   # harness edits are uncommitted
         if result.passed:
