@@ -53,6 +53,13 @@ Every fabricated row is identical in shape: a `mint` of exactly 75 J from
 counterparty `economy`, described `autocode task_complete t1`. 75 J is the fixture
 card's constant (base 25 J x medium priority x the fixture quality score).
 
+Two of those numbers are stable and two are not. **The fabricated count (1,452)
+and the fabricated joules (108,900) are frozen**, because the leak is fixed and
+no further fixture rows can be written. The recorded and corrected balances both
+keep moving as genuine work lands, and the fabricated share of rows falls as the
+ledger grows. Rerun the tool rather than quoting the balances above: the sidecar
+records the row count it was computed against, so it always says what it covers.
+
 ## What was decided, and why
 
 The operator chose to **mark and publish a correction factor**. He explicitly
