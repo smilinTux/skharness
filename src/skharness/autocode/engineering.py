@@ -425,7 +425,17 @@ class EngineeringExecutor:
             # coverage. The predicate is the shared twin_gate_passed (also used by
             # the ratify one-shot) so the gate has one definition, never two.
             if twin_gate_passed(gr, ci_status, cov, repo):
-                return GateResult(score=5, passed=True,
+                # Return the score the GRADER produced, which is the same number
+                # already persisted to the board two lines up. The old literal 5
+                # was accurate (twin_gate_passed requires gr.score == 5 to reach
+                # here) but it restated the gate's current threshold instead of
+                # reading the grade, so the pass path was structurally incapable
+                # of ever carrying a different number and the value was
+                # indistinguishable from a constant to every downstream reader.
+                # NOTE deliberately NOT folded in: _settle_economics still passes
+                # score=5 to settle(). That changes minted joule values, so it is
+                # an economic change needing Chef's sign-off (spec open question 2).
+                return GateResult(score=gr.score, passed=True,
                                   notes=strip_promise(gr.notes), artifact=gr.artifact)
             # Grade-resilience: the grader could not certify (score None == the
             # adapter returned no parseable verdict even after its retries -- a

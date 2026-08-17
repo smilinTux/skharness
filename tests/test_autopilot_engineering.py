@@ -240,6 +240,28 @@ def test_run_stops_at_five_with_green_gate(mocker, cfg):
     assert rounds == [1, 2]
 
 
+def test_pass_return_carries_the_graders_score_not_a_literal(mocker, cfg):
+    """S6: the twin-gate pass return must READ the grade, not restate the gate.
+
+    twin_gate_passed currently requires gr.score == 5, so on the live path a
+    hardcoded `score=5` and `gr.score` are indistinguishable: no observation
+    separates them. Pinning the one shared predicate open is what makes the two
+    distinguishable, and it is the exact property the card asks for (the pass
+    path must be structurally capable of carrying a different number). A
+    hardcoded literal turns this red.
+    """
+    grades = [GateResult(score=4, passed=False,
+                         notes="ready <promise>COMPLETE</promise>", artifact="pr")]
+    ex, harness, item = _run_ex(mocker, cfg, grades)
+    mocker.patch("skharness.autocode.engineering.twin_gate_passed", return_value=True)
+    res = ex.run(item, harness)
+    assert res.passed is True
+    assert res.score == 4                     # the grader's number, not a literal 5
+    # ... and it agrees with the score persisted to the board in the same round,
+    # which is the value the return was throwing away.
+    assert ex.board.score_task.call_args.kwargs["score"] == 4
+
+
 def test_run_caps_at_four_rounds_then_fails(mocker, cfg):
     grades = [GateResult(score=4, passed=False, notes="one gap", artifact=None)] * 6
     ex, harness, item = _run_ex(mocker, cfg, grades)
