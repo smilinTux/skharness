@@ -273,6 +273,50 @@ which reads as an idle board.
 
 ---
 
+## 7a. Learnings from execution, folded back in
+
+Written after the cards were executed rather than before, because none of this was
+visible from planning. Five cards (S17 to S22) exist only because of it.
+
+**The epic's premise was half wrong, and the correction improves it.** This design
+asked whether to BUILD a learning loop. A partial one already exists in production:
+`adapters/base.py:467` runs the twin-gate grader with `model=dispatch_model_of(brief)`,
+so a card's own grade selects the model that grades it (card `0b7e3ac3`). The right
+question was never "should we close the loop" but "an unaudited partial loop is already
+wired, so make it observable and bounded first". Blast radius is zero only because no
+card carries a grade, and card `6dff5c17` exists to change that.
+
+**Built-but-unwired is a failure class, not a series of accidents.** Eight instances
+surfaced inside this one epic: `record_run`, `record_success`,
+`changed_paths_are_protected`, the CapLedger ceiling, `escalation_reason`, graded
+dispatch, `meta.autopilot.reverted`, and `routing_guard.py`'s protected-list entry. In
+every case the unit tests pass and nothing proves a caller exists on the live path. This
+is the fleet's measurement rule one level up: **a mechanism whose absence is
+indistinguishable from its presence provides no protection.** Tracked as `bb536f68`,
+and it is closed only by a detector that catches the ninth, not by fixing these eight.
+
+**Three of the five refusal grounds rested on that class.** Ground 3's carve-out does
+not execute. Ground 1 is a policy with no enforcing mechanism. Criteria immutability is
+incidental, holding only because `p = item.payload` binds once. The refusal survives,
+through the CI arm, but the margin was thinner than this document originally claimed.
+
+**Two disciplines paid for themselves and should be standing practice.** First,
+requiring the ACTUAL observed red rather than a green test: it caught the `outcome="pass"`
+default, a test count of 28 that was 5 real observations, and every one of the planted
+negative controls. Second, pointing reviewers adversarially rather than for approval:
+the two adversarial passes produced the epic's most valuable findings, including the
+correction to this document's own ranking of its grounds.
+
+**Agents checking each other beat agents checking themselves.** Three separate claims
+survived my review and died on contact with the code when another agent verified them,
+including one I had relayed to the operator. Cross-checking is cheap; inheritance of a
+plausible claim is expensive.
+
+**Three states, not two, wherever observability is partial.** S12 reports
+`escalation_rate: null` with `observed_fraction: 0.0` over 183 rows rather than
+"0% escalation", which would have been indistinguishable from a healthy fleet. Any rate
+computed over partly unobservable data must publish the observed fraction beside it.
+
 ## 8. Open questions, carried not closed
 
 1. Does A1's `RunRecord` absorb section 4.1's fields, or does `record_run` stay separate
