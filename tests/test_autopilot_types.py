@@ -2,7 +2,7 @@ import pytest
 
 from skharness.autocode.types import (
     WorkItem, RepoSpec, AssessBrief, TaskBrief, GradeBrief,
-    GateResult, GATE_OUTCOMES, Verdict, HarnessResult, DecisionItem,
+    GateResult, GATE_OUTCOMES, UNRECORDED, Verdict, HarnessResult, DecisionItem,
 )
 
 
@@ -48,9 +48,23 @@ def test_gateresult_outcome_and_cost_fields_have_safe_defaults():
     # Existing construction sites across the repo do not pass outcome/tokens/cost_usd.
     # They must keep constructing without error, with tokens/cost_usd defaulting to 0/0.0.
     gr = GateResult(score=5, passed=True, notes="", artifact=None)
-    assert gr.outcome in GATE_OUTCOMES
+    assert gr.outcome == UNRECORDED
     assert gr.tokens == 0
     assert gr.cost_usd == 0.0
+
+
+def test_unrecorded_is_not_in_gate_outcomes():
+    # UNRECORDED means "no terminal state was recorded". It must never be mistaken
+    # for a member of the closed five-value terminal-state vocabulary.
+    assert UNRECORDED not in GATE_OUTCOMES
+
+
+def test_gateresult_default_outcome_does_not_report_pass():
+    # A default-constructed GateResult (no outcome passed) must NOT read as a success.
+    # If anyone ever changes the default back to "pass", this test goes red.
+    gr = GateResult(score=5, passed=True, notes="", artifact=None)
+    assert gr.outcome != "pass"
+    assert gr.outcome == UNRECORDED
 
 
 def test_gateresult_accepts_each_vocabulary_value():

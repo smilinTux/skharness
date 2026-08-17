@@ -123,6 +123,12 @@ class GradeBrief:                     # grade input
 # that asserts its size and membership (tests/test_autopilot_types.py).
 GATE_OUTCOMES = frozenset({"pass", "ci_red", "no_op", "salvage", "direct_fail"})
 
+# Sentinel meaning "no terminal state was recorded". Never "this succeeded". A
+# construction site that omits outcome has not measured anything, and a default of
+# "pass" would let that absence read as good news. UNRECORDED is deliberately kept
+# out of GATE_OUTCOMES: it is not a sixth terminal state, it is the absence of one.
+UNRECORDED = "unrecorded"
+
 
 @dataclass
 class GateResult:
@@ -133,20 +139,22 @@ class GateResult:
     mode: str = "gated"               # which QualityMode produced this result; default
     #   "gated" preserves every existing construction site (and the twin gate's byte-
     #   identical GateResult(...) returns) for full back-compat.
-    outcome: str = "pass"             # terminal-state vocabulary (design doc section 4.1);
-    #   default "pass" preserves every existing construction site, none of which pass
-    #   this argument today. A later card (S2) populates the real value at each of the
-    #   five terminal return sites; this default is a placeholder, not a claim.
+    outcome: str = UNRECORDED         # terminal-state vocabulary (design doc section 4.1);
+    #   default UNRECORDED preserves every existing construction site, none of which
+    #   pass this argument today, WITHOUT claiming any of them passed. A later card
+    #   (S2) populates the real value at each of the five terminal return sites; this
+    #   default is a placeholder, not a claim: an unset outcome must never read as a
+    #   success, per "never let a grade widen access by being absent".
     tokens: int = 0                   # accumulated token usage; repairs the CapLedger
     #   budget ceiling at orchestrator.py:800, which today always adds zero because
     #   GateResult never carried this field.
     cost_usd: float = 0.0             # accumulated dollar cost, same repair as tokens.
 
     def __post_init__(self):
-        if self.outcome not in GATE_OUTCOMES:
+        if self.outcome not in GATE_OUTCOMES and self.outcome != UNRECORDED:
             raise ValueError(
-                f"GateResult.outcome must be one of {sorted(GATE_OUTCOMES)}, "
-                f"got {self.outcome!r}"
+                f"GateResult.outcome must be one of {sorted(GATE_OUTCOMES)} or "
+                f"{UNRECORDED!r}, got {self.outcome!r}"
             )
 
 
