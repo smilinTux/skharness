@@ -190,7 +190,7 @@ def test_floor_never_lowers_a_gated_request():
 # QualityMode routes to the right executor kind                                #
 # --------------------------------------------------------------------------- #
 
-def test_quality_direct_routes_direct_when_the_OPERATOR_asks_for_it():
+def test_quality_direct_routes_direct_when_the_operator_asks_for_it():
     """DIRECT still routes to the gateless executor. What changed in S20 is WHO
     may ask for it: an operator, through config, never a card through its tags.
     The card-tag half of this is pinned in tests/test_autocode_grader_pin.py."""

@@ -32,14 +32,24 @@ import pytest
 from skharness.autocode import autopilot_cost
 from skharness.autocode import orchestrator as orch
 from skharness.autocode.adapters.base import BaseCliAdapter
-from skharness.autocode.buckets import (BUCKET_CLASSES, BUCKET_SENSITIVITIES,
-                                        attach_dispatch_model, bucket_id,
-                                        is_wider_than, validate_bucket)
+from skharness.autocode.buckets import (
+    BUCKET_CLASSES,
+    BUCKET_SENSITIVITIES,
+    attach_dispatch_model,
+    bucket_id,
+    is_wider_than,
+    validate_bucket,
+)
 from skharness.autocode.grader_pin import GRADER_CAPABILITY_CLASS, grader_bucket
-from skharness.autocode.orchestrator import Caps, CapLedger
 from skharness.autocode.sandbox import AuthMount, Sandbox
-from skharness.autocode.types import (GateResult, GradeBrief, RepoSpec, Verdict,
-                                      WorkItem)
+from skharness.autocode.types import (
+    GateResult,
+    GradeBrief,
+    QualityMode,
+    RepoSpec,
+    Verdict,
+    WorkItem,
+)
 
 
 class _Fake(BaseCliAdapter):
@@ -287,7 +297,6 @@ def _spec(name="skrender", **over):
 
 
 def _cfg(repo_map=None, **over):
-    from skharness.autocode.types import QualityMode
     base = dict(repo_map=repo_map or {"skrender": _spec()}, automerge_repos=[],
                 default_quality=QualityMode.GATED)
     base.update(over)
@@ -299,7 +308,6 @@ def test_a_card_tag_cannot_lower_quality_below_the_operator_baseline():
     NO grade, NO gate. That made the twin gate itself card-selectable. The tag is
     now RAISE-ONLY against the operator baseline (config default, raised by the
     repo floor), neither of which a card can write."""
-    from skharness.autocode.types import QualityMode
     cfg = _cfg()                                    # default_quality=GATED
     task = {"id": "t1", "tags": ["repo:skrender", "quality:direct"]}
     assert orch.resolve_quality(task, cfg) == QualityMode.GATED
@@ -310,7 +318,6 @@ def test_the_operator_can_still_choose_direct_and_the_tag_can_still_raise():
     """Negative control: the rule must be RAISE-ONLY, not "always gated". If the
     fix simply hardcoded GATED, both assertions here fail and the direct mode the
     operator configures for skcode/telegram would be silently dead."""
-    from skharness.autocode.types import QualityMode
     direct_cfg = _cfg(default_quality=QualityMode.DIRECT)
     plain = {"id": "t1", "tags": ["repo:skrender"]}
     assert orch.resolve_quality(plain, direct_cfg) == QualityMode.DIRECT
@@ -322,7 +329,6 @@ def test_the_operator_can_still_choose_direct_and_the_tag_can_still_raise():
 
 
 def test_a_repo_floor_still_beats_an_operator_default_and_a_tag():
-    from skharness.autocode.types import QualityMode
     cfg = _cfg(repo_map={"skchat": _spec("skchat", min_quality=QualityMode.GATED)},
                default_quality=QualityMode.DIRECT)
     task = {"id": "t1", "tags": ["repo:skchat", "quality:direct"]}
@@ -333,7 +339,6 @@ def test_a_repo_floor_still_beats_an_operator_default_and_a_tag():
 def test_the_downgrade_refusal_is_recorded_not_silent(monkeypatch):
     """A card that TRIED to switch off its own gate must leave a trace. A silent
     coercion is indistinguishable from a card that never asked."""
-    from skharness.autocode.types import QualityMode
     seen = []
     monkeypatch.setattr(orch.health, "record",
                         lambda event, **kw: seen.append((event, kw)))
