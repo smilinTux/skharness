@@ -10,6 +10,40 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 ## [Unreleased]
 
 ### Added
+- **Attribution fields on every autopilot ledger row (A1).**
+  `autopilot_cost.record_run` now accepts ten optional fields, all defaulting
+  to None: `agent`, `session_id`, `agent_var`, `session_id_var`, `node`,
+  `gateway_url`, `bucket`, `backend_served`, `gateway_req_id` and
+  `fallback_reason`. They turn a ledger of anonymous rows into one that can be
+  attributed to a writer, a box and a serving path.
+  - `agent_var` and `session_id_var` record WHICH env var supplied the value,
+    not just the value. The inputs genuinely disagree in production: one
+    `skcomms.service` unit on `.41` sets `SKAGENT=jarvis`,
+    `SKMEMORY_AGENT=lumina` and `SKCHAT_IDENTITY=capauth:opus@skworld.io` at
+    once, so a row carrying only the resolved name has discarded information
+    no later reader can reconstruct.
+  - `gateway_url` is semantically required whenever `bucket` is set. A bucket
+    id resolves to different backends depending on the gateway that resolved
+    it (`autopilot-pi.yaml` points at `100.86.156.5:18780`, other flags were
+    verified against `localhost:18780`), so a bucket without its gateway is
+    indistinguishable from correct routing either way.
+  - `backend_served` is held to the same discipline as `model_served`: NEVER
+    defaulted from the request, the bucket or the gateway. Unknown and matched
+    are different facts, and collapsing them would make every run in the ledger
+    read as sovereign.
+  - `fallback_reason` is a closed vocabulary (`FALLBACK_REASONS`) so a fallback
+    RATE is computable. An off-vocabulary value is still written verbatim, and
+    counted as `ledger_vocabulary_drift` rather than coerced.
+  - `work_grade` stays a NESTED dict, unflattened. `grade_size`, `grade_risk`
+    and `grade_sensitivity` are DERIVED beside it, computed here rather than
+    accepted from a caller, so no row can carry axes that disagree with its own
+    grade.
+- **A failed ledger write is now counted, not only logged.**
+  `autopilot_cost.record_run` still never raises, but a write failure records a
+  `ledger_write_error` health event, matching what `record_outcome_row` already
+  does with `outcome_row_error`. A run record that failed to write used to be
+  visible only in a log line nobody aggregates, so the missing rows were absent
+  rather than marked absent and the ledger could not detect its own gaps.
 - **Graded dispatch: a card's grade now selects the model.** `model_class` and
   `sensitivity` map onto a skgateway bucket id (`sk-<class>-<sensitivity>`),
   replacing the single static `autocode.config.harness_model`. Bucket ids are

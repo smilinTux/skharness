@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import socket
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -132,6 +133,11 @@ def record_outcome_row(item, *, terminal_state: str, run_id: str, result=None,
     observe what skgateway actually served; echoing ``model_requested`` would
     manufacture the exact fact that field exists to detect.
 
+    Of the A1 attribution fields, only ``node`` is populated here, because it
+    is the only one this process can observe first-hand. The identity fields
+    wait on PR #42 and the gateway fields belong to the adapter that made the
+    call; both are passed as explicit None. See the call below for why each.
+
     ``pr`` is always "" here: the gated executor does not surface the PR url
     back to the orchestrator, so there is nothing to record. Rows join to a PR
     through ``run_id`` and the run journal.
@@ -165,6 +171,30 @@ def record_outcome_row(item, *, terminal_state: str, run_id: str, result=None,
             quality_mode=(getattr(result, "mode", None) if result is not None
                           else payload.get("quality")),
             work_grade=payload.get("work_grade"),
+            # A1 attribution (card 8967bf22). Only what THIS process can
+            # actually observe is filled in; everything else is an explicit
+            # None rather than a plausible guess.
+            node=socket.gethostname(),
+            # agent / session_id / agent_var / session_id_var are pending PR
+            # #42 (feat/a21-session-identity), which adds autocode/identity.py:
+            # the ONE per-process resolver for all four. Deliberately not
+            # reimplemented here. A second resolver would mint a second session
+            # id for the same process, so one session would appear as two, which
+            # is precisely the ambiguity A2.1 exists to remove. Wire these here
+            # once #42 lands.
+            agent=None, session_id=None, agent_var=None, session_id_var=None,
+            # The orchestrator never talks to skgateway. The gateway url, the
+            # request id and the backend that answered are known only inside the
+            # adapter that made the call, so there is nothing here to record.
+            gateway_url=None, backend_served=None, gateway_req_id=None,
+            # NOT _model_requested's bucket. That value is what the payload
+            # WOULD address; this field means a bucket was actually dispatched.
+            # Four terminal states here (claim-raced, off-node, kill-switch,
+            # budget-hit) never ran a build at all, so stamping a bucket would
+            # report a dispatch that did not happen.
+            bucket=None,
+            # Which path served the run is observed by the adapter, not here.
+            fallback_reason=None,
         )
     except Exception as exc:      # noqa: BLE001 - telemetry never breaks a build
         health.record("outcome_row_error", task=getattr(item, "ref", ""),
