@@ -129,6 +129,41 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   reports from runs that FAILED, to be checked rather than believed.
 
 ### Added
+- **A worker-independent outcome label: shadow mutation testing over changed
+  lines** (card `33c50540`, new module `autocode/mutation.py`). The twin gate's
+  CI and coverage arms are satisfied by tests the WORKER ITSELF AUTHORED, so a
+  passing score partly measures the worker's ability to write a passing test.
+  The epic's refusal to close a learning loop rested on that, and named an
+  outcome label the worker did not author as its own reopen condition. Nobody
+  owned building one. This is it: the mutation operators live in the harness,
+  fixed, so a worker cannot author the mutants and cannot weaken them the way a
+  diff can add an `omit` rule to a coverage config. A surviving mutant is a
+  changed line the worker's own tests did not notice.
+  - THREE states (`survived_clean`, `mutants_survived`, `unobserved`), with a
+    deliberate asymmetry: a survivor is decisive even on a partial run, while
+    the absence of a survivor over a capped or timed-out run is `unobserved`,
+    never a clean sweep. A sampled label reported as universal is the failure
+    this epic exists to remove, so a sampled run structurally cannot report a
+    universal verdict.
+  - Cost is bounded and the bound is recorded: changed lines only (mirroring
+    `diff_coverage`), `max_mutants`, a wall-clock budget and a per-mutant
+    timeout. A per-mutant timeout counts as unjudged, never as a kill; a red
+    baseline is `unobserved`, never a perfect kill rate.
+  - It rides the EXISTING outcome row; no second store. The seven `mutation_*`
+    columns are DERIVED inside `record_run` from the raw probe report, the same
+    pattern `escalation_state` follows, so no caller can stamp a state that
+    disagrees with its own counts.
+  - SHADOW ONLY. It gates nothing and nothing routes on it;
+    `tests/test_autocode_mutation.py` section 5 proves that with a
+    whole-package static sweep, a byte-identical twin-gate verdict and dispatch
+    decision across all three states, and a check that no module calls
+    `probe()`. Promoting it to a gate would destroy the property that makes it
+    worth having.
+  - Every live row today reads `unobserved` / `not_run`: the one site holding a
+    live worktree at grade time is on the protected floor. The module therefore
+    ships its own entry point (`python -m skharness.autocode.mutation`) so real
+    data can be produced now. New read helper
+    `autopilot_cost.mutation_summary()`.
 - **Graded dispatch: a card's grade now selects the model.** `model_class` and
   `sensitivity` map onto a skgateway bucket id (`sk-<class>-<sensitivity>`),
   replacing the single static `autocode.config.harness_model`. Bucket ids are
@@ -217,6 +252,21 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   `SKCODE_FORCE_DENY_ALL` is set.
 
 ### Documented (no behaviour change)
+- **Human ratification is FORMALLY DEMOTED as a control** (card `33c50540`,
+  `docs/specs/2026-08-16-s23-worker-independent-label.md` section 5). The
+  gaming analysis leaned on it hardest; measured against the live GTD store on
+  2026-08-16 it answers at zero. 0 of 38 open autopilot decisions answered, 20
+  of 82 archived, and **every answer ever recorded predates 2026-07-26**: the
+  control did not decline gradually, it stopped. The mechanism is the
+  built-but-unwired class (card `bb536f68`) applied to a human process:
+  `digest.py` builds the morning manifest daily and never sends it (`sent_at:
+  null`, and its own docstring says sending "is Phase F"), and the manifest
+  counts 62 already-archived items, so the reply-by-number index would not even
+  match the live queue if it were delivered. It is therefore removed from the
+  list of controls any analysis in this epic may lean on. Listing a control
+  that does not operate is worse than listing none, because it lets an analysis
+  discharge a risk against something that has answered nothing in three weeks.
+  No notification system was built; this is a written demotion, deliberately.
 - **`SKCODE_DISPATCH_REPOS` unset means DENY ALL**, and the shipped env template
   deliberately omits the key, so a fresh install can dispatch nothing. The
   template now carries a commented, annotated entry explaining this, plus
