@@ -495,6 +495,48 @@ def test_finalize_still_archives_failure_memory_on_a_normal_pass(mocker):
     ex.journal.archive_attempts.assert_called_once()
 
 
+def test_finalize_carries_the_retry_count_to_the_recording_point(mocker):
+    """S7: _archive_attempts clears meta.autopilot.attempts BEFORE the recording
+    point, so a card that struggled and then passed recorded ZERO retries. The
+    hardest-won evidence in the dataset was deleted milliseconds before the only
+    place that could keep it. Capture the count before the archive."""
+    from skharness.autocode import joules
+    spec = _spec("skrender")
+    cfg = _t.SimpleNamespace(repo_map={"skrender": spec}, automerge_repos=[])
+    ex, item = _final_ex(mocker, cfg, "skrender")
+    mocker.patch("skharness.autocode.joules.settle",
+                 return_value=joules.Economics(agent="lumina", task_ref="t1"))
+    ex.board.clear_attempts.return_value = [
+        {"round": 1, "outcome": "ci_red"},
+        {"round": 4, "outcome": "ci_red"},
+        {"round": 2, "outcome": "no_op"}]
+    rec = mocker.patch("skharness.autocode.engineering.health.record")
+    ex.finalize(item, GateResult(score=5, passed=True, notes="", artifact="pr"))
+    ev = [c.kwargs for c in rec.call_args_list
+          if c.args and c.args[0] == "build_economics"]
+    assert len(ev) == 1
+    assert ev[0]["retries"] == 3              # survived the archive
+    assert ev[0]["rounds_max"] == 4           # the worst round reached
+    assert ev[0]["rounds_cap"] == 4           # clipped: never read as unbounded
+
+
+def test_finalize_records_zero_retries_for_a_first_try_pass(mocker):
+    """The other half of the distribution: a card that passed first time must
+    record 0, not an absent/None field, or 'easy' and 'unmeasured' collapse."""
+    from skharness.autocode import joules
+    spec = _spec("skrender")
+    cfg = _t.SimpleNamespace(repo_map={"skrender": spec}, automerge_repos=[])
+    ex, item = _final_ex(mocker, cfg, "skrender")
+    mocker.patch("skharness.autocode.joules.settle",
+                 return_value=joules.Economics(agent="lumina", task_ref="t1"))
+    ex.board.clear_attempts.return_value = []
+    rec = mocker.patch("skharness.autocode.engineering.health.record")
+    ex.finalize(item, GateResult(score=5, passed=True, notes="", artifact="pr"))
+    ev = [c.kwargs for c in rec.call_args_list
+          if c.args and c.args[0] == "build_economics"]
+    assert len(ev) == 1 and ev[0]["retries"] == 0 and ev[0]["rounds_max"] == 0
+
+
 def test_finalize_automerges_when_whitelisted_and_green(mocker):
     spec = _spec("skrender")
     spec.automerge = True

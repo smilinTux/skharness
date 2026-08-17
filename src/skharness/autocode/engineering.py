@@ -150,9 +150,21 @@ class EngineeringExecutor:
             print(f"autopilot[{ref}] usage record failed (build unaffected): {log_ref}")
         return usage
 
-    def _settle_economics(self, item: WorkItem, sha: str) -> None:
+    def _settle_economics(self, item: WorkItem, sha: str, *,
+                          retries: int = 0, rounds_max: int = 0) -> None:
         """Settle the build's joule P&L on a twin-gate pass (mint value, spend real
-        token cost). Best-effort: a wallet failure never affects the finalized PR."""
+        token cost). Best-effort: a wallet failure never affects the finalized PR.
+
+        `retries` is how many recorded attempts this card burned before the pass,
+        captured by the caller BEFORE _archive_attempts clears them, and
+        `rounds_max` is the highest round any of those attempts reached.
+
+        Both are CLIPPED, not unbounded: a single run grinds at most
+        _MAX_ROUNDS (4) rounds before it terminates, so rounds_max saturates
+        there and a genuinely harder card is indistinguishable from a merely
+        hard one past the cap. The cap is emitted alongside the value
+        (`rounds_cap`) so no reader can mistake the distribution for an open one.
+        """
         try:
             from .joules import BuildUsage, settle
 
@@ -163,7 +175,9 @@ class EngineeringExecutor:
             health.record("build_economics", task=item.ref, minted=econ.minted,
                           cost_usd=econ.cost_usd, net_joules=econ.net_joules,
                           joules_per_usd=round(econ.joules_per_usd, 2),
-                          tokens=econ.tokens, recorded=econ.recorded)
+                          tokens=econ.tokens, recorded=econ.recorded,
+                          retries=retries, rounds_max=rounds_max,
+                          rounds_cap=self._MAX_ROUNDS)
             if econ.recorded:
                 print(f"autopilot[{item.ref}] {econ.summary()}")
         except Exception as exc:
@@ -332,19 +346,34 @@ class EngineeringExecutor:
             health.record("record_attempt_error", task=item.ref,
                           outcome=outcome, error=str(exc)[:120])
 
-    def _archive_attempts(self, item: WorkItem) -> None:
+    def _archive_attempts(self, item: WorkItem) -> list:
         """On a pass, clear the card's failure memory and keep it in the journal.
 
         skcoord clears and hands the entries back; skharness archives them. A
         flake therefore haunts a card at most until its next pass.
+
+        RETURNS the archived entries so the caller can carry the retry evidence
+        forward to the recording point. This used to return None, and the archive
+        runs before that point, so a card that struggled through several attempts
+        and then passed recorded ZERO retries: the hardest-won evidence in the
+        dataset was deleted milliseconds before the only place that could keep
+        it. Retry count is the best available proxy for "was this card harder
+        than its grade said", which is the whole question the calibration work
+        exists to answer.
+
+        Returns an empty list (never None) on any failure, so a caller can take
+        len() unconditionally; the archive is best-effort and never breaks a
+        finalize.
         """
         try:
-            removed = self.board.clear_attempts(item.ref)
+            removed = self.board.clear_attempts(item.ref) or []
             if removed:
                 self.journal.archive_attempts(item.ref, removed)
                 health.record("attempts_cleared", task=item.ref, count=len(removed))
+            return list(removed)
         except Exception as exc:      # noqa: BLE001 - never break a finalize
             health.record("clear_attempts_error", task=item.ref, error=str(exc)[:120])
+            return []
 
     def escalate(self, item: WorkItem, reason: str) -> DecisionItem:
         """Queue a decision for a non-converging item (mirrors the stub shape)."""
@@ -611,14 +640,25 @@ class EngineeringExecutor:
         # the next run of that card started blind, rebuilding into exactly the
         # wall the memory existed to prevent. Do not clear memory before an
         # operation that can abort.
+        #
+        # The archive is also the LAST place the card's retry evidence exists, and
+        # the recording point is below it, so capture the count here rather than
+        # letting it die with the clear.
+        retries = 0
+        rounds_max = 0
         if result.passed:
-            self._archive_attempts(item)
+            archived = self._archive_attempts(item)
+            retries = len(archived)
+            rounds_max = max((int(a.get("round") or 0) for a in archived
+                              if isinstance(a, dict)), default=0)
         pr_branch = f"autopilot/{item.ref}"
         self._commit_and_push(repo, wt, pr_branch, item)   # harness edits are uncommitted
         if result.passed:
             # Verified work reached finalize: settle the build's joule P&L (mint the
-            # value, spend the real token cost) now that a commit SHA exists.
-            self._settle_economics(item, self._head_sha(wt))
+            # value, spend the real token cost) now that a commit SHA exists, and
+            # stamp the retry evidence captured above onto the same record.
+            self._settle_economics(item, self._head_sha(wt),
+                                   retries=retries, rounds_max=rounds_max)
         # Always open the PR: it is the visible record AND the surface GitHub CI
         # runs on. Auto-merge then merges THAT PR on GitHub (updating origin +
         # leaving history), never a silent local merge.
