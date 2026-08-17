@@ -53,6 +53,8 @@ _ALWAYS_PROTECTED: tuple[str, ...] = (
     "*skharness/autocode/sensitivity.py",
     "*/skharness/autocode/buckets.py",        # grade -> trust-zone addressing
     "*skharness/autocode/buckets.py",
+    "*/skharness/autocode/routing_guard.py",  # S14: routing cannot touch gate fields
+    "*skharness/autocode/routing_guard.py",
     "*/autocode/data/joule-grade-vocabulary.json",   # the vendored enums
     "*autocode/data/joule-grade-vocabulary.json",
     "*/tests/data/joule-economy-golden-set-*.json",  # the calibration reference
