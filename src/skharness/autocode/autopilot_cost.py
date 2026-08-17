@@ -81,7 +81,8 @@ def record_run(*, card_id: str, repo: str, tokens: int, cost_usd: float,
                model_requested: str | None = None,
                model_served: str | None = None, score: int | None = None,
                retries: int = 0, quality_mode: str | None = None,
-               work_grade: dict | None = None) -> None:
+               work_grade: dict | None = None,
+               terminal_state: str | None = None) -> None:
     """Append one run to the ledger. Never raises -- a cost-tracking bug must
     never turn a successful (or a well-formed failed) run into a crash.
 
@@ -106,7 +107,25 @@ def record_run(*, card_id: str, repo: str, tokens: int, cost_usd: float,
     ``sensitivity``, ``model_class``) exactly as stored on the card, or None
     when the card is ungraded; this module never re-derives it.
 
-    NO BACKFILL: rows written before this change carry none of these eight
+    ``terminal_state`` (S4, card 432b81b7) names the terminal disposition of
+    the run as its OWN DISPATCHER saw it, which is a different fact from
+    ``outcome`` and must not be folded into it. ``outcome`` is the closed
+    five-value GATE vocabulary (types.GATE_OUTCOMES) plus the UNRECORDED
+    sentinel: it answers "what did the gate decide". ``terminal_state``
+    answers "how did this item end", including the paths where NO build ran
+    and so no gate ever decided anything:
+
+      orchestrator (orchestrator.TERMINAL_STATES): ``finalized``,
+        ``finalize-failed``, ``escalated``, ``claim-raced``, ``off-node``,
+        ``kill-switch``, ``budget-hit``
+      agent-run bridge: ``agentrun-finalized``, ``agentrun-refused``
+
+    Keeping them separate is what lets a bypass row stay honest. A claim-raced
+    item has ``terminal_state="claim-raced"`` and ``outcome="unrecorded"``:
+    the row says "this item ended, and no gate outcome exists", which is
+    neither a pass nor a null.
+
+    NO BACKFILL: rows written before this change carry none of these nine
     keys at all (not even as null), and nothing on the read path invents a
     value for them."""
     row = {
@@ -116,7 +135,7 @@ def record_run(*, card_id: str, repo: str, tokens: int, cost_usd: float,
         "outcome": outcome, "adapter": adapter,
         "model_requested": model_requested, "model_served": model_served,
         "score": score, "retries": retries, "quality_mode": quality_mode,
-        "work_grade": work_grade,
+        "work_grade": work_grade, "terminal_state": terminal_state,
     }
     try:
         path = ledger_path()

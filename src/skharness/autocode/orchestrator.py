@@ -62,6 +62,134 @@ class CapLedger:
                 or self.usd > self.caps.max_usd_per_day)
 
 
+#: The orchestrator's own terminal-disposition vocabulary for ONE item in ONE
+#: run (S4, card 432b81b7). Deliberately NOT merged into types.GATE_OUTCOMES,
+#: which is closed at five values and answers a different question: what the
+#: GATE decided. Four of the states below are reached without a build ever
+#: running, so no gate ever decided anything on them; folding them into the
+#: gate vocabulary would make "no build ran" look like a graded verdict.
+TERMINAL_STATES: frozenset[str] = frozenset({
+    "finalized", "finalize-failed", "escalated",     # a build ran and terminated
+    "claim-raced", "off-node", "kill-switch", "budget-hit",   # no build ran
+})
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _adapter_name(harness) -> str | None:
+    """The harness adapter that ran (or would have), e.g. ``claude-code``."""
+    name = getattr(harness, "name", None)
+    return name.strip() if isinstance(name, str) and name.strip() else None
+
+
+def _model_requested(item, harness) -> str | None:
+    """The model id this item's calls ADDRESSED, as the live path addresses it.
+
+    Graded cards address a validated skgateway bucket (``bucket_for_payload``,
+    the same function EngineeringExecutor._dispatch_model calls, over the same
+    payload, so this reads the value the build used rather than inventing one).
+    An UNGRADED card constructs no bucket at all and the adapter runs on its
+    statically configured model, so that static model is what was requested.
+    None only when neither exists, which is a harness with no model attribute
+    (the stub, and the SimpleNamespace fakes in the suite).
+    """
+    try:
+        from .buckets import bucket_for_payload
+        bucket = bucket_for_payload(getattr(item, "payload", None) or {})
+    except Exception:      # noqa: BLE001 - a corrupt grade must not break telemetry
+        bucket = None
+    if bucket:
+        return bucket
+    model = getattr(harness, "model", None)
+    return model.strip() if isinstance(model, str) and model.strip() else None
+
+
+def record_outcome_row(item, *, terminal_state: str, run_id: str, result=None,
+                       harness=None, retries: int = 0, pr: str = "") -> None:
+    """Append EXACTLY ONE outcome row for one item of one run (card 432b81b7).
+
+    This is the union side of the epic's central asymmetry. ``joules.settle()``
+    is contractually pass-only and ``failure_memory`` holds only terminal
+    non-passes, so neither store can detect its own bias: in each, the missing
+    rows are ABSENT rather than marked absent. Recording here, from the
+    orchestrator, is the only place that sees every terminal state of an item,
+    including the four where no build ever ran.
+
+    Recording at settle instead would yield a dataset of only passes, so
+    over-graded cards would appear constantly, under-graded ones never, class
+    floors would ratchet downward, every version would measure as an
+    improvement, and the first honest signal would be a production incident
+    (inherited verbatim from card 09573989).
+
+    ``result`` is the GateResult when a build produced one, else None. With no
+    result there is no gate verdict, so ``outcome`` is the UNRECORDED sentinel:
+    "no terminal state was recorded", never "this succeeded" and never a bare
+    null that would read the same as a field nobody threaded.
+
+    ``model_served`` is ALWAYS None here, on purpose. The orchestrator does not
+    observe what skgateway actually served; echoing ``model_requested`` would
+    manufacture the exact fact that field exists to detect.
+
+    ``pr`` is always "" here: the gated executor does not surface the PR url
+    back to the orchestrator, so there is nothing to record. Rows join to a PR
+    through ``run_id`` and the run journal.
+
+    Best-effort by construction. record_run itself never raises, and the whole
+    body is guarded besides: a telemetry bug must never turn a real build into
+    a crash.
+    """
+    try:
+        from . import autopilot_cost
+        from .types import UNRECORDED
+        payload = getattr(item, "payload", None) or {}
+        autopilot_cost.record_run(
+            card_id=getattr(item, "ref", ""),
+            repo=getattr(item, "repo", None) or "",
+            tokens=int(getattr(result, "tokens", 0) or 0),
+            cost_usd=float(getattr(result, "cost_usd", 0.0) or 0.0),
+            passed=bool(getattr(result, "passed", False)),
+            pr=pr, ts=_now_iso(), run_id=run_id,
+            terminal_state=terminal_state,
+            outcome=(getattr(result, "outcome", None) or UNRECORDED),
+            adapter=_adapter_name(harness),
+            model_requested=_model_requested(item, harness),
+            model_served=None,
+            score=getattr(result, "score", None),
+            retries=int(retries or 0),
+            # The mode that ACTUALLY produced the result when there is one
+            # (GateResult.mode is stamped by the executor that ran); the
+            # resolved intent from the payload when nothing ran. terminal_state
+            # tells a reader which of the two it is looking at.
+            quality_mode=(getattr(result, "mode", None) if result is not None
+                          else payload.get("quality")),
+            work_grade=payload.get("work_grade"),
+        )
+    except Exception as exc:      # noqa: BLE001 - telemetry never breaks a build
+        health.record("outcome_row_error", task=getattr(item, "ref", ""),
+                      terminal_state=terminal_state, error=str(exc)[:120])
+
+
+def record_off_node_rows(off_node, *, state: dict, run_id: str, harness=None) -> None:
+    """Write the off-node item state AND its outcome row, together.
+
+    Off-node items never enter phase2_swarm, so this is the only site that sees
+    them terminate. Keeping the state write and the row write in one function
+    is what stops the two drifting apart: an item recorded in the run journal
+    but missing from the ledger is exactly the censored-row shape this card
+    removes.
+    """
+    for item, decision in off_node:
+        # Read the prior round BEFORE overwriting the entry: on a resumed run
+        # this item may already carry attempts, and retries must count them.
+        prior_rounds = int((state.get(item.ref) or {}).get("round", 0) or 0)
+        state[item.ref] = {"state": "off-node", "node": decision.node,
+                           "reason": decision.reason}
+        record_outcome_row(item, terminal_state="off-node", run_id=run_id,
+                           harness=harness, retries=prior_rounds)
+
+
 def kill_switch_active(enabled: bool) -> bool:
     """True when the run must stop cleanly: env override or disabled config."""
     if os.environ.get("SKOS_AUTOPILOT_OFF") == "1":
@@ -770,8 +898,18 @@ def phase2_swarm(selected, *, harness, board, caps: Caps, ledger: CapLedger,
             health.record("session_registry_error", sid=sid, phase="end",
                           error=str(exc)[:120])
 
+    def _prior_rounds(ref: str) -> int:
+        """Attempts this item already burned before the current one."""
+        return int((state.get(ref, {}) or {}).get("round", 0) or 0)
+
     def _process(item, ex) -> None:
+        # Both silent returns below used to write NOTHING at all: no state, no
+        # decision (past the first), no ledger row. An item stopped by the kill
+        # switch or the budget ceiling was therefore indistinguishable from an
+        # item that never existed. One row each, so the union is a union.
         if kill_switch_active(enabled):
+            record_outcome_row(item, terminal_state="kill-switch", run_id=run_id,
+                               harness=harness, retries=_prior_rounds(item.ref))
             return
         with _lock:
             if ledger.exceeded():
@@ -780,6 +918,11 @@ def phase2_swarm(selected, *, harness, board, caps: Caps, ledger: CapLedger,
                     decisions.append(DecisionItem(qid=stable_qid("budget-hit", run_id),
                         prompt="Autopilot hit its budget ceiling (token/dollar limits); stopped early.",
                         options={"ok": "acknowledge"}, action_ref=run_id, priority="high"))
+                # EVERY stopped item gets a row, not just the first: the
+                # decision is one operator prompt per run, the rows are the
+                # per-item record, and conflating them would undercount.
+                record_outcome_row(item, terminal_state="budget-hit", run_id=run_id,
+                                   harness=harness, retries=_prior_rounds(item.ref))
                 return
         # Card C-1 AC3: register this item's build as a skcode session
         # (source=autocode) so it appears on hostd's GET /sessions rail for
@@ -791,9 +934,15 @@ def phase2_swarm(selected, *, harness, board, caps: Caps, ledger: CapLedger,
             result = ex.run(item, harness)          # ISOLATED build -- unlocked
         except ClaimRaced as exc:
             with _lock:
+                retries = _prior_rounds(item.ref)
                 state[item.ref] = {"state": "claim-raced", "detail": str(exc)}
                 journal.write_run(run_id, {"run_id": run_id, "phase": "swarm",
                                            "items": dict(state)})
+            # A lost claim is a terminal state for THIS node's copy of the item,
+            # and it costs a worktree + a claim round trip. It gets a row like
+            # every other terminal state; no build ran, so no gate outcome.
+            record_outcome_row(item, terminal_state="claim-raced", run_id=run_id,
+                               harness=harness, retries=retries)
             _end_session(sid, "claim-raced")
             return
         with _lock:
@@ -825,12 +974,21 @@ def phase2_swarm(selected, *, harness, board, caps: Caps, ledger: CapLedger,
         with _lock:
             state[item.ref] = entry
             journal.write_run(run_id, {"run_id": run_id, "phase": "swarm", "items": dict(state)})
+        # THE single guarded write site: all three of finalized / finalize-failed
+        # / escalated funnel through here, so one call covers all three and no
+        # branch can acquire a terminal state without a row.
+        record_outcome_row(item, terminal_state=entry["state"], run_id=run_id,
+                           result=result, harness=harness, retries=rnd - 1)
         _end_session(sid, entry["state"])
 
     if workers <= 1:
-        for item, ex in selected:                   # exact old sequential path
-            if kill_switch_active(enabled):
-                break
+        for item, ex in selected:
+            # _process is now the ONE kill-switch gate. It used to be checked
+            # here too and the loop `break`ed, which meant a mid-run kill left
+            # the remaining items with no record on the sequential path while
+            # the threaded path (which submits every item) recorded them. Same
+            # guarantee as before -- _process still does no work when the switch
+            # is on -- with a row per unstarted item instead of silence.
             _process(item, ex)
     else:
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -975,9 +1133,7 @@ def run_once(*, board, harness, config, tasks_dir=None, run_id=None, dry_run=Non
             placer = fleet_dispatch.default_placer()
         selected, off_node = fleet_dispatch.partition_local(
             selected, placer=placer, self_node=fleet_dispatch.self_node())
-        for item, decision in off_node:
-            state[item.ref] = {"state": "off-node", "node": decision.node,
-                               "reason": decision.reason}
+        record_off_node_rows(off_node, state=state, run_id=run_id, harness=harness)
         state = phase2_swarm(selected, harness=harness, board=board, caps=caps,
                              ledger=ledger, decisions=decisions, run_id=run_id,
                              state=state, enabled=config.enabled,
