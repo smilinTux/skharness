@@ -118,6 +118,12 @@ class GradeBrief:                     # grade input
     diff_coverage: float | None       # changed-lines coverage ratio, or None
 
 
+# Closed terminal-state vocabulary (design doc section 4.1). Exactly five values.
+# A sixth value requires a written reason and an update to this set, plus the test
+# that asserts its size and membership (tests/test_autopilot_types.py).
+GATE_OUTCOMES = frozenset({"pass", "ci_red", "no_op", "salvage", "direct_fail"})
+
+
 @dataclass
 class GateResult:
     score: int | None
@@ -127,6 +133,21 @@ class GateResult:
     mode: str = "gated"               # which QualityMode produced this result; default
     #   "gated" preserves every existing construction site (and the twin gate's byte-
     #   identical GateResult(...) returns) for full back-compat.
+    outcome: str = "pass"             # terminal-state vocabulary (design doc section 4.1);
+    #   default "pass" preserves every existing construction site, none of which pass
+    #   this argument today. A later card (S2) populates the real value at each of the
+    #   five terminal return sites; this default is a placeholder, not a claim.
+    tokens: int = 0                   # accumulated token usage; repairs the CapLedger
+    #   budget ceiling at orchestrator.py:800, which today always adds zero because
+    #   GateResult never carried this field.
+    cost_usd: float = 0.0             # accumulated dollar cost, same repair as tokens.
+
+    def __post_init__(self):
+        if self.outcome not in GATE_OUTCOMES:
+            raise ValueError(
+                f"GateResult.outcome must be one of {sorted(GATE_OUTCOMES)}, "
+                f"got {self.outcome!r}"
+            )
 
 
 @dataclass
