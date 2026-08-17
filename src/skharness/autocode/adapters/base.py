@@ -435,10 +435,19 @@ class BaseCliAdapter(Harness):
             "stop -- do not re-implement working code. Otherwise implement the task "
             "in the current git worktree, test-driven (failing test first), matching "
             "the repo's conventions.")
+        # Both memory channels are sent, and they are NOT interchangeable.
+        # prior_feedback carries reports from runs that FAILED, to be checked
+        # rather than believed. prior_success_feedback carries an approach a
+        # grader already scored 5, so it is cross-RUN memory and is not
+        # overwritten round to round. Sending only the failure half is what made
+        # S9/S18's success memory recorded, read back, seeded onto the brief and
+        # never seen by the model: a complete, tested, entirely inert feature.
         data = json.dumps({"task_id": brief.task_id, "title": brief.title,
                            "description": brief.description,
                            "acceptance": brief.acceptance,
-                           "prior_feedback": brief.prior_feedback, "round": brief.round})
+                           "prior_feedback": brief.prior_feedback,
+                           "prior_success_feedback": brief.prior_success_feedback,
+                           "round": brief.round})
         # A dispatcher may pin this ONE call to a graded bucket (see buckets.py);
         # absent that, dispatch_model_of is None and this is the pre-existing call.
         raw = self._run_raw(instruction, data, worktree=brief.worktree, repo=brief.repo,
