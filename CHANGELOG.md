@@ -45,6 +45,41 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   test, so the two cannot drift.
 
 ### Security
+- **The sovereign-grader gate checked a model NAME, so it could not see the
+  fact it existed to check** (card `a43cac2e`, critical). `is_sovereign_grader`
+  ran `name.startswith("ornith")` over `harness.grader_model or harness.model`,
+  a statically configured id, under a docstring that called it "what actually
+  graded". skgateway resolves failover server side, so that id is what was
+  REQUESTED. Measured in the live ledger (`skgateway/data/metrics.db`,
+  `energy_log`, read-only): `ornith-big`, this repo's own pinned "sovereign"
+  grader, has a row with `backend=nvidia`, `basis=imputed_cloud`. So does
+  `ornith-tiny`. The old rule returned `True` for both. That gate protects raw
+  card text on a board where 1,433 cards are classified secret, and a green
+  gate was indistinguishable from a broken one.
+- **New module `autocode/sovereignty.py`: ONE definition, for the whole fleet.**
+  Sovereignty is a claim about HARDWARE AND JURISDICTION, so the discriminator
+  is the backend that served plus the energy basis it reported, never the model
+  name. `ornith-1.0-9b` served by `nvidia` is a violation; the same weights
+  served by `reg:ornith` are not. `classify()` takes no model parameter at all,
+  by construction. Evidence is ranked: `measured_gpu` with a named node is
+  physical and unforgeable, `backend` is config-grounded and correct per winning
+  attempt, and the model id is not an input. The third-party denylist is checked
+  FIRST and is not overridable, so no configuration change can relabel `nvidia`
+  or `anthropic` as sovereign.
+- **Three states, never two: `sovereign` / `violated` / `unobserved`.** Unknown
+  is NOT sovereign. A harness that cannot report which backend served it is
+  refused (fail closed) and the refusal is recorded as `unobserved`, distinct
+  from a measured `violated`, so an operator can tell "wire the observation"
+  from "fix the routing" without re-running anything. `grade_refused_nonsovereign`
+  now carries `sovereignty`, `backend_served`, `energy_basis`, `energy_node` and
+  a reason.
+- **`grader_model_for` renamed to `requested_grader_model`.** The old name
+  invited exactly the misuse that caused this bug. The value is still stamped on
+  every grade, because paired with `rubric_version` it is the only grade-drift
+  signal there is, but it is provenance, not permission. `is_sovereign_grader`
+  now takes observed serving facts and RAISES `TypeError` on a string, so an old
+  caller holding a model id cannot silently get a verdict about a name and read
+  it as a verdict about a machine.
 - **A card can no longer select the model that grades it** (card `0b7e3ac3`).
   The twin-gate grader took the build's bucket wholesale, so a card graded
   S/low routed its own quality gate to the weakest class in the fleet: grade
