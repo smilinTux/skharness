@@ -47,9 +47,11 @@ for a reward signal that partly measures the ability to write a passing test.
 | Human ratification outside the loop | **Exists in code, not in practice.** The channel is `digest.queue_decision`; 38 items sit unanswered, oldest 20 days | `digest.py:113-131`, GTD `waiting-for.json` |
 | Any policy consuming the score today | **None.** `.score` is read by the twin-gate predicate, one salvage branch, and report text | section 2.3 |
 
-Two of those "no" answers are load-bearing enough to be their own sections. The
-CI arm is the deepest problem in the design and section 3.3 addresses it
-directly rather than mitigating it.
+Four rows say "no". Two of them get the longest treatment: the CI arm, which is
+the deepest problem in the design (section 3.3 addresses it directly rather than
+mitigating it), and human ratification, where the gap between the code and the
+observed behaviour is large enough to be worth measuring rather than asserting
+(section 3.5).
 
 ---
 
@@ -229,7 +231,8 @@ CI command, over the worker's own diff.
 
 The mechanics, verified:
 
-- For a `local:` CI repo (5 of the 7 in `autopilot.yaml`), `ci.py:115-123` runs
+- For a `local:` CI repo (6 of the 7 in `autopilot.yaml`; only `skworld-app`
+  uses `github-actions`), `ci.py:115-123` runs
   the configured command with `cwd=worktree`, that is, in the tree containing
   the harness's uncommitted edits. Whatever test files the build round created
   are the test files that run.
@@ -291,13 +294,15 @@ place, and section 3.5 is about how well it actually works.
 or seeded-probe mechanism anywhere in `skharness/src/` at the pinned commit. The
 nearest three things are each something else:
 
-- `tests/data/joule-economy-golden-set-v1.json` is on the protected floor
-  (`protected.py:58-59`) and is a calibration reference for the *grading rubric*,
-  not a check on any individual card's work. It is also not yet ground truth: its
-  own metadata records `graded_by: opus (pre-grade, awaiting Chef correction)`,
-  a caveat carried from card `09573989`. Forty-two of forty-two agreeing on the
-  derivation rule proves the `max()` rule is self-consistent, not that the grades
-  are right.
+- `skharness/tests/data/joule-economy-golden-set-v1.json` is on the protected
+  floor (`protected.py:58-59`) and is a calibration reference for the *grading
+  rubric*, not a check on any individual card's work. It is also not yet ground
+  truth: read at the pinned commit, it holds 42 cards and its own top-level
+  metadata is `rubric_version: 1`, `created: 2026-08-14`, `graded_by: "opus
+  (pre-grade, awaiting Chef correction)"`. Forty-two of forty-two agreeing on
+  the derivation rule proves the `max()` rule is self-consistent, not that the
+  grades are right. Card `09573989` records that it becomes ground truth when
+  Chef reviews it.
 - `repo.advisory_checks` (`types.py:69`, consumed at `engineering.py:652`) marks
   CI checks that are explicitly *not* core gates. That is the opposite of a
   held-out check.
@@ -328,9 +333,9 @@ funnels here: the carve-out hold (`engineering.py:573`), the auto-merge hold
 stamps `answered_at`.
 
 The red-team's concern was that ratification candidates would arrive on the same
-flooded channel as merge holds and degrade into one-keypress ratification. I
-measured the channel. The finding is worse than the concern, and it is measured,
-not inferred:
+flooded channel as merge holds and degrade into one-keypress ratification. The
+channel was measured for this document. The finding is worse than the concern,
+and it is counted, not inferred:
 
 - `~/.skcapstone/coordination/gtd/waiting-for.json` holds 42 items. 38 carry
   `source: "autopilot"` and a `decision` block. **All 38 have
@@ -358,10 +363,12 @@ mode is stalled work, not unreviewed merges.
 
 That is exactly the asymmetry a fail-closed design should produce, and it is
 also the reason a future session must not read "human ratification is in the
-design" as "human ratification is a live control". It is a live control for
-merges precisely because merges are off. Turn `automerge_repos` on and the same
-channel becomes the only thing between a self-graded diff and the integration
-branch, at an observed answer rate of zero.
+design" as "human ratification is a live control". What holds the line today is
+not the decision queue being drained. It is that nothing reaches an integration
+branch without a person running a merge by hand, because `automerge_repos` is
+empty. Turn it on and this queue, at an observed answer rate of zero over the
+window measured above, becomes the only thing standing between a self-graded
+diff and the integration branch.
 
 One further observation from the same code, recorded because it bears on the
 reward specifically: `_settle_economics` runs at `engineering.py:555` on
@@ -461,11 +468,12 @@ control arm's first round through `build_prior_feedback` (called at
 counterfactual is not measurable this way.
 
 Epic `935d4b61` acceptance criterion 4 asks for exactly this: "An exploration
-budget and counterfactual logging exist". Ground 4 is the recorded answer that
-it should not, and this cross-reference is the point of writing it down: a future
-session reading the epic's criteria will find a criterion that has been
-deliberately declined, and should find this sentence rather than an apparent
-oversight.
+budget and counterfactual logging exist, so the policy can be shown to beat the
+heuristic rather than merely to have replaced it". Ground 4 is the recorded
+answer that it should not be built. The cross-reference is the point of writing
+it down: a future session reading the epic's criteria will find a criterion that
+has been deliberately declined, and should find this paragraph rather than an
+apparent oversight.
 
 **Weight:** strong on its own terms, and it is the ground most likely to be
 re-proposed, because it looks like cheap data. It is not cheap; it is
@@ -482,8 +490,10 @@ here verbatim because it is the deepest point in the entire design:
 > falsifier.
 
 This is a measurement fact, not a policy choice, and it is the one ground that
-cannot be voted away. A high-risk grade routes to a bigger model, more review,
-and no auto-merge. If that grade was correct, the caution it bought prevents the
+cannot be voted away. A high-risk grade raises the model class through
+`model_class = CLASS[max(size_rank, risk_rank)]` (Joule design section 3.3), and
+at `risk: crit` or `confidence < 0.6` it routes to Chef regardless of anything
+else (same section). If that grade was correct, the caution it bought prevents the
 incident, and the record shows a high-risk card that went fine, which any
 supervised learner reads as an over-estimate and corrects downward. The
 correction removes the caution. The next such card is the incident.
@@ -591,6 +601,12 @@ as `{"pr", "branch", "ts", "auto"}` with **no `sha`**. `_revert_impl` at
 always fails on automerged work and `meta.autopilot.reverted` (written at `:704`)
 can never be set. **Verified in code at the pinned commit.**
 
+Note the second, independent reason the field is empty today: the merge record at
+`:596-600` is written only inside the auto-merge branch, and `automerge_repos` is
+empty in every config on this node (section 3.5), so `meta.autopilot.merge` is
+not being written at all. Both roads lead to a constant `False`, which is exactly
+why the field cannot be read as an outcome.
+
 Two consequences, and the second is why this belongs in this document:
 
 1. The operator has no working undo for anything autopilot auto-merged. The
@@ -603,8 +619,10 @@ Two consequences, and the second is why this belongs in this document:
 
 **Citation drift, recorded deliberately.** Card `1e5be0a7` cites
 `engineering.py:564` and `:655`. At `2e8affdc` those are `:596-600` and `:689`.
-The card's line numbers were already stale when this document was written, one
-day after the card was created. This is the practical argument for the pinning
+The card was created at 09:37 UTC on 2026-08-16 and the pinned commit (the merge
+of PR #39, `feat/grade-bucket-dispatch`) is dated 09:20 local the same day, so
+the line numbers went stale within hours of being written, without anyone
+touching the defect they describe. This is the practical argument for the pinning
 note at the top: cite a sha with a line, or expect the line to move.
 
 **Until `1e5be0a7` closes, no outcome analysis may treat `reverted` as a
@@ -633,7 +651,7 @@ first principles again.
 4. **A live revert sensor.** Section 6.2 closed, so "did this get reverted" means
    something.
 5. **A golden set that is ground truth.** Chef-reviewed, per `09573989`. Today
-   its metadata says `graded_by: opus (pre-grade, awaiting Chef correction)`.
+   its metadata says `graded_by: "opus (pre-grade, awaiting Chef correction)"`.
 6. **An argument that survives ground 5.** Grounds 1 through 4 are decisions and
    could be revisited by whoever made them. Ground 5 is a property of feedback
    under intervention, and reopening requires either an identification strategy
@@ -676,7 +694,8 @@ failure this document exists to prevent.
 `types.py:66-76`, `:111-129`;
 `digest.py:113-131`; `resolver.py:47-80`;
 `orchestrator.py:303-327`, `:805`, `:819`, `:824`, `:844-846`;
-`joules.py:92-106`; `config.py:17-21`, `:83`.
+`joules.py:92-106`; `config.py:17-21`, `:83`;
+`tests/data/joule-economy-golden-set-v1.json` (42 cards, `graded_by` metadata).
 Outside skharness: `skcoord/src/skcoord/coordination.py` `set_grade` (411-498);
 `skgateway/docs/specs/2026-08-08-model-ranking-routing-intelligence-arch.md:605-613`;
 `skcapstone/docs/superpowers/specs/2026-08-14-joule-economy-design.md` sections 0,
