@@ -1,0 +1,63 @@
+{
+  "_what_this_is": [
+    "Reviewed, enumerated exceptions to the grading-floor guard in",
+    "tests/test_autocode_escalation.py (S12 AC4, card 9a7c0a86).",
+    "",
+    "The guard asserts that no file on the grading floor differs from the",
+    "branch's base. That assertion is correct for ONE card and wrong for a",
+    "COMPOSED branch: card A never touches the floor, card B legitimately does,",
+    "and A's guard then reports B's change as A's violation (card 3f6719e4).",
+    "This file is how a floor change gets ACCEPTED, in writing, once.",
+    "",
+    "AN ENTRY IS PINNED TO CONTENT, NOT TO A PATH. `blob` is the git blob sha",
+    "of the exact reviewed post-image. A path allowance would be a permanent",
+    "hole: every later edit to that file would ride in free. A content pin",
+    "expires the instant anything else lands on the file, so the next change",
+    "goes red and gets its own review. That is the difference between an",
+    "allowance and a mute button.",
+    "",
+    "THIS FILE IS ITSELF ON protected._ALWAYS_PROTECTED. A diff that adds an",
+    "entry can therefore never auto-merge; it always routes to a human. The",
+    "'reviewed, not automatic' property is structural, not a convention that",
+    "depends on somebody remembering it.",
+    "",
+    "FAIL CLOSED: if this file is missing, unreadable or unparseable, the guard",
+    "reads it as allowing NOTHING, and every floor change is a violation.",
+    "",
+    "MAINTENANCE: an entry goes inert once its change is in the base (the file",
+    "no longer differs, so it is never consulted). Inert entries are harmless",
+    "but should be pruned when the epic closes, so this list stays a short",
+    "record of live exceptions rather than a growing pile of old ones."
+  ],
+  "allowances": [
+    {
+      "path": "src/skharness/autocode/buckets.py",
+      "blob": "b2de1246b814446dabf8b682f661619a2c257245",
+      "card": "6ad3c9ab",
+      "epic": "935d4b61",
+      "recorded_by": "lumina, epic 935d4b61 integration pass, 2026-08-16",
+      "human_signoff": "PENDING: goes to Chef with the branch. Recorded here so the disposition is visible in the diff rather than decided silently by whoever runs the suite next.",
+      "reason": [
+        "S14 (card 6ad3c9ab) added, to buckets.py, one import of",
+        "routing_guard.assert_routing_field and two lines inside",
+        "attach_dispatch_model: it validates DISPATCH_MODEL_ATTR on every call",
+        "and writes to the name assert_routing_field RETURNS instead of",
+        "re-reading the global after the check.",
+        "",
+        "It changes NO grading semantics. Not the bucket grammar (BUCKET_RE,",
+        "BUCKET_CLASSES), not the class mapping in bucket_id, not model_class",
+        "derivation, not sensitivity. It is additive hardening on the routing",
+        "WRITE path: it narrows what buckets.py may setattr onto a brief.",
+        "",
+        "S12's AC4 asks that the rubric and its addressing not be rewritten by",
+        "the engine those rules constrain. That is intact in substance here and",
+        "violated only in letter, because the guard measures the whole branch",
+        "rather than one card's work.",
+        "",
+        "SCOPE: this reason covers this blob and nothing else. Do not widen it",
+        "to buckets.py in general, and do not re-point the blob at a later",
+        "revision without reading the new diff and writing a new reason."
+      ]
+    }
+  ]
+}
