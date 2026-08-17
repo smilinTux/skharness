@@ -151,6 +151,18 @@ class EngineeringExecutor:
             print(f"autopilot[{ref}] usage record failed (build unaffected): {log_ref}")
         return usage
 
+    def _peek_usage(self, ref: str):
+        """This build's usage so far, WITHOUT taking it off the books.
+
+        The twin-gate pass return needs the numbers, but it must not take them:
+        _settle_economics is the one path allowed to pop them, because it is the
+        one path allowed to mint. Every non-pass terminal uses _take_usage
+        instead, which pops and records.
+        """
+        from .joules import BuildUsage
+
+        return self._build_usage.get(ref) or BuildUsage()
+
     def _settle_economics(self, item: WorkItem, sha: str, *,
                           retries: int = 0, rounds_max: int = 0) -> None:
         """Settle the build's joule P&L on a twin-gate pass (mint value, spend real
@@ -496,13 +508,14 @@ class EngineeringExecutor:
                         replacement_hint=("verify against the base branch before "
                                           "re-implementing"))
                     # record what the two rounds cost; no mint (not a pass)
-                    self._take_usage(item.ref, "no_op")
+                    u = self._take_usage(item.ref, "no_op")
                     return GateResult(
                         score=None, passed=False, artifact=None,
                         notes=("no-op: the agent produced no diff in 2 rounds. The "
                                "acceptance is likely ALREADY satisfied on the base "
                                "branch (stale card) or the harness cannot write. "
-                               "This is not a gate failure -- review the card."))
+                               "This is not a gate failure -- review the card."),
+                        outcome="no_op", tokens=u.tokens, cost_usd=u.cost_usd)
                 feedback = ("You produced NO changes to the repository. If the "
                             "acceptance criteria are ALREADY satisfied by existing "
                             "code on this branch, do not re-implement -- instead make "
@@ -536,8 +549,13 @@ class EngineeringExecutor:
                 # NOTE deliberately NOT folded in: _settle_economics still passes
                 # score=5 to settle(). That changes minted joule values, so it is
                 # an economic change needing Chef's sign-off (spec open question 2).
+                # PEEK, never take: finalize's _settle_economics pops this usage
+                # to mint against it, and it is the only path allowed to.
+                u = self._peek_usage(item.ref)
                 return GateResult(score=gr.score, passed=True,
-                                  notes=strip_promise(gr.notes), artifact=gr.artifact)
+                                  notes=strip_promise(gr.notes), artifact=gr.artifact,
+                                  outcome="pass", tokens=u.tokens,
+                                  cost_usd=u.cost_usd)
             # Grade-resilience: the grader could not certify (score None == the
             # adapter returned no parseable verdict even after its retries -- a
             # flaky/transient grade), BUT the DETERMINISTIC signals are strong: CI
@@ -550,11 +568,12 @@ class EngineeringExecutor:
                 pr_url = self._salvage_to_review(item, repo, wt, pr_branch)
                 # record what the salvaged rounds cost; no mint (the grade never
                 # said 5, so this is not a pass)
-                self._take_usage(item.ref, "salvage")
+                u = self._take_usage(item.ref, "salvage")
                 return GateResult(
                     score=None, passed=False, artifact=pr_url,
                     notes=(f"grade inconclusive but CI green + coverage met; opened "
-                           f"PR {pr_url} for human review (NOT auto-merged)."))
+                           f"PR {pr_url} for human review (NOT auto-merged)."),
+                    outcome="salvage", tokens=u.tokens, cost_usd=u.cost_usd)
             feedback = strip_promise(gr.notes)
         # Terminal: the rounds are spent and the gate never closed. Distil the
         # cause (failing test id + assertion) rather than carrying the grader's
@@ -565,11 +584,12 @@ class EngineeringExecutor:
                   f"{self._MAX_ROUNDS} rounds",
             why_failed=distill_failure(strip_promise(last.notes) if last else ""))
         # record what all the rounds cost; no mint (the gate never closed)
-        self._take_usage(item.ref, "ci_red")
+        u = self._take_usage(item.ref, "ci_red")
         return GateResult(score=(last.score if last else None), passed=False,
                           notes=f"did not converge in {self._MAX_ROUNDS} rounds: "
                                 f"{strip_promise(last.notes) if last else ''}",
-                          artifact=(last.artifact if last else None))
+                          artifact=(last.artifact if last else None),
+                          outcome="ci_red", tokens=u.tokens, cost_usd=u.cost_usd)
 
     def _merge(self, repo: RepoSpec, pr_branch: str) -> str:
         subprocess.run(["git", "-C", repo.path, "checkout", repo.integration_branch],

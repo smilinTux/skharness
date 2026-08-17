@@ -69,9 +69,17 @@ class DirectExecutor(EngineeringExecutor):
                             "the harness run reported not-ok"),
                 replacement_hint=("check the acceptance is not already satisfied "
                                   "on the base branch" if ok else ""))
+        # Direct mode has exactly two terminal states and they must stay
+        # distinguishable: an ungated run that FAILED must never read as a pass.
+        # tokens/cost come straight off the one HarnessResult this mode produces
+        # (direct runs no rounds, so it accrues no multi-round BuildUsage), which
+        # also stops the CapLedger reading a zero for every direct build.
         return GateResult(score=None, passed=passed,
                           notes="direct mode: UNGATED single run; review required",
-                          artifact=wt, mode=QualityMode.DIRECT.value)
+                          artifact=wt, mode=QualityMode.DIRECT.value,
+                          outcome=("pass" if passed else "direct_fail"),
+                          tokens=int(getattr(res, "tokens", 0) or 0),
+                          cost_usd=float(getattr(res, "cost_usd", 0.0) or 0.0))
 
     def _merge(self, repo, pr_branch) -> str:
         """HARD GUARDRAIL (G1): direct-mode work is ungated and MUST NOT merge to a
