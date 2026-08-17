@@ -115,6 +115,41 @@ class EngineeringExecutor:
         except Exception as exc:
             health.record("usage_accrue_error", task=ref, error=str(exc)[:120])
 
+    def _take_usage(self, ref: str, outcome: str):
+        """Take a terminal non-pass's accrued usage off the books and RECORD it.
+
+        Two separate concerns used to be collapsed into one `pop`:
+
+          MINTING   -- legal ONLY on a twin-gate pass. settle()'s contract, and
+                       this method does not touch it: settle() is still reachable
+                       only from _settle_economics, only on result.passed.
+          RECORDING -- what the run actually COST. True on every path, and the
+                       one number an honest cost picture cannot do without.
+
+        The salvage path popped the usage under the comment "no mint on a
+        non-pass". The comment was right; the action overreached and discarded
+        the telemetry along with the mint, so a salvaged run's real token and
+        dollar cost was recorded nowhere at all. Meanwhile the no-op bail and the
+        did-not-converge return never popped at all, so _build_usage grew for the
+        process lifetime.
+
+        One place now removes the usage from the books AND writes it down, which
+        fixes the leak and the censorship together. Returns the BuildUsage so a
+        caller can read tokens/cost off it; best-effort, never raises into the
+        build loop.
+        """
+        from .joules import BuildUsage
+
+        usage = self._build_usage.pop(ref, None) or BuildUsage()
+        try:
+            health.record("build_usage_unsettled", task=ref, outcome=outcome,
+                          tokens=usage.tokens, cost_usd=round(usage.cost_usd, 6),
+                          model=usage.model, turns=usage.turns, minted=False)
+        except Exception as exc:      # noqa: BLE001 - telemetry never breaks a build
+            log_ref = str(exc)[:120]
+            print(f"autopilot[{ref}] usage record failed (build unaffected): {log_ref}")
+        return usage
+
     def _settle_economics(self, item: WorkItem, sha: str) -> None:
         """Settle the build's joule P&L on a twin-gate pass (mint value, spend real
         token cost). Best-effort: a wallet failure never affects the finalized PR."""
@@ -396,6 +431,8 @@ class EngineeringExecutor:
                                     "cannot write"),
                         replacement_hint=("verify against the base branch before "
                                           "re-implementing"))
+                    # record what the two rounds cost; no mint (not a pass)
+                    self._take_usage(item.ref, "no_op")
                     return GateResult(
                         score=None, passed=False, artifact=None,
                         notes=("no-op: the agent produced no diff in 2 rounds. The "
@@ -447,6 +484,9 @@ class EngineeringExecutor:
             if gr.score is None and ci_status == "green" and diff.strip() and cov_ok:
                 health.record("grade_inconclusive_ci_green", task=item.ref, round=rnd)
                 pr_url = self._salvage_to_review(item, repo, wt, pr_branch)
+                # record what the salvaged rounds cost; no mint (the grade never
+                # said 5, so this is not a pass)
+                self._take_usage(item.ref, "salvage")
                 return GateResult(
                     score=None, passed=False, artifact=pr_url,
                     notes=(f"grade inconclusive but CI green + coverage met; opened "
@@ -460,6 +500,8 @@ class EngineeringExecutor:
             tried=f"gated build of {p.get('title', item.ref)!r}, "
                   f"{self._MAX_ROUNDS} rounds",
             why_failed=distill_failure(strip_promise(last.notes) if last else ""))
+        # record what all the rounds cost; no mint (the gate never closed)
+        self._take_usage(item.ref, "ci_red")
         return GateResult(score=(last.score if last else None), passed=False,
                           notes=f"did not converge in {self._MAX_ROUNDS} rounds: "
                                 f"{strip_promise(last.notes) if last else ''}",
@@ -523,7 +565,12 @@ class EngineeringExecutor:
         """
         self._commit_and_push(repo, wt, pr_branch, item)
         pr_url = self._open_pr(repo, pr_branch, item)
-        self._build_usage.pop(item.ref, None)   # drop unsettled usage (no mint on a non-pass)
+        # The usage is NOT dropped here any more. This helper owns the PR
+        # mechanics, not the books: the caller's terminal return takes the usage
+        # off the books via _take_usage AND records it. The no-mint rule is
+        # unchanged (settle() is still only reachable from _settle_economics on a
+        # pass); what changed is that the numbers are now written down instead of
+        # thrown away with the mint.
         health.record("grade_salvaged_to_review", task=item.ref, pr=pr_url)
         print(f"autopilot[{item.ref}] grade inconclusive; salvaged to PR {pr_url} for review")
         return pr_url

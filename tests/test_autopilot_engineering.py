@@ -311,6 +311,112 @@ def test_run_bails_fast_on_noop_empty_diff(mocker, cfg):
     assert ex.board.score_task.call_count == 0
 
 
+# ── S5: a failed run's usage and cost must be RECORDED, not dropped ──────────
+# Two concerns used to be collapsed into one `pop`: minting (pass only) and
+# recording (every path). The load-bearing assertions below are all on the
+# FAILURE paths, which are the censored half; the pass path already worked.
+
+def _usage_ex(mocker, cfg, grades, **kw):
+    """_run_ex with a harness whose rounds cost real, non-zero tokens/dollars."""
+    ex, harness, item = _run_ex(mocker, cfg, grades, **kw)
+    harness.run_task.return_value = HarnessResult(ok=True, artifact=None, tokens=7,
+                                                  cost_usd=0.02, raw={})
+    rec = mocker.patch("skharness.autocode.engineering.health.record")
+    return ex, harness, item, rec
+
+
+def _unsettled(rec):
+    """Every build_usage_unsettled event health.record was handed."""
+    return [c.kwargs for c in rec.call_args_list
+            if c.args and c.args[0] == "build_usage_unsettled"]
+
+
+def test_noop_bail_records_its_usage_and_leaves_no_leak(mocker, cfg):
+    ex, harness, item, rec = _usage_ex(mocker, cfg, grades=[])
+    mocker.patch.object(ex, "_diff", return_value="")      # no-op bail
+    ex.run(item, harness)
+    ev = _unsettled(rec)
+    assert len(ev) == 1 and ev[0]["outcome"] == "no_op"
+    assert ev[0]["tokens"] == 14 and ev[0]["cost_usd"] == 0.04   # 2 rounds accrued
+    assert ex._build_usage == {}                # accrued each round, never popped before
+
+
+def test_did_not_converge_records_its_usage_and_leaves_no_leak(mocker, cfg):
+    grades = [GateResult(score=4, passed=False, notes="one gap", artifact=None)] * 6
+    ex, harness, item, rec = _usage_ex(mocker, cfg, grades)
+    ex.run(item, harness)
+    ev = _unsettled(rec)
+    assert len(ev) == 1 and ev[0]["outcome"] == "ci_red"
+    assert ev[0]["tokens"] == 28 and ev[0]["cost_usd"] == 0.08   # 4 rounds accrued
+    assert ex._build_usage == {}
+
+
+def test_salvage_records_its_usage_instead_of_discarding_it(mocker, cfg):
+    grades = [GateResult(score=None, passed=False, notes="", artifact=None)] * 6
+    ex, harness, item, rec = _usage_ex(mocker, cfg, grades)
+    mocker.patch.object(ex, "_salvage_to_review", return_value="https://gh/pr/9")
+    ex.run(item, harness)
+    ev = _unsettled(rec)
+    assert len(ev) == 1 and ev[0]["outcome"] == "salvage"
+    assert ev[0]["tokens"] == 7 and ev[0]["cost_usd"] == 0.02    # the real cost, not 0
+    assert ex._build_usage == {}
+
+
+def test_salvage_helper_itself_no_longer_discards_the_numbers(mocker, cfg):
+    """The pop lived inside _salvage_to_review, so the helper destroyed the
+    telemetry before any caller could record it. Prove the helper leaves the
+    accrued usage intact and does exactly its PR job."""
+    ex = EngineeringExecutor(cfg, board=mocker.Mock(), journal=mocker.Mock(),
+                             agent_name="autopilot")
+    mocker.patch.object(ex, "_commit_and_push")
+    mocker.patch.object(ex, "_open_pr", return_value="https://gh/pr/9")
+    item = WorkItem(kind="engineering", ref="t1", source="coord", repo=None,
+                    payload={"tags": ["repo:skrender"], "title": "t"})
+    ex._accrue_usage("t1", HarnessResult(ok=True, artifact=None, tokens=7,
+                                         cost_usd=0.02, raw={}))
+    ex._salvage_to_review(item, cfg.repo_map["skrender"], "/wt/t1", "autopilot/t1")
+    assert ex._build_usage["t1"].tokens == 7    # the numbers survive the helper
+
+
+@pytest.mark.parametrize("kind", ["no_op", "ci_red", "salvage"])
+def test_settle_is_never_called_off_the_pass_path(mocker, cfg, kind):
+    """Recording usage must NOT weaken settle()'s pass-only contract: no mint on
+    a non-pass, ever. Asserted against joules.settle itself, the one function
+    that touches the wallet."""
+    settle = mocker.patch("skharness.autocode.joules.settle")
+    grades = {"no_op": [],
+              "ci_red": [GateResult(score=4, passed=False, notes="g", artifact=None)] * 6,
+              "salvage": [GateResult(score=None, passed=False, notes="", artifact=None)] * 6
+              }[kind]
+    ex, harness, item, _rec = _usage_ex(mocker, cfg, grades)
+    if kind == "no_op":
+        mocker.patch.object(ex, "_diff", return_value="")
+    if kind == "salvage":
+        mocker.patch.object(ex, "_salvage_to_review", return_value="https://gh/pr/9")
+    res = ex.run(item, harness)
+    assert res.passed is False
+    settle.assert_not_called()
+    # ... and a non-passed result reaching finalize still never settles
+    ex.journal.worktree_for.return_value = "/wt/t1"
+    ex.digest = mocker.Mock()
+    mocker.patch("skharness.autocode.engineering.os.path.isdir", return_value=True)
+    mocker.patch.object(ex, "_commit_and_push")
+    mocker.patch.object(ex, "_open_pr", return_value="https://gh/pr/9")
+    mocker.patch.object(ex, "_head_sha", return_value="sha1")
+    ex.finalize(item, res)
+    settle.assert_not_called()
+
+
+def test_settle_positive_control_a_pass_does_reach_the_wallet(mocker, cfg):
+    """Positive control for the three assert_not_called tests above: the same
+    patch target IS hit on the pass path. Without this an always-wrong mock
+    target would make those three green for the wrong reason."""
+    settle = mocker.patch("skharness.autocode.joules.settle")
+    ex, item = _final_ex(mocker, cfg, "skrender")
+    ex.finalize(item, GateResult(score=5, passed=True, notes="", artifact="pr"))
+    settle.assert_called_once()
+
+
 def test_twin_gate_blocks_merge_when_ci_red_even_at_five(mocker, cfg):
     grades = [GateResult(score=5, passed=True,
                          notes="<promise>COMPLETE</promise>", artifact="pr")] * 6
