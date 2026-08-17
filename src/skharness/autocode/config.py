@@ -25,6 +25,48 @@ misplaced key a startup failure rather than a policy change nobody ordered.
 The lint covers all three filtered levels (top level, `caps:`, and each `repo_map:`
 entry) because each one uses the same drop-on-unknown filter and would otherwise be
 the next place this happens.
+
+WHY THE DEFAULT HARNESS IS `pi`, and why it is a prerequisite rather than a taste
+---------------------------------------------------------------------------------
+`adapters/base.BaseCliAdapter.supports_model_override()` returns False, and PiAdapter
+is the ONLY adapter that overrides it to True. `BaseCliAdapter._run_raw` RAISES
+`ModelOverrideUnsupported` on a per-call model override rather than dropping it, on
+purpose: dropping it would run the call on the statically configured model with the
+card's sensitivity ceiling quietly discarded, which is the exact failure the graded
+routing seam exists to prevent.
+
+`engineering.py` attaches the graded bucket (`_dispatch_model`) to every build round
+AND to every grade call of a graded card. So on the day anything starts WRITING
+grades, every graded card dispatched through a `claude-code` default raises instead
+of building. Today 0 of ~4,890 cards carry a grade, so the ungraded path sends no
+override and nothing is broken yet; that is precisely why the default flips now.
+pi-default before grading-on is inert. The reverse order breaks the gated executor.
+
+WHAT "WORK THAT FITS PI" MEANS
+------------------------------
+Written down here because an undefined scope becomes whatever the first ambiguous
+card makes it mean. `fits_pi()` below is this paragraph in code. Work fits the pi
+default when ALL FOUR hold:
+
+1. Its repo resolves. The card carries exactly one `repo:<name>` tag and that name is
+   a KEY of the loaded `repo_map`. This gate is harness-independent (orchestrator
+   `phase1_triage` parks an unmapped engineering card as a which-repo DECISION), but
+   it belongs in the definition because switching the default harness usually means
+   switching config FILE, and a smaller `repo_map` in the new file silently unselects
+   whole repos. Quiet, because those cards do not error, they just stop being picked.
+2. Its build runs in a pi image. A `repo_map` entry may pin `sandbox_image`, and
+   `_run_raw` prefers that pin over the adapter's own image. `sandbox-claude-flutter:1`
+   is built FROM `sandbox-claude:1` and carries no `pi` binary (measured 2026-08-16:
+   `command -v pi` -> nothing, `claude` -> /usr/local/bin/claude). Running pi in it
+   fails, so a non-pi image pin means the card does not fit the pi default.
+3. Its routing requirement is one pi can honour. A GRADED card carries a bucket model
+   override, so it fits pi and does NOT fit claude-code (see above). An ungraded card
+   carries no override and fits either.
+4. It needs no capability pi lacks. PiAdapter declares the TASK plane only
+   (`session_plane: False`, `headless_api: "none"`). Attachable/resumable interactive
+   session work is the claude-code session plane's job and is not pi work.
+
+Anything outside those four is not "pi work by default"; route it explicitly.
 """
 from __future__ import annotations
 
@@ -41,6 +83,23 @@ _REPO_KEYS = {
     "coverage_cmd", "ci_poll_timeout", "ci_scope", "advisory_checks", "automerge",
     "auto_revert", "min_diff_coverage", "sandbox_image", "min_quality", "deploy_cmd",
 }
+
+#: The harness a config selects when it does not name one. See the module docstring:
+#: pi is the only adapter that can honour a per-call model override, so it is the only
+#: safe default once anything writes grades.
+DEFAULT_HARNESS = "pi"
+
+#: Every name `harness:` may carry. A literal set on purpose: config sits at the
+#: BOTTOM of this package's import graph (orchestrator, agentrun_bridge and
+#: change_deploy_bridge all import it), while `harness.HARNESSES` only fills once
+#: `skharness.autocode.adapters` is imported, which pulls in the sandbox and all four
+#: adapters. Reading the registry from here would invert the layering and make a plain
+#: `Config.load()` depend on Docker-shaped modules. The two cannot drift silently:
+#: tests/test_autopilot_config_harness.py asserts this set IS the registry's key set.
+KNOWN_HARNESSES = frozenset({"claude-code", "pi", "opencode", "codex", "stub"})
+
+#: Image prefix a sandbox image must carry to be a pi image (leg 2 of `fits_pi`).
+_PI_IMAGE_PREFIX = "sandbox-pi"
 
 
 class ConfigError(ValueError):
@@ -102,7 +161,7 @@ _CAPS_KEYS = set(Caps.__dataclass_fields__)
 @dataclass
 class Config:
     enabled: bool = False
-    harness: str = "claude-code"
+    harness: str = DEFAULT_HARNESS
     allowed_tools: list[str] = field(default_factory=list)
     repo_map: dict[str, RepoSpec] = field(default_factory=dict)
     automerge_repos: list[str] = field(default_factory=list)
@@ -121,6 +180,17 @@ class Config:
     default_quality: QualityMode = QualityMode.GATED   # per-interface default quality
     #   (toggle spec 2.2 step 3); board/CLI runs fall back to this, then to gated.
     fleet_dispatch: bool = True           # consult the fleet scheduler before swarm
+
+    # NO __post_init__ harness check, and the omission is deliberate. Validating at
+    # CONSTRUCTION would be the stronger invariant ("no Config can ever carry an
+    # unknown harness"), but it also makes `Config(harness="totally-bogus")`
+    # impossible, and that is exactly how
+    # tests/test_agentrun_bridge.py::test_factory_returns_none_when_harness_is_unresolvable
+    # proves the execute bridge fails closed on an unresolvable harness. Deleting a
+    # negative control to install a second guard over the same failure is a bad trade:
+    # the yaml is where an operator writes a harness NAME, `load` below is that
+    # boundary, and `harness.build_harness` still raises on any unknown name reaching
+    # it programmatically. Nothing silently falls back either way.
 
     def repo(self, name: str) -> RepoSpec | None:
         return self.repo_map.get(name)
@@ -144,9 +214,18 @@ class Config:
         _reject_unknown(_CAPS_KEYS, caps_raw, "caps", p)
         caps = Caps(**{k: v for k, v in caps_raw.items()
                        if k in _CAPS_KEYS})
+        harness = raw.get("harness", DEFAULT_HARNESS)
+        # Checked here as well as in __post_init__ so the message can name the FILE and
+        # the line's value. A `harness:` typo is otherwise indistinguishable from a
+        # deliberate choice until a run is already underway.
+        if harness not in KNOWN_HARNESSES:
+            raise ConfigError(
+                f"{p}: unknown harness {harness!r}; known: "
+                f"{', '.join(sorted(KNOWN_HARNESSES))}. Autopilot refuses to fall back "
+                "to a harness the operator did not name.")
         return cls(
             enabled=bool(raw.get("enabled", False)),
-            harness=raw.get("harness", "claude-code"),
+            harness=harness,
             allowed_tools=list(raw.get("allowed_tools") or []),
             repo_map=repo_map,
             automerge_repos=list(raw.get("automerge_repos") or []),
@@ -171,6 +250,49 @@ class Config:
 #: `load` reads exactly these, so deriving the set from the dataclass keeps the lint
 #: and the parser from ever disagreeing.
 _TOP_KEYS = set(Config.__dataclass_fields__)
+
+
+def requires_pi(*, graded: bool) -> bool:
+    """True when this work can ONLY run on pi (leg 3 of "what fits pi").
+
+    A graded card carries a skgateway bucket as a per-call model override. pi is the
+    only adapter whose `supports_model_override()` is True; every other adapter RAISES
+    `ModelOverrideUnsupported` rather than dropping the override, because dropping it
+    would discard the card's sensitivity ceiling in silence. So graded work is not
+    merely better on pi, it is unrunnable anywhere else.
+    """
+    return bool(graded)
+
+
+def fits_pi(repo: str | None, config: "Config", *,
+            needs_session_plane: bool = False) -> str | None:
+    """None when this work fits the pi default, else the REASON it does not.
+
+    The module docstring's four legs, in code. Returning the reason rather than a bare
+    False is deliberate and matches `_reject_unknown`: a caller that parks or reroutes
+    a card should be able to say which leg failed, not merely that something did.
+
+    Leg 3 (graded work) is `requires_pi` above: it can never make work UNfit for pi,
+    so it is not a rejection here.
+    """
+    if needs_session_plane:
+        # PiAdapter declares session_plane False / headless_api "none": task plane only.
+        return ("pi is a task-plane harness (session_plane: False); attachable or "
+                "resumable session work belongs to the claude-code session plane")
+    if not repo:
+        return "no repo:<name> tag, so no repo_map entry can be resolved"
+    spec = config.repo(repo)
+    if spec is None:
+        return (f"repo {repo!r} is not a key of this config's repo_map "
+                f"(mapped: {', '.join(sorted(config.repo_map)) or 'none'})")
+    # A per-repo image pin BEATS the adapter's own image in `_run_raw`, so a repo
+    # pinned to another harness's image would run `pi` in a container that has no pi.
+    for image, where in ((spec.sandbox_image, f"repo_map.{repo}.sandbox_image"),
+                         (config.sandbox_image, "sandbox_image")):
+        if image and not str(image).startswith(_PI_IMAGE_PREFIX):
+            return (f"{where} is {image!r}, which is not a {_PI_IMAGE_PREFIX}* image; "
+                    "the pi binary does not exist in the claude sandbox images")
+    return None
 
 
 _AUTOPILOT_JOB_YAML = """\
