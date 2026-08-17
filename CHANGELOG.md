@@ -9,6 +9,31 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ## [Unreleased]
 
+### Security
+- **A card can no longer select the model that grades it** (card `0b7e3ac3`).
+  The twin-gate grader took the build's bucket wholesale, so a card graded
+  S/low routed its own quality gate to the weakest class in the fleet: grade
+  the work easy, get an easy grader. The bucket's two legs are now split at the
+  grader boundary. The SENSITIVITY leg is still inherited exactly (the grader
+  reads the diff, so it must stay inside the build's trust zone, and a secret
+  card still cannot get a looser grader); the CAPABILITY leg is a fixed class
+  the card cannot influence, matching the pin the approved design already
+  applies to the phase0 assessor. New module `autocode/grader_pin.py`.
+- **A card `quality:` tag is now RAISE-ONLY.** `quality:direct` routed to
+  `engineering-direct`, documented as NO grade, NO gate, so a card-authored tag
+  could switch off the twin gate that judges it. A tag may now only strengthen
+  review against the operator baseline (`config.default_quality` raised by
+  `RepoSpec.min_quality`). Lowering quality is still fully available, but only
+  through operator config that no card can write. A refused downgrade emits a
+  `quality_downgrade_refused` health event rather than coercing silently.
+- **`grader_model` is recorded on every outcome row.** Before this, a grade
+  produced by a competent grader and one the card downgraded for itself wrote
+  byte-identical ledger rows (both a well formed score 5); there was no
+  observation separating them. The field sits alongside `model_requested`, never
+  folded into it: on a graded card the two agree on sensitivity zone and differ
+  on capability class, and two rows whose classes track each other is the defect
+  returning.
+
 ### Added
 - **Graded dispatch: a card's grade now selects the model.** `model_class` and
   `sensitivity` map onto a skgateway bucket id (`sk-<class>-<sensitivity>`),

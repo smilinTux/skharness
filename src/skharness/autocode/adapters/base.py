@@ -11,6 +11,7 @@ from skharness.harness import Harness
 
 from .. import health
 from ..buckets import dispatch_model_of, validate_bucket
+from ..grader_pin import grader_bucket
 from ..claude_code import frame
 from ..grading import GRADE_RUBRIC, parse_grade
 from ..sandbox import LaunchSpec
@@ -462,8 +463,16 @@ class BaseCliAdapter(Harness):
                            "acceptance": brief.acceptance, "ci_status": brief.ci_status,
                            "diff_coverage": brief.diff_coverage})
         # The grader reads the DIFF, which carries the card's content, so it sits in
-        # the same sensitivity zone as the build and takes the same bucket.
+        # the same sensitivity zone as the build. That leg IS inherited, exactly and
+        # unwidened: a secret card's diff must never reach a looser trust zone.
+        #
+        # The CAPABILITY leg is NOT inherited. Taking the build's bucket wholesale
+        # let the card being graded pick the competence of its own examiner: a card
+        # graded S/low routed its own quality gate to the weakest class in the fleet.
+        # grader_bucket keeps the zone and replaces the class with a fixed pin the
+        # card cannot influence (see grader_pin.py; Joule Economy design D6).
+        # Ungraded card -> None in, None out -> no override, today's exact behaviour.
         out = self._run(instruction, data, worktree=brief.worktree, repo=brief.repo,
-                        light=True, model=dispatch_model_of(brief))
+                        light=True, model=grader_bucket(dispatch_model_of(brief)))
         return GateResult(score=out.get("score"), passed=bool(out.get("passed")),
                           notes=out.get("notes", ""), artifact=out.get("artifact"))

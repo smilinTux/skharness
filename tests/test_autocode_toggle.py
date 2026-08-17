@@ -9,6 +9,9 @@ Pins the toggle's safety and routing invariants:
   floor  a per-repo min_quality upgrades a direct request to gated (G6).
   route  QualityMode picks the executor kind (direct -> engineering-direct,
          everything else -> engineering).
+  S20    a card `quality:` TAG is raise-only: it can strengthen review, never
+         weaken it, so a card can no longer route itself to the gateless
+         executor. Lowering quality is operator config only.
   gated-unchanged  the gated path still routes to EngineeringExecutor and still
          passes ONLY behind the twin gate.
 
@@ -162,8 +165,16 @@ def test_floor_upgrades_direct_to_gated_on_floored_repo():
 
 
 def test_floor_absent_keeps_direct():
-    cfg = _cfg(repo_map={"skrender": _spec("skrender")})           # min_quality None
-    task = {"id": "t1", "tags": ["repo:skrender", "quality:direct"]}
+    """With no floor, an OPERATOR-configured direct default survives untouched.
+
+    Updated by S20 (card 0b7e3ac3): the direct request used to come from a
+    `quality:direct` card TAG, which let a card switch off its own twin gate. The
+    tag is now raise-only and the request comes from operator config instead. The
+    property under test is unchanged: absent a floor, direct stays direct.
+    """
+    cfg = _cfg(repo_map={"skrender": _spec("skrender")},            # min_quality None
+               default_quality=QualityMode.DIRECT)
+    task = {"id": "t1", "tags": ["repo:skrender"]}
     assert orch.resolve_quality(task, cfg) == QualityMode.DIRECT
     assert orch.classify_kind(task, cfg) == "engineering-direct"
 
@@ -179,10 +190,19 @@ def test_floor_never_lowers_a_gated_request():
 # QualityMode routes to the right executor kind                                #
 # --------------------------------------------------------------------------- #
 
-def test_quality_tag_routes_direct():
-    cfg = _cfg()
-    task = {"id": "t1", "tags": ["repo:skrender", "quality:direct"]}
+def test_quality_direct_routes_direct_when_the_OPERATOR_asks_for_it():
+    """DIRECT still routes to the gateless executor. What changed in S20 is WHO
+    may ask for it: an operator, through config, never a card through its tags.
+    The card-tag half of this is pinned in tests/test_autocode_grader_pin.py."""
+    cfg = _cfg(default_quality=QualityMode.DIRECT)
+    task = {"id": "t1", "tags": ["repo:skrender"]}
     assert orch.classify_kind(task, cfg) == "engineering-direct"
+
+
+def test_a_card_tag_can_no_longer_route_itself_to_the_gateless_executor():
+    cfg = _cfg()                                      # operator baseline: gated
+    task = {"id": "t1", "tags": ["repo:skrender", "quality:direct"]}
+    assert orch.classify_kind(task, cfg) == "engineering"
 
 
 def test_no_quality_tag_uses_config_default():
@@ -210,9 +230,8 @@ def test_unknown_quality_tag_fails_closed_to_gated():
 
 
 def test_to_workitem_normalizes_quality_into_payload():
-    task = {"id": "t1", "tags": ["repo:skrender", "quality:direct"],
-            "acceptance_criteria": ["x"]}
-    wi = orch._to_workitem(task, config=_cfg())
+    task = {"id": "t1", "tags": ["repo:skrender"], "acceptance_criteria": ["x"]}
+    wi = orch._to_workitem(task, config=_cfg(default_quality=QualityMode.DIRECT))
     assert wi.payload["quality"] == "direct" and wi.kind == "engineering-direct"
 
 
