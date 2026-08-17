@@ -21,7 +21,24 @@ import re
 MAX_ATTEMPTS = 3
 MAX_CHARS = 600
 
-_HEADER = "Prior attempts on this card (distilled):"
+# S21 (card 53b8c8be), vector 2: every line under this header is model-derived
+# text, distilled from ONE previous run's grader notes by `distill_failure`. It
+# crosses attempts: a failing worker seeds the next worker's round one. That is
+# the same mechanism the 2026-08-16 red-team accepted as decisive against the
+# exploration slice (card f81d8d2d), where a weak model's misdiagnosis would have
+# corrupted the control arm through the card's failure memory.
+#
+# The DECISION recorded here: keep the channel (a card that rebuilds into the
+# same wall every run is the failure it exists to prevent), keep its existing
+# bounds (3 distinct entries, 600 chars, one distilled line each, dedup on cause,
+# and a journal pointer attributing the newest entry to its run), and fix the
+# missing piece, which was epistemic status. The block used to read as an
+# established finding. It now says what it is: an unverified report from a run
+# that FAILED, to be checked rather than believed. The prefix is unchanged so the
+# existing wiring tests keep matching on it.
+_HEADER = ("Prior attempts on this card (distilled, UNVERIFIED: these are "
+           "reports from earlier runs that FAILED, not findings, so verify each "
+           "against the code before acting on it):")
 
 
 # Longest a distilled cause may be. Well under the block ceiling so three of them

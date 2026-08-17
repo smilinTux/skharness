@@ -10,6 +10,7 @@ import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from . import health
 from .types import RepoSpec
 
 _POLL_INTERVAL = 5  # seconds between gh polls; patched to a no-op sleep in tests
@@ -148,29 +149,93 @@ def _changed_lines(diff: str) -> dict[str, set[int]]:
     return changed
 
 
+def _unusable(reason: str, **detail) -> None:
+    """Record WHY the coverage arm produced no signal.
+
+    S21: a returned None used to be indistinguishable from every other None, and
+    a fabricated ratio was indistinguishable from a measured one. This is the
+    observation that separates "coverage measured and met" from "the instrument
+    never ran", and it is the point of the card, not decoration.
+    """
+    health.record("coverage_unusable", reason=reason, **detail)
+
+
 def diff_coverage(repo: RepoSpec, worktree: str, diff: str) -> float | None:
-    """Changed-lines coverage ratio, or None when the repo has no coverage_cmd.
+    """Changed-lines coverage ratio, or None when there is no usable measurement.
 
     Runs coverage_cmd in the worktree (emitting a Cobertura coverage.xml), then
     scores only the lines the diff added. Computed outside the harness.
+
+    S21 (card 53b8c8be): this function must return a MEASUREMENT, never a CLAIM.
+    `_stage_work` deliberately resets `coverage.xml` out of the staged index so
+    CI byproducts do not pollute the diff, and the grader reads `git diff
+    --cached`, so a `coverage.xml` written by the worker is structurally
+    invisible to the LLM arm of the twin gate. That exclusion is CORRECT (it is
+    what lets a legitimate TDD change, whose new test files are untracked, be
+    gradeable at all), so the fix is here rather than there: this arm makes a
+    planted file impossible to read as a measurement.
+
+    Four checks, in order, each returning None (the "no coverage signal"
+    contract, which the twin gate already treats conservatively: no hands-off
+    merge, the item surfaces as a review PR):
+
+      1. any pre-existing coverage.xml is DELETED before cov_cmd runs, so a
+         planted report cannot survive into the parse;
+      2. cov_cmd's returncode is checked, so a failed coverage run and a
+         successful one are no longer indistinguishable (a hang is bounded by
+         the same ceiling local CI uses and is likewise not a pass);
+      3. the emitted file's mtime must postdate the run, so a cov_cmd that
+         restores a stale report cannot pass it off as current;
+      4. a non-test source line in the diff that the report does not mention at
+         all yields None rather than the old perfect 1.0, which is what a diff
+         adding its own `omit` rule produced.
     """
     if not repo.coverage_cmd:
         return None
-    cov_cmd = _scoped_cmd(repo.coverage_cmd, repo, worktree, diff)
-    subprocess.run(cov_cmd, shell=True, cwd=worktree,
-                   capture_output=True, text=True)
-    changed = _changed_lines(diff)
     cov_path = Path(worktree) / "coverage.xml"
+    # (1) The planted-file defence. Anything already on disk was not produced by
+    # THIS run, so it can only mislead. Delete it before measuring.
+    try:
+        cov_path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:               # cannot guarantee freshness -> no signal
+        _unusable("stale_report_not_removable", error=str(exc)[:120])
+        return None
+    started = time.time()
+    cov_cmd = _scoped_cmd(repo.coverage_cmd, repo, worktree, diff)
+    try:
+        proc = subprocess.run(cov_cmd, shell=True, cwd=worktree,
+                              capture_output=True, text=True,
+                              timeout=_LOCAL_CI_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        _unusable("command_timeout", repo=repo.name)
+        return None
+    # (2) An unrun or failed coverage command is not a measurement.
+    if proc.returncode != 0:
+        _unusable("command_failed", repo=repo.name, returncode=proc.returncode)
+        return None
+    changed = _changed_lines(diff)
     if not cov_path.exists():
-        # coverage_cmd ran but emitted no coverage.xml (missing pytest-cov, a
-        # wrong --cov target, or the test command itself errored). Degrade to the
-        # "no coverage signal" contract (None) instead of crashing the whole run;
-        # the twin gate already treats None conservatively (no hands-off merge),
-        # so the item surfaces as a review PR rather than killing the pass.
+        # coverage_cmd exited 0 but emitted no coverage.xml (a missing
+        # --cov-report=xml, a wrong --cov target). Exit 0 alone is not evidence.
+        _unusable("no_report_emitted", repo=repo.name)
+        return None
+    # (3) A report older than the run is a leftover, not this diff's measurement.
+    # The one-second slack absorbs coarse filesystem mtime granularity; the
+    # unlink above is what actually carries this check, so the slack cannot open
+    # a hole a planted file could fit through.
+    try:
+        if cov_path.stat().st_mtime < started - 1.0:
+            _unusable("stale_report", repo=repo.name)
+            return None
+    except OSError:
+        _unusable("report_unreadable", repo=repo.name)
         return None
     try:
         root = ET.parse(str(cov_path)).getroot()
     except ET.ParseError:
+        _unusable("report_malformed", repo=repo.name)
         return None
     covered = missed = 0
     for cls in root.iter("class"):
@@ -185,4 +250,21 @@ def diff_coverage(repo: RepoSpec, worktree: str, diff: str) -> float | None:
                 else:
                     missed += 1
     total = covered + missed
-    return 1.0 if total == 0 else covered / total
+    if total == 0:
+        # (4) Nothing of this diff appears in the report. Two very different
+        # causes used to collapse into the same perfect 1.0:
+        #   * the diff has no measurable source line at all (docs, config, a new
+        #     test file): honestly unmeasurable, and 1.0 is the right answer, or
+        #     every documentation card would fail the gate;
+        #   * the diff DOES change non-test source, and the instrument still did
+        #     not see it. That is what an `omit` rule added by the diff itself
+        #     produces, and reporting 1.0 for it is the strongest gaming path in
+        #     the whole gate. Refuse to certify: None routes to human review.
+        src = [p for p, lines in changed.items()
+               if lines and p.endswith(".py") and not _is_test_file(p)]
+        if src:
+            _unusable("changed_source_absent_from_report", repo=repo.name,
+                      files=sorted(src)[:10])
+            return None
+        return 1.0
+    return covered / total

@@ -117,10 +117,26 @@ def _cov_repo(tmp, cmd="pytest --cov --cov-report=xml", **kw):
                     ci="none", coverage_cmd=cmd, **kw)
 
 
+def _emitting_run(mocker, tmp_path, body=None, returncode=0):
+    """Patch subprocess.run so the mocked coverage command behaves like a REAL
+    one: it EMITS coverage.xml as a side effect.
+
+    S21: writing the file in the test body and mocking the command to do nothing
+    is precisely the shape of the gaming path this card closed (a report on disk
+    that the coverage command did not produce). `diff_coverage` now deletes any
+    pre-existing report before running, so a fixture that plants one is no longer
+    a test of the measurement path at all.
+    """
+    def _side(*a, **kw):
+        if body is not None:
+            (tmp_path / "coverage.xml").write_text(body, encoding="utf-8")
+        return subprocess.CompletedProcess(args=a[0] if a else [],
+                                           returncode=returncode)
+    return mocker.patch("skharness.autocode.ci.subprocess.run", side_effect=_side)
+
+
 def test_diff_coverage_ratio_over_changed_lines_only(mocker, tmp_path):
-    (tmp_path / "coverage.xml").write_text(_COBERTURA, encoding="utf-8")
-    run = mocker.patch("skharness.autocode.ci.subprocess.run",
-                       return_value=subprocess.CompletedProcess(args=[], returncode=0))
+    run = _emitting_run(mocker, tmp_path, _COBERTURA)
     repo = _cov_repo(tmp_path, min_diff_coverage=0.8)
     # changed lines 10,11,12 -> covered {10,12}, missed {11}; line 99 not in the diff
     ratio = ci.diff_coverage(repo, str(tmp_path), _DIFF)
@@ -148,9 +164,8 @@ def test_diff_coverage_none_when_coverage_xml_missing(mocker, tmp_path):
 
 
 def test_diff_coverage_none_when_coverage_xml_malformed(mocker, tmp_path):
-    (tmp_path / "coverage.xml").write_text("<not-valid-xml", encoding="utf-8")
-    mocker.patch("skharness.autocode.ci.subprocess.run",
-                 return_value=subprocess.CompletedProcess(args=[], returncode=0))
+    # The coverage command really emits a report; the report is unparseable.
+    _emitting_run(mocker, tmp_path, "<not-valid-xml")
     repo = _cov_repo(tmp_path)
     assert ci.diff_coverage(repo, str(tmp_path), _DIFF) is None
 
@@ -251,9 +266,7 @@ def test_local_full_scope_is_unchanged_default(mocker, tmp_path):
 
 def test_diff_coverage_scopes_cmd_to_changed_targets(mocker, tmp_path):
     _scope_tree(tmp_path)
-    (tmp_path / "coverage.xml").write_text(_COBERTURA, encoding="utf-8")
-    run = mocker.patch("skharness.autocode.ci.subprocess.run",
-                       return_value=subprocess.CompletedProcess(args=[], returncode=0))
+    run = _emitting_run(mocker, tmp_path, _COBERTURA)
     repo = RepoSpec(name="skchat", path=str(tmp_path), base_branch="main",
                     integration_branch="develop", test_cmd="pytest",
                     ci="none", coverage_cmd="pytest --cov --cov-report=xml",

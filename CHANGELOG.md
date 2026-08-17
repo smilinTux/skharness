@@ -9,6 +9,46 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ## [Unreleased]
 
+### Fixed
+- **S21: the coverage arm reported a CLAIM, not a measurement, and a planted
+  `coverage.xml` passed the twin gate.** `_stage_work` deliberately resets
+  `coverage.xml` out of the staged index so CI byproducts never pollute the
+  diff, and `_diff` reads `git diff --cached`, so the diff the LLM grader sees
+  is structurally incapable of containing a `coverage.xml`. `diff_coverage`
+  separately parsed whatever `coverage.xml` was on disk, with no returncode
+  check on `cov_cmd`. A worker could therefore write a fabricated report and
+  satisfy the coverage arm while the grader could not observe the reason. The
+  exclusion is correct and is unchanged (staging untracked files is what makes a
+  legitimate TDD change gradeable at all), so the repair is in `diff_coverage`:
+  any pre-existing report is deleted before `cov_cmd` runs, the returncode is
+  checked (and a hang is bounded by the local-CI ceiling), the emitted report's
+  mtime must postdate the run, and a diff whose non-test source lines are absent
+  from the report yields `None` instead of the old perfect `1.0` that an `omit`
+  rule produced. Every refusal now records a `coverage_unusable` health event
+  naming the reason, which is the observation that separates "coverage measured
+  and met" from "the instrument never ran". Negative control, in
+  `tests/test_autocode_coverage_integrity.py`: a planted `coverage.xml` claiming
+  100 percent, with a score-5 grade, a `COMPLETE` promise and green CI, is
+  driven through `EngineeringExecutor.run` and must NOT pass.
+- **S21: the coverage instrument's own configuration is now on the protected
+  floor.** `.coveragerc`, `pyproject.toml`, `pytest.ini`, `setup.cfg`,
+  `tox.ini` and `conftest.py` decide what `--cov` measures, so a diff adding an
+  `omit` rule blinds the arm that grades it without touching CI. That is the
+  rubric hazard one level down, and the floor is hard-coded for the same reason
+  the rubric is. Accepted cost, recorded rather than discovered later:
+  `pyproject.toml` and `conftest.py` change for unrelated reasons, so under
+  auto-merge these globs will route ordinary work to human review. The floor
+  never blocks work, it only refuses to merge it unattended, and auto-merge is
+  off fleet-wide today.
+- **S21: cross-attempt failure memory now declares itself unverified.**
+  `why_failed` is model-derived text distilled from one failed run's grader
+  notes and fed into the next run's round one, which is the mechanism the
+  2026-08-16 red-team accepted as decisive against the exploration slice (card
+  f81d8d2d). The channel is kept and its existing bounds are unchanged (3
+  distinct entries, 600 chars, one distilled line each, dedup, journal pointer);
+  what was missing was epistemic status, so the block now says it carries
+  reports from runs that FAILED, to be checked rather than believed.
+
 ### Added
 - **Graded dispatch: a card's grade now selects the model.** `model_class` and
   `sensitivity` map onto a skgateway bucket id (`sk-<class>-<sensitivity>`),

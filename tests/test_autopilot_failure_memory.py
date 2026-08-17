@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from skharness.autocode.failure_memory import build_prior_feedback, distill_failure
 
-HEADER = "Prior attempts on this card (distilled):"
+from skharness.autocode.failure_memory import _HEADER as HEADER
 
 
 def _payload(attempts, **extra):
@@ -177,3 +177,33 @@ def test_distill_does_not_carry_a_traceback_block():
     out = distill_failure(notes)
     assert "tests/test_m.py::test_f" in out
     assert 'File "mod.py"' not in out
+
+
+# -- S21 vector 2: the cross-attempt channel carries CLAIMS, not findings ------
+
+def test_the_header_attributes_the_prior_as_an_unverified_report():
+    """S21 (card 53b8c8be): `why_failed` is model-derived text distilled from one
+    run's grader notes, and it is fed into the NEXT run's round one. The same
+    mechanism was accepted as decisive against the exploration slice (card
+    f81d8d2d): a weak model's misdiagnosis becomes the next worker's premise.
+
+    The channel is already BOUNDED (3 distinct entries, 600 chars, one distilled
+    line each, dedup) and the entries are already attributed to a run via the
+    journal pointer. What was missing was epistemic status: the block read as
+    established fact. It must announce itself as an unverified prior.
+    """
+    out = build_prior_feedback(_payload([_attempt(why_failed="a cause")]))
+    assert "Prior attempts on this card" in out          # unchanged prefix
+    assert "UNVERIFIED" in out
+    first = out.splitlines()[0]
+    assert "verify" in first.lower() or "check" in first.lower()
+
+
+def test_the_attributed_header_still_fits_inside_the_char_ceiling():
+    """Positive control: the longer header must not blow the 600-char bound, and
+    the newest failure must still survive the oldest-first drop."""
+    out = build_prior_feedback(_payload([
+        _attempt(run_id=f"r{i}", ts=f"2026-08-14T0{i}:00:00+00:00",
+                 why_failed=f"cause {i} " + "x" * 260) for i in range(1, 4)]))
+    assert len(out) <= 600
+    assert "cause 3" in out

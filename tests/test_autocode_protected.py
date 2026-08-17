@@ -146,3 +146,34 @@ def test_ordinary_autocode_files_are_still_editable(tmp_path):
     m = load_manifest(tmp_path)
     assert is_protected(["src/skharness/autocode/orchestrator.py"], m) is False
     assert is_protected(["src/skharness/autocode/adapters/pi.py"], m) is False
+
+
+# -- S21: the coverage instrument's own configuration -------------------------
+
+def test_coverage_configuration_is_on_the_floor(tmp_path):
+    """S21 (card 53b8c8be): the twin gate's third arm measures the diff with
+    `pytest --cov`. The files below decide WHAT gets measured, so a diff that
+    adds an `omit` rule blinds the instrument that grades it without touching
+    CI. That is the same self-modification hazard as rewriting the rubric, so
+    the coverage configuration sits on the hard-coded floor rather than on a
+    manifest entry nobody would remember to add.
+    """
+    from skharness.autocode.protected import changed_paths_are_protected
+    for path in (".coveragerc",
+                 "pyproject.toml",
+                 "pytest.ini",
+                 "setup.cfg",
+                 "tox.ini",
+                 "conftest.py",
+                 "tests/conftest.py",
+                 "src/pkg/conftest.py"):
+        assert changed_paths_are_protected(tmp_path, [path]) is True, path
+
+
+def test_the_coverage_config_floor_does_not_swallow_ordinary_work(tmp_path):
+    """Negative control for the entry above: the globs must not match every
+    ordinary file, or the carve-out signal is worthless."""
+    from skharness.autocode.protected import changed_paths_are_protected
+    for path in ("src/pkg/module.py", "tests/test_module.py", "README.md",
+                 "docs/design.md", "src/pkg/config.toml"):
+        assert changed_paths_are_protected(tmp_path, [path]) is False, path
