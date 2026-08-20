@@ -17,7 +17,7 @@ import signal
 import subprocess
 import tempfile
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
@@ -85,12 +85,9 @@ class SandboxProcessSupervisor:
                     source.write_text(content, encoding="utf-8")
                     config_mounts.append(AuthMount(str(source), destination, ro=True))
             self._run_checked([self.sandbox.docker, "network", "create", "--internal", network])
-            self._run_checked([
-                self.sandbox.docker, "run", "-d", "--name", proxy_name,
-                "--network", network, "--network-alias", proxy_alias,
-                "sandbox-proxy:1", "python", "-m", "skharness.autocode.sandbox_proxy",
-                "8080", *allow,
-            ])
+            self._run_checked(self.sandbox._proxy_run_argv(
+                name=proxy_name, network=network, alias=proxy_alias, allow=allow
+            ))
             self._run_checked([
                 self.sandbox.docker, "network", "connect", "bridge", proxy_name
             ])
@@ -202,6 +199,12 @@ class PiExperimentRunner:
         admission = self.controller.admit(request, attempt_number=attempt)
         if not admission.admitted or admission.duplicate:
             return admission
+        resources = request.resources
+        spec = replace(
+            spec,
+            cpu_limit=resources.cpu if resources.cpu > 0 else None,
+            memory_gb_limit=resources.ram_gb if resources.ram_gb > 0 else None,
+        )
         directory = self._attempt_dir(request.experiment_id, attempt)
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "run.json").write_text(json.dumps({

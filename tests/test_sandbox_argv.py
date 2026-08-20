@@ -32,6 +32,20 @@ def test_no_secret_paths_mounted():
         assert secret not in j
 
 
+def test_egress_proxy_is_also_resource_bounded_and_unprivileged():
+    argv = Sandbox()._proxy_run_argv(
+        name="proxy", network="internal", alias="gateway", allow=["example.test"]
+    )
+    joined = " ".join(argv)
+    assert "--read-only" in argv
+    assert "--cap-drop ALL" in joined
+    assert "--security-opt no-new-privileges" in joined
+    assert "--user 65534:65534" in joined
+    assert "--pids-limit 64" in joined
+    assert "--memory 128m --memory-swap 128m" in joined
+    assert argv[-1] == "example.test"
+
+
 def test_container_name_is_inserted_without_disturbing_the_tail():
     argv = Sandbox()._docker_run_argv(_spec(), "n", "p", container_name="sbxrun-x")
     assert "--name" in argv
@@ -48,6 +62,15 @@ def test_no_container_name_omits_the_flag():
 def test_stdin_spec_adds_interactive_flag():
     argv = Sandbox()._docker_run_argv(_spec(stdin="hi"), network="n", proxy_alias="p")
     assert "-i" in argv
+
+
+def test_resource_limits_are_enforced_by_docker_cgroups():
+    argv = Sandbox()._docker_run_argv(
+        _spec(cpu_limit=1.5, memory_gb_limit=3.25), network="n", proxy_alias="p"
+    )
+    assert argv[argv.index("--cpus") + 1] == "1.5"
+    assert argv[argv.index("--memory") + 1] == "3.25g"
+    assert argv[argv.index("--memory-swap") + 1] == "3.25g"
 
 
 def test_no_stdin_spec_omits_interactive_flag():

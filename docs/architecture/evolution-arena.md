@@ -256,14 +256,21 @@ unbounded kitchen-sink image:
 
 ### `skharness-pi-core`
 
-- Debian bookworm base pinned by digest; non-root UID/GID contract;
-- Pi npm package pinned exactly with lockfile/integrity;
-- git, ca-certificates, curl, `jq`, `rg`, `fd`, build essentials, and process tools;
+- Debian trixie slim base pinned by index digest (with the amd64 manifest recorded);
+  non-root UID/GID contract;
+- Pi npm package and its complete transitive graph pinned with lockfile/integrity;
+- git, ca-certificates, curl, `jq`, `rg`, `fd`, and process tools;
 - Python 3 plus a locked virtual environment containing SKHarness client/bridge code,
-  SKCapstone/SKCoord client, SKMemory client, pytest, coverage, and schema tooling;
+  SKCapstone/SKCoord client, SKMemory client, and schema tooling;
 - generated Pi config mount points; pinned SK Pi extension and skill bundle;
 - OCI labels, SBOM, provenance, signature, and vulnerability report;
 - no secrets, agent home, model weights, Docker socket, or mutable global cache.
+
+Native build dependencies, pip/setuptools, npm itself, and test-only Python tooling
+exist only in builder/test stages. They are deliberately absent from `pi-core`; image
+qualification runs the repository's tests outside the published runtime and scans the
+final target. This reduces the attack surface without changing the fail-closed rule:
+any Critical or High Grype match still blocks qualification.
 
 ### `skharness-pi-polyglot`
 

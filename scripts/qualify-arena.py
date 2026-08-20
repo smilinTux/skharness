@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import platform
 import subprocess
 import tempfile
+import threading
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib import request
+from urllib import parse, request
 
 
 def digest(path: Path) -> str:
@@ -45,6 +48,200 @@ def http_json(url: str, api_key: str, *, payload: dict | None = None,
         }
 
 
+_HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate",
+               "proxy-authorization", "te", "trailers", "transfer-encoding",
+               "upgrade"}
+_ATTRIBUTION_HEADERS = ("x-sk-req-id", "x-request-id", "x-sk-backend",
+                        "x-sk-model-served")
+
+
+class PiGatewayRelay:
+    """Loopback-only, transparent observer for Pi's gateway execution."""
+
+    def __init__(self, upstream: str):
+        parsed = parse.urlsplit(upstream.rstrip("/"))
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("live gateway must be an absolute HTTP(S) URL")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("live gateway URL must not contain credentials, query, or fragment")
+        self._upstream = parsed
+        self.captures: list[dict] = []
+        self._lock = threading.Lock()
+        relay = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *_args):
+                pass
+
+            def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
+                length = self.headers.get("content-length")
+                if length is None:
+                    self.send_error(411, "content-length required")
+                    return
+                body = self.rfile.read(int(length))
+                headers = {key: value for key, value in self.headers.items()
+                           if key.lower() not in _HOP_BY_HOP | {"host", "content-length"}}
+                path = relay._upstream.path.rstrip("/") + self.path
+                connection_type = (http.client.HTTPSConnection
+                                   if relay._upstream.scheme == "https"
+                                   else http.client.HTTPConnection)
+                connection = connection_type(relay._upstream.hostname,
+                                             relay._upstream.port, timeout=20)
+                captured = bytearray()
+                try:
+                    connection.request("POST", path, body=body, headers=headers)
+                    upstream_response = connection.getresponse()
+                    response_headers = {key.lower(): value
+                                        for key, value in upstream_response.getheaders()}
+                    self.send_response(upstream_response.status)
+                    for key, value in upstream_response.getheaders():
+                        if key.lower() not in _HOP_BY_HOP | {"content-length"}:
+                            self.send_header(key, value)
+                    self.send_header("connection", "close")
+                    self.end_headers()
+                    while True:
+                        chunk = upstream_response.read1(16 * 1024)
+                        if not chunk:
+                            break
+                        captured.extend(chunk)
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    with relay._lock:
+                        relay.captures.append({"method": "POST", "path": self.path,
+                                               "status": upstream_response.status,
+                                               "headers": {name: response_headers.get(name)
+                                                           for name in _ATTRIBUTION_HEADERS},
+                                               "body": bytes(captured)})
+                finally:
+                    connection.close()
+                    self.close_connection = True
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    @property
+    def api_base(self) -> str:
+        return f"http://127.0.0.1:{self._server.server_port}/v1"
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc):
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join()
+
+
+def relay_response_model(capture: dict) -> str | None:
+    """Extract model metadata from JSON or OpenAI-compatible SSE without guessing."""
+    raw = capture["body"].decode("utf-8", errors="replace")
+    candidates = [raw]
+    candidates.extend(line[5:].strip() for line in raw.splitlines()
+                      if line.startswith("data:") and line[5:].strip() != "[DONE]")
+    for candidate in reversed(candidates):
+        try:
+            body = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(body, dict) and isinstance(body.get("model"), str):
+            return body["model"]
+    return None
+
+
+def immutable_execution_records(args: argparse.Namespace, evidence: dict) -> list[dict]:
+    """Materialize the two real executions without upgrading their trust state.
+
+    The direct OpenAI-compatible probe and the Pi invocation are separate gateway
+    executions.  Qualification preserves each as a frozen Experiment/Result pair;
+    independent verification remains a later gate and therefore these Results are
+    deliberately UNVERIFIED here.
+    """
+    from skharness.arena.models import (
+        ArtifactRef,
+        BudgetSpec,
+        Experiment,
+        Measurement,
+        Observation,
+        Result,
+    )
+
+    created_at = datetime.now(timezone.utc)
+    challenge_hash = "sha256:" + hashlib.sha256(args.prompt.encode()).hexdigest()
+    direct_body = evidence["completion_body"]
+    direct_output = ""
+    if isinstance(direct_body, dict):
+        choices = direct_body.get("choices", [])
+        if choices and isinstance(choices[0], dict):
+            direct_output = choices[0].get("message", {}).get("content", "")
+    executions = (
+        ("direct", direct_output, evidence["completion_model"],
+         evidence["attribution"].get("x-sk-req-id")
+         or evidence["attribution"].get("x-request-id"), evidence["attribution"]),
+        ("pi", evidence["pi"]["output"],
+         evidence["pi"]["responseModel"] or evidence["pi"]["served_model"],
+         evidence["pi"]["attribution"].get("x-sk-req-id")
+         or evidence["pi"]["attribution"].get("x-request-id"),
+         evidence["pi"]["attribution"]),
+    )
+    records = []
+    for kind, output, served_model, request_id, execution_attribution in executions:
+        raw = str(output).encode()
+        artifact = ArtifactRef(
+            digest="sha256:" + hashlib.sha256(raw).hexdigest(),
+            media_type="text/plain",
+            size=len(raw),
+            role="assistant-output",
+        )
+        experiment = Experiment(
+            id=f"{args.session_id}:{kind}",
+            challenge_hash=challenge_hash,
+            actor="service:arena-qualification",
+            harness=kind,
+            card_id=args.card_id,
+            run_id=f"{args.session_id}:{kind}",
+            repository_base_sha="qualification-worktree-unresolved",
+            image_digest=args.image if kind == "pi" else "gateway-managed",
+            sbom_digest="not-observed",
+            requested_route="skgateway/openai-compatible",
+            requested_model=args.gateway_model,
+            served_model=served_model,
+            gateway_request_id=request_id,
+            gateway_backend_id=execution_attribution.get("x-sk-backend"),
+            configuration={
+                "prompt_sha256": challenge_hash,
+                "live": True,
+                "gateway_header_served_model": execution_attribution.get(
+                    "x-sk-model-served"
+                ),
+            },
+            budgets=BudgetSpec(wall_seconds=20),
+            created_at=created_at,
+            artifacts=(artifact,),
+        )
+        observation = Observation(value=float(bool(output)), recorded_at=created_at)
+        result = Result(
+            experiment_id=experiment.id,
+            experiment_hash=experiment.content_hash,
+            challenge_hash=challenge_hash,
+            measurements=(Measurement(
+                metric="nonempty_output", unit="boolean", observations=(observation,),
+                mean=observation.value, standard_deviation=0,
+            ),),
+            artifacts=(artifact,),
+            created_at=created_at,
+        )
+        records.append({
+            "experiment": experiment.model_dump(mode="json"),
+            "experiment_hash": experiment.content_hash,
+            "result": result.model_dump(mode="json"),
+            "result_hash": result.content_hash,
+        })
+    return records
+
+
 def live_qualification(args: argparse.Namespace) -> dict:
     api_key = os.environ.get(args.gateway_api_key_env)
     if not api_key:
@@ -67,17 +264,18 @@ def live_qualification(args: argparse.Namespace) -> dict:
         for name in ("x-sk-req-id", "x-request-id", "x-sk-backend", "x-sk-model-served")
     }
     config = {"providers": {"skgw": {
-        "baseUrl": api_base, "api": "openai-completions", "apiKey": "not-recorded",
+        "baseUrl": "ephemeral-loopback-relay", "api": "openai-completions", "apiKey": "not-recorded",
         "headers": attribution, "compat": {"supportsDeveloperRole": False},
         "models": [{"id": args.gateway_model,
                     "limit": {"context": args.context_limit, "output": args.output_limit}}],
     }}}
-    with tempfile.TemporaryDirectory(prefix="skharness-arena-") as temp:
+    with PiGatewayRelay(root) as relay, tempfile.TemporaryDirectory(prefix="skharness-arena-") as temp:
         # tempfile directories are 0700 by default, but the worker runs as UID
         # 10001 and must be able to traverse the read-only bind mount.
         Path(temp).chmod(0o755)
         config_path = Path(temp) / "models.json"
         runtime_config = json.loads(json.dumps(config))
+        runtime_config["providers"]["skgw"]["baseUrl"] = relay.api_base
         runtime_config["providers"]["skgw"]["apiKey"] = api_key
         config_path.write_text(json.dumps(runtime_config))
         config_path.chmod(0o444)
@@ -94,6 +292,11 @@ def live_qualification(args: argparse.Namespace) -> dict:
         # Pi's JSON stream may exceed the evidence truncation limit. Parse the
         # complete stream, then retain only the structured terminal evidence.
         pi = command(docker_argv, truncate=False)
+    pi_captures = [capture for capture in relay.captures
+                   if capture["path"].split("?", 1)[0] == "/v1/chat/completions"]
+    if len(pi_captures) != 1:
+        raise RuntimeError(f"expected exactly one observed Pi completion, got {len(pi_captures)}")
+    pi_capture = pi_captures[0]
     events = []
     for line in pi["stdout"].splitlines():
         try:
@@ -110,6 +313,9 @@ def live_qualification(args: argparse.Namespace) -> dict:
     if response_model is None:
         response_model = next((event.get("responseModel") for event in reversed(events)
                                if event.get("responseModel")), None)
+    pi_attribution = pi_capture["headers"]
+    pi_served_model = (pi_attribution.get("x-sk-model-served")
+                       or relay_response_model(pi_capture))
     return {
         "gateway": gateway,
         "health": health,
@@ -118,11 +324,18 @@ def live_qualification(args: argparse.Namespace) -> dict:
         "pi_request_headers": attribution,
         "attribution": observed_headers,
         "attribution_source": "direct_openai_compatible_probe",
+        "pi_relay": {"transport": "ephemeral_loopback_http_forwarder",
+                     "upstream": gateway, "captured_requests": 1,
+                     "preserves_streaming": True},
         "completion_status": completion["status"],
+        "completion_body": completion["body"],
         "completion_model": completion["body"].get("model")
         if isinstance(completion["body"], dict) else None,
         "pi": {"exit_code": pi["exit_code"], "stderr": pi["stderr"],
-               "responseModel": response_model, "output": output},
+               "responseModel": response_model, "served_model": pi_served_model,
+               "attribution": pi_attribution,
+               "attribution_source": "ephemeral_loopback_relay_observation",
+               "completion_status": pi_capture["status"], "output": output},
     }
 
 
@@ -156,7 +369,11 @@ def main() -> int:
                  "tests/test_arena_scheduler.py", "-q"]),
         command(["docker", "image", "inspect", args.image, "--format", "{{json .}}"]),
         command(["docker", "run", "--rm", args.image, "pi", "--version"]),
-        command(["docker", "run", "--rm", args.image, "pip", "freeze"]),
+        command([
+            "docker", "run", "--rm", args.image, "python", "-c",
+            "import importlib.metadata as m,json; "
+            "print(json.dumps(sorted((d.metadata['Name'],d.version) for d in m.distributions())))",
+        ]),
         command(["docker", "run", "--rm", args.image, "dpkg-query", "-W"]),
     ]
     bundle = {
@@ -172,17 +389,23 @@ def main() -> int:
         try:
             bundle["live_gateway"] = live_qualification(args)
             live = bundle["live_gateway"]
+            live["records"] = immutable_execution_records(args, live)
             bundle["claims"]["live_gateway"] = (
                 live["health"]["status"] == 200
                 and live["models"]["status"] == 200
                 and live["completion_status"] == 200
                 and live["pi"]["exit_code"] == 0
                 and bool(live["pi"]["responseModel"])
+                and live["pi"]["completion_status"] == 200
+                and bool(live["pi"]["served_model"])
                 and bool(live["pi"]["output"])
                 and bool(live["attribution"]["x-sk-backend"])
                 and bool(live["attribution"]["x-sk-model-served"])
                 and bool(live["attribution"]["x-sk-req-id"]
                          or live["attribution"]["x-request-id"])
+                and bool(live["pi"]["attribution"]["x-sk-backend"])
+                and bool(live["pi"]["attribution"]["x-sk-req-id"]
+                         or live["pi"]["attribution"]["x-request-id"])
             )
         except Exception as exc:  # record a failed optional qualification truthfully
             bundle["live_gateway"] = {"error": f"{type(exc).__name__}: {exc}"}

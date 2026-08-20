@@ -61,12 +61,35 @@ def test_image_manifest_pins_base_pi_and_two_targets():
     root = Path(__file__).parents[1]
     dockerfile = (root / "docker/sandbox/pi/Dockerfile").read_text()
     lock = json.loads((root / "docker/sandbox/pi/dependencies.lock.json").read_text())
-    assert f"node:24-bookworm@{lock['base_image']['index_digest']}" in dockerfile
+    assert f"{lock['base_image']['reference']}@{lock['base_image']['index_digest']}" in dockerfile
     assert f"ARG PI_VERSION={lock['npm']['version']}" in dockerfile
     assert "AS pi-core" in dockerfile and "AS pi-polyglot" in dockerfile
     assert "USER 10001:10001" in dockerfile
-    assert "@${PI_VERSION}" in dockerfile
+    assert "package-lock.json" in dockerfile
+    assert '].version\")" = "${PI_VERSION}"' in dockerfile
     assert lock["npm"]["integrity"].startswith("sha512-")
+
+
+def test_core_image_keeps_build_and_package_managers_out_of_runtime():
+    root = Path(__file__).parents[1]
+    dockerfile = (root / "docker/sandbox/pi/Dockerfile").read_text()
+    package_lock = json.loads(
+        (root / "docker/sandbox/pi/package-lock.json").read_text())
+    runtime = dockerfile.split("FROM ${NODE_IMAGE} AS pi-base", 1)[1].split(
+        "FROM pi-base AS pi-core", 1)[0]
+
+    assert "COPY --from=pi-node-builder" in runtime
+    assert "COPY --from=pi-python-builder" in runtime
+    assert "build-essential" not in runtime
+    assert "python3-pip" not in runtime
+    assert "test-requirements.lock" not in runtime
+    assert "/usr/local/lib/node_modules/npm" in runtime
+    pi_package = package_lock["packages"][
+        "node_modules/@earendil-works/pi-coding-agent"]
+    assert pi_package["version"] == "0.84.2"
+    assert pi_package["integrity"] == json.loads(
+        (root / "docker/sandbox/pi/dependencies.lock.json").read_text()
+    )["npm"]["integrity"]
 
 
 def test_no_profile_preserves_existing_adapter_contract():

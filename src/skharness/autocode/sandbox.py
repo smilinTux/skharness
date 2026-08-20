@@ -41,6 +41,8 @@ class LaunchSpec:
     egress_hosts: list[str] = field(default_factory=list)
     config_files: dict[str, str] = field(default_factory=dict)
     stdin: str | None = None
+    cpu_limit: float | None = None
+    memory_gb_limit: float | None = None
 
 
 class Sandbox:
@@ -75,6 +77,16 @@ class Sandbox:
             "--env", f"HTTPS_PROXY=http://{proxy_alias}:{PROXY_PORT}",
             "--env", f"HTTP_PROXY=http://{proxy_alias}:{PROXY_PORT}",
         ]
+        if spec.cpu_limit is not None:
+            if spec.cpu_limit <= 0:
+                raise ValueError("cpu_limit must be positive when set")
+            argv += ["--cpus", f"{spec.cpu_limit:g}"]
+        if spec.memory_gb_limit is not None:
+            if spec.memory_gb_limit <= 0:
+                raise ValueError("memory_gb_limit must be positive when set")
+            memory = f"{spec.memory_gb_limit:g}g"
+            # Equal memory/swap values prohibit additional swap consumption.
+            argv += ["--memory", memory, "--memory-swap", memory]
         # Each auth mount's parent dir is auto-created by docker as a root-owned,
         # non-writable dir; the harness (e.g. claude) needs to write siblings there
         # (session-env, cache). Mount a writable tmpfs at each such parent first so
@@ -92,6 +104,21 @@ class Sandbox:
             argv += ["--env", f"{k}={v}"]
         argv += [spec.image, *spec.argv]
         return argv
+
+    def _proxy_run_argv(
+        self, *, name: str, network: str, alias: str, allow: list[str]
+    ) -> list[str]:
+        """Build the equally confined egress-proxy sidecar command."""
+        return [
+            self.docker, "run", "-d", "--name", name,
+            "--network", network, "--network-alias", alias,
+            "--user", "65534:65534", "--read-only", "--tmpfs", "/tmp:mode=1777",
+            "--security-opt", "no-new-privileges", "--cap-drop", "ALL",
+            "--pids-limit", "64", "--cpus", "0.5",
+            "--memory", "128m", "--memory-swap", "128m",
+            "sandbox-proxy:1", "python", "-m", "skharness.autocode.sandbox_proxy",
+            str(PROXY_PORT), *allow,
+        ]
 
     def _ensure_capable(self, spec: LaunchSpec) -> None:
         if not shutil.which(self.docker):
@@ -129,9 +156,9 @@ class Sandbox:
             # proxy sidecar: dual-homed (internal net + default bridge) so it is the
             # ONLY route out; started with the pinned allowlist; reached by alias.
             subprocess.run(
-                [self.docker, "run", "-d", "--name", proxy_name, "--network", net,
-                 "--network-alias", proxy_alias, "sandbox-proxy:1",
-                 "python", "-m", "skharness.autocode.sandbox_proxy", str(PROXY_PORT), *allow],
+                self._proxy_run_argv(
+                    name=proxy_name, network=net, alias=proxy_alias, allow=allow
+                ),
                 capture_output=True, text=True, check=True)
             subprocess.run([self.docker, "network", "connect", "bridge", proxy_name],
                            capture_output=True, text=True)          # give proxy outward egress

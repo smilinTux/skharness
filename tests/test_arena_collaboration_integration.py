@@ -10,6 +10,7 @@ from skharness.arena import (
     AccessDeniedError,
     CollaborationAccess,
     CollaborationError,
+    ExecutableRuntimeBackend,
     ExperimentCatalog,
     MetricDirection,
     MetricObjective,
@@ -258,6 +259,57 @@ def test_runtime_skmemory_adapter_captures_and_restores_prior_hash_idempotently(
     assert backend.values[proposal.target][0] == promoted.prior_content_hash
     assert [name for name, _ in backend.calls].count("memory.compare_and_set") == 1
     assert [name for name, _ in backend.calls].count("memory.restore") == 1
+
+
+def test_runtime_skmemory_adapter_canary_rollback_through_executable(tmp_path):
+    runtime = tmp_path / "skmemory-runtime"
+    state = tmp_path / "runtime-state.json"
+    state.write_text('{"current":"sha256:old","receipts":{}}')
+    runtime.write_text(
+        "#!/usr/bin/env python3\n"
+        "import hashlib,json,sys\n"
+        f"p={str(state)!r}\n"
+        "s=json.load(open(p)); op=sys.argv[1]; q=json.load(sys.stdin)\n"
+        "if op=='memory.read': r={'content_hash':s['current']}\n"
+        "elif q['idempotency_key'] in s['receipts']: r=s['receipts'][q['idempotency_key']]\n"
+        "else:\n"
+        " assert q['expected_content_hash']==s['current']\n"
+        " old=s['current']\n"
+        " new=('sha256:'+hashlib.sha256(q['content'].encode()).hexdigest() "
+        "if op=='memory.compare_and_set' else q['restore_content_hash'])\n"
+        " r={'receipt':'runtime:'+q['idempotency_key'],"
+        "'prior_content_hash':old,'content_hash':new}\n"
+        " s['current']=new; s['receipts'][q['idempotency_key']]=r\n"
+        " json.dump(s,open(p,'w'))\n"
+        "print(json.dumps(r))\n"
+    )
+    runtime.chmod(0o755)
+    journal, proposal = ready_journal(tmp_path / "journal")
+    adapter = RuntimeSKMemoryAdapter(journal, ExecutableRuntimeBackend(runtime))
+
+    promoted = adapter.promote(proposal.id, provenance("service:skmemory", "promote"))
+    # Reconstructing both objects models a controller restart; journal/backend
+    # receipts make retries immutable and prevent a second mutation.
+    restarted_journal = RefinementJournal(
+        journal.root, approvers={"operator:casey"},
+        evidence_exists={"verified", "canary", "approval", "incident"}.__contains__,
+    )
+    restarted = RuntimeSKMemoryAdapter(
+        restarted_journal, ExecutableRuntimeBackend(runtime)
+    )
+    assert restarted.promote(
+        proposal.id, provenance("service:skmemory", "promote")
+    ) == promoted
+    restarted_journal.authorize_rollback(
+        proposal.id, provenance("operator:casey", "rollback.authorize"), ("incident",)
+    )
+    rolled_back = restarted.rollback(
+        proposal.id, provenance("service:skmemory", "rollback")
+    )
+    assert rolled_back.resulting_content_hash == "sha256:old"
+    assert restarted.rollback(
+        proposal.id, provenance("service:skmemory", "rollback")
+    ) == rolled_back
 
 
 def test_refinement_journal_serializes_concurrent_proposals_and_transition_race(tmp_path):

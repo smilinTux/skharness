@@ -14,6 +14,10 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 - Made Arena qualification evidence fail closed: live SKGateway claims now require
   attributed direct and Dockerized Pi requests, and supply-chain scans retain their
   reports but exit non-zero whenever any critical or high vulnerability is present.
+- Bound Arena CPU/RAM reservations to Docker cgroups and hardened the egress proxy with
+  the same non-root, read-only, capability-free posture as workers. Rebuilt Pi core as
+  a locked multi-stage slim image, eliminating npm/Python critical and high findings
+  while retaining a failed gate for the remaining Debian findings.
 
 ### Operations
 

@@ -29,9 +29,11 @@ class ScriptedSupervisor:
         self.stderr = stderr
         self.cancelled = False
         self.calls = 0
+        self.last_spec = None
 
     def run(self, spec, attempt_dir, timeout_s):
         self.calls += 1
+        self.last_spec = spec
         (attempt_dir / "stdout.log").write_bytes(self.stdout)
         (attempt_dir / "stderr.log").write_bytes(self.stderr)
         return self.exit_code, self.classification
@@ -83,6 +85,21 @@ def test_success_runs_pi_attempt_and_persists_artifacts_before_terminal_event(tm
     assert controller.state("experiment") is ExperimentState.PROVISIONAL
     assert controller.store.get_artifact(outcome.stdout_digest) == b"trajectory"
     assert controller.scheduler.snapshot()["active_leases"] == 0
+
+
+def test_admitted_resources_become_container_cpu_and_memory_limits(tmp_path):
+    controller = _controller(tmp_path)
+    controller.propose("experiment")
+    supervisor = ScriptedSupervisor()
+    runner = PiExperimentRunner(controller, supervisor, tmp_path / "runs")
+    request = AttemptRequest(
+        "challenge", "experiment", "1", "experiment:1",
+        resources=ResourceRequest(cpu=1.5, ram_gb=3.25),
+    )
+    outcome = runner.execute(request, _spec(tmp_path))
+    assert isinstance(outcome, RunOutcome) and outcome.successful
+    assert supervisor.last_spec.cpu_limit == 1.5
+    assert supervisor.last_spec.memory_gb_limit == 3.25
 
 
 def test_timeout_and_oom_are_failed_with_durable_partial_evidence(tmp_path):

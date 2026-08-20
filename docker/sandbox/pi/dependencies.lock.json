@@ -1,9 +1,9 @@
 {
   "schema": "skharness.pi-image-lock.v1",
   "base_image": {
-    "reference": "node:24-bookworm",
-    "index_digest": "sha256:934240a162082fd8b8a2f90cd5114446443f1eba1c5378f6687167ca405e6584",
-    "linux_amd64_manifest_digest": "sha256:f6d02cf1353049cf3658e6ce9ec03c6877a6479495f122062d195e2279d01055"
+    "reference": "node:24-trixie-slim",
+    "index_digest": "sha256:0711b541c1c33a8a530ac4f0d391baa9a15b3d804695b1b24a47daa5fb60e74d",
+    "linux_amd64_manifest_digest": "sha256:f2925910482dc53394bc0034c5f4abffcd01de400794c050ca343fe0d733b486"
   },
   "npm": {
     "package": "@earendil-works/pi-coding-agent",
@@ -13,12 +13,13 @@
   "python_test_tools": {"coverage": "7.13.4", "pytest": "9.0.2"},
   "polyglot": {
     "go": "distribution package from the pinned Debian image",
-    "java": "openjdk-17-jdk-headless from the pinned Debian image",
+    "java": "openjdk-21-jdk-headless from the pinned Debian image",
     "rust": "rustc/cargo distribution packages from the pinned Debian image"
   },
   "notes": [
     "The image digest and Pi package are immutable inputs.",
-    "Debian package versions remain a reproducibility gap until an apt snapshot is pinned.",
+    "Direct Debian package versions are pinned; transitive packages remain tied to the immutable base and repository state until an apt snapshot is pinned.",
+    "package-lock.json pins and integrity-checks the complete Pi npm dependency graph.",
     "SBOM generation, signing, and registry publication are not claimed here."
   ]
 }

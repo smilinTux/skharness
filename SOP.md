@@ -178,8 +178,8 @@ placeholder like `0.1.dev1`. Every CI checkout therefore sets `fetch-depth: 0` a
 ./docker/sandbox/build.sh
 ```
 
-The Pi Dockerfile now has `pi-core` and `pi-polyglot` targets. The base image digest,
-exact Pi version, and observed npm integrity are recorded in
+The Pi Dockerfile now has `pi-core` and `pi-polyglot` targets. The slim Trixie base
+image digest, exact Pi version, and complete npm transitive integrity lock are recorded in
 `docker/sandbox/pi/dependencies.lock.json`; both targets run as UID/GID `10001`, and
 `docker/sandbox/build.sh pi` deliberately builds `pi-core` as `sandbox-pi:1`.
 
@@ -202,6 +202,11 @@ dependencies are transitively pinned with hashes in `requirements.lock` and
 `test-requirements.lock`. `scripts/qualify-arena.py` emits an explicitly unsigned local
 evidence bundle, and `scripts/pi-supply-chain.sh` requires Syft and Grype to generate a
 CycloneDX SBOM and vulnerability report (optionally signing provenance with Cosign).
+The script retains its reports but exits non-zero for any critical or high match;
+generating an SBOM is never treated as a passing vulnerability gate. The core runtime
+omits npm, pip, setuptools, compilers, and test-only dependencies after its multi-stage
+build. Package inventory evidence uses Python package metadata rather than requiring a
+runtime package installer.
 Its default remains offline. Operators may add `--live-gateway URL` and provide the
 credential only through `SKGATEWAY_API_KEY` (or the environment-variable name selected
 by `--gateway-api-key-env`) to record health/models probes, redacted generated Pi
@@ -212,13 +217,26 @@ operations for the worker bridge. Arena/scratch writes are idempotent files; an
 idempotency-key collision fails rather than overwriting evidence. Runtime launch still
 must mount this executable and scoped SK credentials/home explicitly.
 
-These are buildable locally qualified images, not published or fleet-qualified
-artifacts. The local qualification covers a frozen challenge contract, a real Pi call
-to a mock OpenAI-compatible SKGateway endpoint with attribution, false-score rejection,
-and durable/idempotent recovery primitives. It does not claim a live SKGateway call,
-SBOM/signature/vulnerability result, registry digest, or `.41` E2E. On the 2026-08-20
-read-only `.41` probe, Docker and `sandbox-pi:1` were present but `nvidia-smi` could not
-communicate with the driver, so GPU qualification is blocked rather than passed.
+These are buildable and CPU-transport-qualified images, not production-qualified
+artifacts. Live qualification now observes distinct direct and Pi SKGateway request
+IDs, backend, gateway served-model header, Pi response model, and immutable unverified
+experiment/result records. The remediated core image is 511 MB and removed all npm and
+Python critical/high findings; its 2026-08-20 scan still fails closed on 40 critical
+and 82 high Debian findings for which Grype reports no available fixes. It therefore
+does not claim a passing vulnerability scan, signature, registry digest, or GPU E2E.
+The identical prior image digest completed a CPU Pi-to-SKGateway probe on `.41`, but
+`nvidia-smi` still cannot communicate with its driver, so GPU qualification remains
+blocked rather than passed.
+
+Arena admission CPU and RAM reservations become Docker `--cpus`, `--memory`, and
+no-extra-swap cgroup limits. Both worker and egress proxy use read-only root filesystems,
+dropped capabilities, `no-new-privileges`, PID limits, and bounded resources. Run the
+real confinement proof against the Pi image with:
+
+```bash
+RUN_SANDBOX_IT=1 SANDBOX_TEST_IMAGE=sandbox-pi:1 \
+  python -m pytest -q tests/test_sandbox_confinement_it.py
+```
 
 ---
 

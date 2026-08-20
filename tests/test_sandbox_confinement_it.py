@@ -73,12 +73,13 @@ print(json.dumps(r))
 
 
 def test_sandbox_confinement(tmp_path):
-    for tag in ("sandbox-proxy:1", "sandbox-claude:1"):
+    worker_image = os.environ.get("SANDBOX_TEST_IMAGE", "sandbox-claude:1")
+    for tag in ("sandbox-proxy:1", worker_image):
         if not _image_present(tag):
             pytest.skip(f"image {tag} not built; run docker/sandbox/build.sh")
 
     spec = LaunchSpec(name="probe", argv=["python3", "-c", PROBE],
-                      image="sandbox-claude:1", worktree=str(tmp_path),
+                      image=worker_image, worktree=str(tmp_path),
                       auth_mounts=[], auth_env={}, egress_hosts=[])
     out = Sandbox(live_execution=True).spawn(spec, repo_remote_host="github.com",
                                              ci_host=None)
