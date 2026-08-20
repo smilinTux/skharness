@@ -61,7 +61,9 @@ for row in "${HARNESSES[@]}"; do
   wanted "$name" || continue
   img="sandbox-${name}:${TAG}"
   echo "== building ${img} =="
-  if docker build "${BUILD_ARGS[@]}" -f "$D/$dir/Dockerfile" -t "$img" .; then
+  target_args=()
+  [ "$name" = "pi" ] && target_args=(--target pi-core)
+  if docker build "${BUILD_ARGS[@]}" "${target_args[@]}" -f "$D/$dir/Dockerfile" -t "$img" .; then
     RESULT[$name]=ok
     if [ "$verify" != "-" ]; then
       ver="$(docker run --rm "$img" sh -c "$verify" 2>/dev/null | head -1 || true)"

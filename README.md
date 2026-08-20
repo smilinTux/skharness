@@ -45,6 +45,12 @@ Two things ship in one distribution:
 
 Full diagram and entry-point tour: [SOP.md section 2](./SOP.md#2-architecture).
 
+Target designs: [continual harness](./docs/architecture/continual-harness.md) defines
+safe refinement and recovery; the [Evolution Arena](./docs/architecture/evolution-arena.md)
+defines controlled multi-agent experiments, Pi/SKGateway execution, independent
+verification, artifact lineage, and Pareto promotion. Both are explicitly proposed;
+their documents distinguish implemented evidence from planned architecture.
+
 ## Run
 
 ```bash

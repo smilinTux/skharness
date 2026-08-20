@@ -10,10 +10,14 @@ import argparse
 import base64
 import json
 import os
+import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
+from skharness.arena import ArenaStatusService, ArenaStore, ProbeResult
 from skharness.auth import AuthContext, Verifier
 from skharness.autocode.sessions import AutocodeSessionRegistry
 from skharness.daemon import build_daemon_app
@@ -49,6 +53,74 @@ REAL_VERIFIER_ENV = "SKCODE_REAL_VERIFIER"
 # verifier (the CR-3.2 default).
 FORCE_DENY_ENV = "SKCODE_FORCE_DENY_ALL"
 _TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    return default if value is None else value.strip().lower() in _TRUTHY
+
+
+def build_http_probe(env_name: str):
+    """Build a bounded dependency probe from an explicitly configured health URL.
+
+    No URL means unknown. Only a 2xx response proves health; connection errors,
+    authentication failures, and malformed configuration are reported as errors.
+    """
+    url = os.environ.get(env_name, "").strip()
+    if not url:
+        return lambda: ProbeResult(None, f"{env_name} not configured")
+
+    def _check() -> ProbeResult:
+        try:
+            request = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(request, timeout=1.0) as response:
+                status = int(response.status)
+            if 200 <= status < 300:
+                return ProbeResult(True, f"HTTP {status}")
+            return ProbeResult(False, f"HTTP {status}")
+        except (OSError, ValueError, urllib.error.URLError) as exc:
+            return ProbeResult(False, f"{type(exc).__name__}: {exc}")
+
+    return _check
+
+
+def build_gpu_probe():
+    """Observe NVIDIA runtime truth; absence/timeout is not treated as healthy."""
+    def _check() -> ProbeResult:
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=uuid,memory.total", "--format=csv,noheader"],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=2.0,
+            )
+        except FileNotFoundError:
+            return ProbeResult(None, "nvidia-smi not installed")
+        except subprocess.TimeoutExpired:
+            return ProbeResult(False, "nvidia-smi timed out")
+        rows = [row.strip() for row in result.stdout.splitlines() if row.strip()]
+        if result.returncode != 0:
+            return ProbeResult(False, result.stderr.strip() or "nvidia-smi failed")
+        if not rows:
+            return ProbeResult(None, "no NVIDIA GPU telemetry returned")
+        return ProbeResult(True, f"{len(rows)} GPU(s) observed")
+
+    return _check
+
+
+def build_arena_status_service() -> ArenaStatusService:
+    """Compose the live arena state root and explicitly required dependencies."""
+    enabled = _env_truthy("SKHARNESS_ARENA_ENABLED")
+    return ArenaStatusService(
+        store=ArenaStore(skcode_state_dir() / "arena"),
+        gateway_probe=build_http_probe("SKHARNESS_ARENA_SKGATEWAY_HEALTH_URL"),
+        verifier_probe=build_http_probe("SKHARNESS_ARENA_VERIFIER_HEALTH_URL"),
+        gpu_probe=build_gpu_probe(),
+        require_gateway=enabled,
+        require_verifier=enabled,
+        require_gpu=enabled and _env_truthy("SKHARNESS_ARENA_REQUIRE_GPU"),
+    )
 
 
 def resolve_bind(host: str | None) -> str:
@@ -396,5 +468,6 @@ def _serve(argv: list[str]) -> None:
         list_autocode_sessions=autocode_registry.list,
         list_jobs=build_jobs_provider(),
         read_digest=build_digest_provider(),
+        arena_status=build_arena_status_service(),
     )
     uvicorn.run(app, host=host, port=args.port)

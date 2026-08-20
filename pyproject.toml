@@ -26,6 +26,8 @@ skcode-hostd = "skharness.serve:main"
 # objects/_freeze.json and objects/_protected.json. See its module docstring
 # for why it must be run with the operator's own key, not as an agent.
 skharness-sign-plane-files = "skharness.autocode.sign_plane_files:main"
+skharness-pi-bridge = "skharness.arena.pi_bridge:main"
+skharness-sk-backend = "skharness.arena.sk_backend:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -4,6 +4,7 @@ import pytest
 
 from skharness.serve import (
     DEFAULT_PORT,
+    build_arena_status_service,
     build_audit_log,
     build_default_verifier,
     build_digest_provider,
@@ -94,3 +95,32 @@ def test_build_digest_provider_none_when_nothing_published(tmp_path, monkeypatch
     monkeypatch.setenv("SKCODE_WATCHDOG_DIGEST_PATH", str(tmp_path / "does-not-exist.json"))
     provider = build_digest_provider()
     assert provider() is None
+
+
+def test_arena_disabled_reports_unconfigured_dependencies_but_stays_ready(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("SKCODE_STATE_DIR", str(tmp_path))
+    monkeypatch.delenv("SKHARNESS_ARENA_ENABLED", raising=False)
+    monkeypatch.delenv("SKHARNESS_ARENA_SKGATEWAY_HEALTH_URL", raising=False)
+    monkeypatch.delenv("SKHARNESS_ARENA_VERIFIER_HEALTH_URL", raising=False)
+    status = build_arena_status_service().readiness()
+    assert status["ready"] is True
+    assert status["dependencies"]["store"]["state"] == "ok"
+    assert status["dependencies"]["skgateway"] == {
+        "state": "unknown", "required": False,
+        "detail": "SKHARNESS_ARENA_SKGATEWAY_HEALTH_URL not configured",
+    }
+
+
+def test_arena_enabled_never_calls_missing_dependency_configuration_healthy(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("SKCODE_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("SKHARNESS_ARENA_ENABLED", "true")
+    monkeypatch.delenv("SKHARNESS_ARENA_SKGATEWAY_HEALTH_URL", raising=False)
+    monkeypatch.delenv("SKHARNESS_ARENA_VERIFIER_HEALTH_URL", raising=False)
+    status = build_arena_status_service().readiness()
+    assert status["ready"] is False
+    assert status["dependencies"]["skgateway"]["state"] == "unknown"
+    assert status["dependencies"]["verifier"]["state"] == "unknown"

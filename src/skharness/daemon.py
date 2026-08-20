@@ -22,6 +22,8 @@ from typing import Any, Callable
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
+from skharness.arena.models import ExperimentState
+from skharness.arena.status import ArenaStatusService, objectives_from_query
 from skharness.auth import Verifier, check_token, require_bearer
 from skharness.autocode import ratify as _ratify
 from skharness.autocode.types import RepoSpec
@@ -107,6 +109,8 @@ PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset({
     ("GET", "/.well-known/skworld-module.json"),
     ("GET", "/"),
     ("GET", "/app"),
+    ("GET", "/livez"),
+    ("GET", "/readyz"),
 })
 
 #: (METHOD, path_format) -> required scope for every gated route. "WS" is the
@@ -118,6 +122,14 @@ ROUTE_SCOPES: dict[tuple[str, str], str] = {
     ("GET", "/api/v1/sessions/{sid}/events"): SCOPE_READ,
     ("GET", "/api/v1/jobs"): SCOPE_READ,
     ("GET", "/api/v1/watchdog/digest"): SCOPE_READ,
+    ("GET", "/api/v1/arena/status"): SCOPE_READ,
+    ("GET", "/api/v1/arena/challenges"): SCOPE_READ,
+    ("GET", "/api/v1/arena/attempts"): SCOPE_READ,
+    ("GET", "/api/v1/arena/leases"): SCOPE_READ,
+    ("GET", "/api/v1/arena/verifications"): SCOPE_READ,
+    ("GET", "/api/v1/arena/frontier"): SCOPE_READ,
+    ("GET", "/api/v1/arena/lineage/{experiment_id}"): SCOPE_READ,
+    ("GET", "/api/v1/arena/metrics"): SCOPE_READ,
     ("GET", "/api/v1/dispatch/targets"): SCOPE_DISPATCH,
     ("POST", "/api/v1/sessions/{sid}/ratify"): SCOPE_WRITE,
     ("POST", "/api/v1/sessions/{sid}/inject"): SCOPE_WRITE,
@@ -191,6 +203,7 @@ def build_daemon_app(
     list_autocode_sessions: AutocodeSessionsProvider | None = None,
     list_jobs: JobsProvider | None = None,
     read_digest: DigestProvider | None = None,
+    arena_status: ArenaStatusService | None = None,
 ) -> FastAPI:
     app = FastAPI(title="skcode-hostd")
     # SessionEvent v2 (spec 5.1, card C-1): assigns seq/sid/source at append and
@@ -200,6 +213,9 @@ def build_daemon_app(
     # correct seq assignment without ever touching disk; serve.py wires a real
     # persisting store for the live daemon.
     store = event_store if event_store is not None else SessionEventStore(persist=False)
+    arena = arena_status or ArenaStatusService(
+        require_gateway=True, require_verifier=True, require_gpu=False
+    )
 
     def _session_source(sid: str) -> str:
         if list_autocode_sessions is not None:
@@ -274,6 +290,71 @@ def build_daemon_app(
         # has a token. It carries no secrets. URLs are origin-relative to the
         # request, so they resolve against wherever this host actually answers.
         return JSONResponse(skcode_module_manifest(str(request.base_url)))
+
+    @app.get("/livez")
+    async def livez():
+        return JSONResponse(arena.liveness())
+
+    @app.get("/readyz")
+    async def readyz():
+        body = arena.readiness()
+        return JSONResponse(body, status_code=200 if body["ready"] else 503)
+
+    @app.get("/api/v1/arena/status")
+    async def arena_status_route(authorization: str | None = Header(default=None)):
+        _auth(authorization, SCOPE_READ)
+        return JSONResponse(arena.status())
+
+    @app.get("/api/v1/arena/challenges")
+    async def arena_challenges_route(authorization: str | None = Header(default=None)):
+        _auth(authorization, SCOPE_READ)
+        return JSONResponse({"challenges": arena.challenges()})
+
+    @app.get("/api/v1/arena/attempts")
+    async def arena_attempts_route(challenge_id: str | None = None, state: str | None = None,
+                                   limit: int = 100,
+                                   authorization: str | None = Header(default=None)):
+        _auth(authorization, SCOPE_READ)
+        if state is not None and state not in {item.value for item in ExperimentState}:
+            raise HTTPException(400, "unknown experiment state")
+        return JSONResponse({"attempts": arena.attempts(
+            challenge_id=challenge_id, state=state, limit=limit)})
+
+    @app.get("/api/v1/arena/verifications")
+    async def arena_verifications_route(limit: int = 100,
+                                        authorization: str | None = Header(default=None)):
+        _auth(authorization, SCOPE_READ)
+        return JSONResponse({"verifications": arena.verifications(limit=limit)})
+
+    @app.get("/api/v1/arena/leases")
+    async def arena_leases_route(authorization: str | None = Header(default=None)):
+        _auth(authorization, SCOPE_READ)
+        return JSONResponse({"leases": arena.leases()})
+
+    @app.get("/api/v1/arena/frontier")
+    async def arena_frontier_route(challenge_hash: str, objectives: str,
+                                   authorization: str | None = Header(default=None)):
+        _auth(authorization, SCOPE_READ)
+        try:
+            parsed = objectives_from_query(objectives)
+            rows = arena.frontier(challenge_hash, parsed)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return JSONResponse({"challenge_hash": challenge_hash, "frontier": rows})
+
+    @app.get("/api/v1/arena/lineage/{experiment_id}")
+    async def arena_lineage_route(experiment_id: str,
+                                  authorization: str | None = Header(default=None)):
+        _auth(authorization, SCOPE_READ)
+        row = arena.lineage(experiment_id)
+        if row is None:
+            raise HTTPException(404, "experiment not found")
+        return JSONResponse(row)
+
+    @app.get("/api/v1/arena/metrics")
+    async def arena_metrics_route(authorization: str | None = Header(default=None)):
+        _auth(authorization, SCOPE_READ)
+        return Response(arena.metrics.render(arena.status()), media_type="text/plain")
 
     @app.get("/api/v1/hosts/self")
     async def hosts_self(authorization: str | None = Header(default=None)):

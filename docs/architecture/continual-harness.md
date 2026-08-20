@@ -4,6 +4,11 @@ Status: proposed
 Canonical epic: `4aca533c`
 Reviewed: 2026-08-20
 
+The controlled multi-agent experiment and verification subsystem is specified in
+[`evolution-arena.md`](./evolution-arena.md). The arena applies this document's
+trajectory, verifier, promotion, and rollback rules to reproducible challenges; it does
+not create a second production execution plane.
+
 ## Scope
 
 This design joins two deliberately separate systems:
@@ -136,4 +141,4 @@ Design or localhost-only results never satisfy the `.41` card (`0172231c`).
 | `23e4e90f` | Evaluation matrix, trace export, slow training gate |
 | `0f1195ce` | Threat model, supply chain, and chaos suite |
 | `0172231c` | Reproducible `.41` end-to-end evidence |
-
+| `82673f16` | Sovereign Pi Evolution Arena epic and controlled challenge loop |

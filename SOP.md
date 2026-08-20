@@ -47,8 +47,9 @@ behind a merge gate.
   `skcapstone.coordination` shim.
 - It is **not** a public service. There is no `:443` route, no Cloudflare Tunnel, and no
   Funnel exposure. See section 5, Front-end / Exposure.
-- It does **not** provide a `/health` or `/healthz` route. Liveness is reported through
-  `skcode-hostd operator observe` and `GET /api/v1/hosts/self`.
+- It provides minimal public `/livez` and `/readyz` routes. `/livez` reports only
+  process serviceability. `/readyz` returns 503 unless every dependency configured as
+  required for the arena is positively observed; an unknown required GPU is unready.
 
 ---
 
@@ -128,6 +129,11 @@ Continual improvement and the production Pi execution image are governed by
 [`docs/architecture/continual-harness.md`](./docs/architecture/continual-harness.md).
 That design keeps execution, verification, refinement, and optional training as
 separately versioned planes and records the canonical coordination epic (`4aca533c`).
+The proposed controlled experiment service, Pi worker profiles, independent verifier,
+artifact lineage, and phased release gates are specified in
+[`docs/architecture/evolution-arena.md`](./docs/architecture/evolution-arena.md). It is
+design-only until its named cards and evidence gates pass; this SOP does not claim an
+operational arena.
 
 ---
 
@@ -171,6 +177,44 @@ placeholder like `0.1.dev1`. Every CI checkout therefore sets `fetch-depth: 0` a
 ```bash
 ./docker/sandbox/build.sh
 ```
+
+The Pi Dockerfile now has `pi-core` and `pi-polyglot` targets. The base image digest,
+exact Pi version, and observed npm integrity are recorded in
+`docker/sandbox/pi/dependencies.lock.json`; both targets run as UID/GID `10001`, and
+`docker/sandbox/build.sh pi` deliberately builds `pi-core` as `sandbox-pi:1`.
+
+```bash
+docker build --target pi-core -t skharness-pi-core:dev \
+  -f docker/sandbox/pi/Dockerfile .
+docker build --target pi-polyglot -t skharness-pi-polyglot:dev \
+  -f docker/sandbox/pi/Dockerfile .
+```
+
+Passing `capability_profile=` to `PiAdapter` loads only the in-image SK bridge extension
+and emits Pi's explicit `--tools` allowlist. The extension calls
+`skharness-pi-bridge`, whose Python policy independently denies operations absent from
+the selected profile. A runtime controller must mount an absolute backend executable
+and set `SKHARNESS_SK_BRIDGE_BACKEND`; no backend credentials or sovereign agent home
+are baked into either image.
+
+Direct apt versions are pinned in `apt-packages.lock`; Python runtime and test
+dependencies are transitively pinned with hashes in `requirements.lock` and
+`test-requirements.lock`. `scripts/qualify-arena.py` emits an explicitly unsigned local
+evidence bundle, and `scripts/pi-supply-chain.sh` requires Syft and Grype to generate a
+CycloneDX SBOM and vulnerability report (optionally signing provenance with Cosign).
+
+The host-side `skharness-sk-backend` provides exact-schema SKCapstone/SKMemory and arena
+operations for the worker bridge. Arena/scratch writes are idempotent files; an
+idempotency-key collision fails rather than overwriting evidence. Runtime launch still
+must mount this executable and scoped SK credentials/home explicitly.
+
+These are buildable locally qualified images, not published or fleet-qualified
+artifacts. The local qualification covers a frozen challenge contract, a real Pi call
+to a mock OpenAI-compatible SKGateway endpoint with attribution, false-score rejection,
+and durable/idempotent recovery primitives. It does not claim a live SKGateway call,
+SBOM/signature/vulnerability result, registry digest, or `.41` E2E. On the 2026-08-20
+read-only `.41` probe, Docker and `sandbox-pi:1` were present but `nvidia-smi` could not
+communicate with the driver, so GPU qualification is blocked rather than passed.
 
 ---
 
@@ -352,9 +396,9 @@ restart: every caller is then denied and nothing actuates.
 - **Port: 9394** (`serve.DEFAULT_PORT`). `:9390` belongs to
   `skcomms.transports.broker_server`, hence the offset. Override with `--port` and record
   it in `~/.skcapstone/docs/PORTS.md`.
-- **Static client:** `GET /` and `GET /app` serve a self-contained page and are the only
-  unauthenticated HTTP routes besides `/.well-known/skworld-module.json`. They carry no
-  data; every data call from that page is bearer-gated.
+- **Static client and probes:** `GET /`, `GET /app`, public discovery, `/livez`, and
+  `/readyz` are the only unauthenticated HTTP routes. Probes expose dependency classes
+  and states, never experiment, lease, run, card, route, or credential identities.
 
 ---
 
@@ -376,6 +420,10 @@ restart: every caller is then denied and nothing actuates.
 | `SKCODE_STATE_DIR` | no | Root for audit log, worktrees, and session events. Default `~/.skcapstone/skcode`. |
 | `SKCODE_CRON_LEDGER_PATH` | no | Overrides the ledger `GET /api/v1/jobs` reads. Default `~/.skcapstone/logs/cron-ledger.jsonl`. |
 | `SKCODE_WATCHDOG_DIGEST_PATH` | no | Overrides the artifact `GET /api/v1/watchdog/digest` reads. Default `~/.skcapstone/watchdog/digests/latest/digest.json`. |
+| `SKHARNESS_ARENA_ENABLED` | no | Truthy makes SKGateway and verifier health required readiness signals. |
+| `SKHARNESS_ARENA_SKGATEWAY_HEALTH_URL` | arena | Exact SKGateway health URL. Missing is `unknown`; only HTTP 2xx is ready. |
+| `SKHARNESS_ARENA_VERIFIER_HEALTH_URL` | arena | Exact verifier health URL. Missing is `unknown`; only HTTP 2xx is ready. |
+| `SKHARNESS_ARENA_REQUIRE_GPU` | no | With arena enabled, require successful `nvidia-smi` telemetry with at least one GPU. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | node-local | The credential the spawned agent uses. It lives only in this env file, never in the repo. |
 
 ### The dispatch allowlist, and why `skos` and `skharness` are not on it
@@ -437,7 +485,17 @@ mapping, and `tests/test_route_coverage.py` fails if a live route is missing fro
 |---|---|---|---|
 | GET | `/.well-known/skworld-module.json` | public | Module manifest. |
 | GET | `/` , `/app` | public | The self-contained static client. |
-| GET | `/api/v1/hosts/self` | `skcode.stream` | Host and harness identity. There is no separate health route. |
+| GET | `/livez` | public | Process liveness only; it does not imply dependency readiness. |
+| GET | `/readyz` | public | Required store/SKGateway/verifier/GPU readiness; 503 on required error or unknown. |
+| GET | `/api/v1/hosts/self` | `skcode.stream` | Host and harness identity. |
+| GET | `/api/v1/arena/status` | `skcode.stream` | Derived attempt counts, scheduler capacity, and dependency status. |
+| GET | `/api/v1/arena/challenges` | `skcode.stream` | Immutable challenge summaries. |
+| GET | `/api/v1/arena/attempts` | `skcode.stream` | Bounded structured attempt-state records. |
+| GET | `/api/v1/arena/leases` | `skcode.stream` | Active lease records; identities never become metric labels. |
+| GET | `/api/v1/arena/verifications` | `skcode.stream` | Bounded independent-verification records. |
+| GET | `/api/v1/arena/frontier` | `skcode.stream` | Valid-only multi-objective Pareto frontier. |
+| GET | `/api/v1/arena/lineage/{experiment_id}` | `skcode.stream` | Parent, ancestor, reproduction, and descendant view. |
+| GET | `/api/v1/arena/metrics` | `skcode.stream` | Fixed-cardinality operational metrics. |
 | GET | `/api/v1/sessions` | `skcode.stream` | Live and historical sessions, harness plus autocode runs merged. |
 | GET | `/api/v1/sessions/{sid}` | `skcode.stream` | One session, or 404. |
 | GET | `/api/v1/sessions/{sid}/events` | `skcode.stream` | Replay from the append-only event store. |
@@ -531,7 +589,7 @@ verdict, not an exception.
 | `SpawnRejected: repo ... is not on the dispatch allowlist` | Path mismatch after realpath. Compare `realpath` of your value with the env entry; a symlinked or relative path will not match. |
 | `skos autopilot run` behaves like an old build, fixes have no effect | Stale delegation. Run the doctor check: `python -c "from skharness.autocode.doctor import check_shim_delegation as c; print(c())"`. A `fail` means `skos.autopilot` is not delegating to `skharness` on this node; reinstall/rsync the `skos.autopilot` shim package there. This is a known failure CLASS documented in `autocode/doctor.py:1-12`, not a written-up incident. |
 | `operator observe` reports everything healthy but the daemon is down | Known gotcha, and it is deliberate. `_default_probe()` fails **safe**: any failure (connection refused, 401, malformed body) returns the all-healthy state so the operator loop never pages falsely (`operator_cli.py:38,180-206`). Do not use `observe` as a liveness probe. Use `systemctl --user is-active skcode-hostd`. |
-| Looking for `/health` or `/healthz` | There is none. Use `GET /api/v1/hosts/self` (bearer-gated) or `systemctl --user is-active`. |
+| `/readyz` returns 503 while `/livez` is 200 | The process serves, but a required arena dependency is error/unknown. Inspect the reported states and configuration; do not restart-loop merely because readiness is false. |
 | CI red on "the cross-repo round trip SKIPPED instead of running" | `skcoord` did not install from git `main`, so the round-trip tests self-skipped. Check the sibling install step, especially that `skcoord` is installed LAST with `--upgrade`. |
 | A build gets escalated at grade 5 with green CI | Expected if the diff touched a carve-out path. Check it against `_ALWAYS_PROTECTED` and `objects/_protected.json`. A missing or malformed manifest protects everything by design. |
 | A graded card uses the adapter's static model | Confirm the card payload carries a complete `work_grade`, the configured adapter returns `supports_model_override() == True`, and `graded_dispatch` appears in health events. Pi supports the override; other adapters intentionally refuse it. |
@@ -608,8 +666,8 @@ checks:
     run: grep -q 'SKCODE_DISPATCH_REPOS", ""' src/skharness/harnesses/claude_code.py && grep -q 'repo allowlist is empty' src/skharness/harnesses/claude_code.py
   - name: carve-out detector still fails closed
     run: grep -q '_FAIL_CLOSED: dict = {"protected": \["\*\*"\]' src/skharness/autocode/protected.py
-  - name: no health route was added without updating this SOP
-    run: test -z "$(grep -o '@app.get("/health[a-z]*")' src/skharness/daemon.py)"
+  - name: truthful arena liveness and readiness routes remain declared
+    run: grep -q '@app.get("/livez")' src/skharness/daemon.py && grep -q '@app.get("/readyz")' src/skharness/daemon.py && grep -q '("GET", "/readyz")' src/skharness/daemon.py
   - name: CI anti-skip gate is still armed
     run: grep -q 'the cross-repo round trip SKIPPED instead of running' .github/workflows/ci.yml
   - name: graded dispatch maps only the canonical twelve bucket addresses

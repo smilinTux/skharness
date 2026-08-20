@@ -20,6 +20,25 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 - Replaced the malformed `88i9j0k1` farming plan with canonical epic `4aca533c`
   and documented the production Pi execution plane plus reward-hack-resistant continual
   improvement design in `docs/architecture/continual-harness.md`.
+- Added the proposed SKHarness Evolution Arena architecture: controlled challenge and
+  experiment contracts, Pi/SKGateway execution, independent verification, Pareto
+  evaluation, artifact lineage, safe refinement, reproducible core/polyglot images,
+  trust boundaries, observability, and a six-sprint evidence-gated delivery plan. No
+  operational-arena claim is made by this documentation change.
+- Registered arena epic `82673f16` and seven dependency-aware delivery cards for
+  contracts, Pi images/SK integration, scheduling/recovery, independent verification,
+  collaboration/refinement, observability, and fleet qualification. Superseded the
+  initial `e90d40f1` birth record after readback exposed empty canonical criteria.
+- Added buildable `pi-core` and `pi-polyglot` Docker targets, a pinned base/Pi input
+  manifest, and a deny-by-default Pi extension/Python bridge with explicit
+  `arena-build`, `arena-verify`, `project-full`, and empty-authority `operator`
+  profiles. Publication, SBOM/signing, apt/Python transitive locks, and fleet
+  qualification remain release gates rather than claimed evidence.
+- Added hashed Python locks, direct apt version locks, a narrow host-side
+  SKCapstone/SKMemory backend, a frozen reference challenge, real Pi-to-mock-SKGateway
+  attribution coverage, idempotent evidence writes, local qualification bundles, and
+  fail-closed SBOM/vulnerability/provenance tooling. Live gateway, signing, publication,
+  and GPU-node qualification remain explicitly unclaimed.
 
 ### Documentation
 

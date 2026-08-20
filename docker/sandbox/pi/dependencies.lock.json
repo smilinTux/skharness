@@ -1,0 +1,24 @@
+{
+  "schema": "skharness.pi-image-lock.v1",
+  "base_image": {
+    "reference": "node:24-bookworm",
+    "index_digest": "sha256:934240a162082fd8b8a2f90cd5114446443f1eba1c5378f6687167ca405e6584",
+    "linux_amd64_manifest_digest": "sha256:f6d02cf1353049cf3658e6ce9ec03c6877a6479495f122062d195e2279d01055"
+  },
+  "npm": {
+    "package": "@earendil-works/pi-coding-agent",
+    "version": "0.84.2",
+    "integrity": "sha512-l4E+B7hgXKWddRo8bC/eSue2aWZjEgJ9xIpf5p0Og+lq8a2TArCwJ0HCoCPCgaBP/tN4zbYH/wOwvx9pJpeLCA=="
+  },
+  "python_test_tools": {"coverage": "7.13.4", "pytest": "9.0.2"},
+  "polyglot": {
+    "go": "distribution package from the pinned Debian image",
+    "java": "openjdk-17-jdk-headless from the pinned Debian image",
+    "rust": "rustc/cargo distribution packages from the pinned Debian image"
+  },
+  "notes": [
+    "The image digest and Pi package are immutable inputs.",
+    "Debian package versions remain a reproducibility gap until an apt snapshot is pinned.",
+    "SBOM generation, signing, and registry publication are not claimed here."
+  ]
+}

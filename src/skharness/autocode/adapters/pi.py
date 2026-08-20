@@ -24,6 +24,7 @@ import json
 import re
 
 from .base import BaseCliAdapter, parse_event_stream
+from ...arena.pi_bridge import PI_PROFILES, BridgeDeniedError
 
 # Attribution header values must be plain, inert tokens. pi treats a LEADING `!`
 # in a header value as "run this shell command and use its stdout", re-executed on
@@ -65,7 +66,7 @@ class PiAdapter(BaseCliAdapter):
 
     def __init__(self, sandbox=None, model=None, base_url=None, egress_hosts=None,
                  live_execution: bool = False, image=None, max_tokens=None,
-                 run_timeout=None, session_id=None, card_id=None):
+                 run_timeout=None, session_id=None, card_id=None, capability_profile=None):
         from ..sandbox import Sandbox
         self.model = model
         self.base_url = base_url
@@ -77,6 +78,9 @@ class PiAdapter(BaseCliAdapter):
         # not import it, so it stays independently mergeable and independently usable.
         self.session_id = _attribution_value(self._H_SESSION, session_id)
         self.card_id = _attribution_value(self._H_CARD, card_id)
+        if capability_profile is not None and capability_profile not in PI_PROFILES:
+            raise BridgeDeniedError(f"unknown Pi capability profile: {capability_profile!r}")
+        self.capability_profile = capability_profile
         self.image = image or "sandbox-pi:1"
         self.max_tokens = int(max_tokens) if max_tokens else self._DEFAULT_MAX_TOKENS
         # pi does one turn and terminates (measured ~3.6s for a classification prompt
@@ -117,10 +121,14 @@ class PiAdapter(BaseCliAdapter):
         # light (assess/grade judgment) accepted for the unified seam; pi's
         # --no-session already runs a single non-agentic shot.
         eff = self._effective_model(model)
-        if not eff:
-            return ["pi", "-p", prompt, "--mode", "json", "--no-session"]
-        return ["pi", "-p", prompt, "--mode", "json", "--no-session",
-                "--model", f"skgw/{eff}", "--api-key", "sk-local"]
+        argv = ["pi", "-p", prompt, "--mode", "json", "--no-session"]
+        if self.capability_profile:
+            profile = PI_PROFILES[self.capability_profile]
+            argv.extend(["--no-extensions", "-e", "/opt/skharness/pi/sk-bridge.ts",
+                         "--tools", ",".join(profile.pi_tools)])
+        if eff:
+            argv.extend(["--model", f"skgw/{eff}", "--api-key", "sk-local"])
+        return argv
 
     def _image(self) -> str:
         return self.image
@@ -131,7 +139,10 @@ class PiAdapter(BaseCliAdapter):
     def _auth_env(self):
         # points pi at the injected config dir (models.json); do NOT set
         # OPENAI_BASE_URL, pi ignores it and hits real OpenAI instead.
-        return {"PI_CODING_AGENT_DIR": "/agent"}
+        env = {"PI_CODING_AGENT_DIR": "/agent"}
+        if self.capability_profile:
+            env["SKHARNESS_PI_PROFILE"] = self.capability_profile
+        return env
 
     def _attribution_headers(self, session_id=None, card_id=None) -> dict:
         """The provider-level `headers` map, or {} when we have nothing to attribute.

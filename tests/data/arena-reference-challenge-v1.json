@@ -1,0 +1,50 @@
+{
+  "schema_version": "arena.challenge.v1",
+  "id": "skharness-reference-patch",
+  "version": "1.0.0",
+  "title": "Frozen deterministic patch qualification",
+  "owner": "skharness",
+  "created_at": "2026-08-20T00:00:00Z",
+  "repository_url": "fixture://arena/reference-repository-v1",
+  "base_commit": "sha256:1f649f032b5e0d6c9e25af3141c44564c78b7b7def244424efacf98284792d25",
+  "writable_paths": ["src/answer.py"],
+  "protected_paths": ["hidden/", "challenge.json"],
+  "task_template": "Implement answer() so the public tests pass without reading hidden/.",
+  "model": {
+    "model_id": "skgw/reference-coder",
+    "digest": "sha256:80b3ad2d438bfafa1ea690c5a59f2369c7f8d84337e82d071cf4c41742300316",
+    "required_modalities": ["text"]
+  },
+  "hardware": {
+    "hardware_class": "cpu-reference",
+    "gpu_count": 0,
+    "image_digest": "sha256:4427788c00f9488b7a6f126a35facb525a6283ee4b5c1f8c4673ce25dc797a2a",
+    "runtime_constraints": ["container", "read-only-rootfs"]
+  },
+  "public_dataset": {
+    "uri": "fixture://arena/public-v1",
+    "digest": "sha256:46a6d44cabb38e3541d61eeb4f7f32545cc983b2956e4631a557f234e4102731"
+  },
+  "withheld_dataset_ref": {
+    "uri": "private://arena/reference-hidden-v1",
+    "digest": "sha256:2cabd74817a364759d4cce82df390e330c7de8183e734194df951914b38d34a6"
+  },
+  "metrics": [
+    {"name": "quality", "unit": "ratio", "objective": "constraint", "threshold": 1.0},
+    {"name": "latency", "unit": "seconds", "objective": "minimize"}
+  ],
+  "warmup_runs": 0,
+  "repetitions": 3,
+  "seeds": [11, 29, 47],
+  "confidence_rule": "two-sided-95-percent",
+  "budgets": {"wall_seconds": 120, "token_limit": 4096, "concurrency": 1},
+  "allowed_optimizations": ["source-patch", "test-driven-development"],
+  "prohibited_optimizations": ["hidden-test-read", "model-swap", "score-fabrication"],
+  "network_capabilities": ["skgateway"],
+  "tool_capabilities": ["arena-build"],
+  "verifier_version": "reference-verifier-v1",
+  "rubric_version": "reference-rubric-v1",
+  "policy_version": "reference-policy-v1",
+  "promotion_requirements": ["independent-rerun", "all-constraints-pass"],
+  "rollback_requirements": ["evidence-id", "previous-artifact-digest"]
+}
