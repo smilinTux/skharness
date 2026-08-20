@@ -425,6 +425,15 @@ The arena is not releasable until one frozen challenge demonstrates, from a clea
 7. a canary promotion can be rolled back by evidence ID; and
 8. the evidence bundle identifies exact image, code, hardware and served model.
 
+The reference qualification implements item 3 as an executable adversarial control,
+not a trusted fixture label. Both provisional execution records and verifier results are
+stored under their canonical content hashes; reads reject a filename/content mismatch.
+The verifier owns a frozen expected output, performs repeated observations through an
+opaque private-evaluation handle, and only a verified-valid result may enter the
+frontier. Exact-output equality is intentionally limited to validating the transport,
+lineage, independent-verification, and admission path. General challenge quality still
+requires withheld operator-owned tests, richer metrics, and the complete controls above.
+
 ## 13. Standards compliance and documentation ownership
 
 - Architecture diagrams, data ownership, critical sequence and entry points follow the

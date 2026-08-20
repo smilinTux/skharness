@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import os
 import re
+import secrets
 from pathlib import Path
 
-from .models import ExperimentEvent
+from .models import Experiment, ExperimentEvent, Result
 
 try:
     import fcntl
@@ -39,7 +40,12 @@ class ArenaStore:
         self.events_dir = self.root / "events"
         self.artifacts_dir = self.root / "artifacts" / "sha256"
         self.specs_dir = self.root / "specs"
-        for directory in (self.events_dir, self.artifacts_dir, self.specs_dir):
+        self.experiments_dir = self.root / "experiments"
+        self.results_dir = self.root / "results"
+        for directory in (
+            self.events_dir, self.artifacts_dir, self.specs_dir,
+            self.experiments_dir, self.results_dir,
+        ):
             directory.mkdir(parents=True, exist_ok=True)
 
     def _segment(self, writer_id: str) -> Path:
@@ -158,3 +164,65 @@ class ArenaStore:
         if not path.exists():
             path.write_bytes(payload)
         return digest
+
+    def _put_record(self, directory: Path, record) -> str:
+        """Persist an immutable model under its canonical content hash."""
+        digest = record.content_hash
+        path = directory / f"{digest.removeprefix('sha256:')}.json"
+        payload = record.model_dump_json(exclude_none=True, indent=2).encode() + b"\n"
+        if path.exists() and path.read_bytes() != payload:
+            raise CorruptEventLogError(f"record content does not match existing hash {digest}")
+        if not path.exists():
+            temporary = path.with_name(
+                f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+            )
+            try:
+                with temporary.open("xb") as stream:
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                try:
+                    os.link(temporary, path)
+                    directory_fd = os.open(directory, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                except FileExistsError:
+                    if path.read_bytes() != payload:
+                        raise CorruptEventLogError(
+                            f"record content does not match existing hash {digest}"
+                        )
+            finally:
+                temporary.unlink(missing_ok=True)
+        return digest
+
+    def put_experiment(self, experiment: Experiment) -> str:
+        """Persist one content-addressed immutable experiment."""
+        return self._put_record(self.experiments_dir, experiment)
+
+    def put_result(self, result: Result) -> str:
+        """Persist one content-addressed immutable result."""
+        return self._put_record(self.results_dir, result)
+
+    def read_experiments(self) -> list[Experiment]:
+        """Read and validate every persisted experiment."""
+        return self._read_records(self.experiments_dir, Experiment)
+
+    def read_results(self) -> list[Result]:
+        """Read and validate every persisted result."""
+        return self._read_records(self.results_dir, Result)
+
+    @staticmethod
+    def _read_records(directory: Path, model_type) -> list:
+        """Validate both content and content-addressed filename on every read."""
+        records = []
+        for path in sorted(directory.glob("*.json")):
+            try:
+                record = model_type.model_validate_json(path.read_bytes())
+            except Exception as exc:
+                raise CorruptEventLogError(f"invalid immutable record at {path}") from exc
+            if path.stem != record.content_hash.removeprefix("sha256:"):
+                raise CorruptEventLogError(f"immutable record hash mismatch at {path}")
+            records.append(record)
+        return records

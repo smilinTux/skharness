@@ -134,6 +134,10 @@ def test_live_qualification_records_gateway_and_pi_evidence_without_secret(
     assert records[1]["experiment"]["configuration"][
         "gateway_header_served_model"
     ] == "served-model"
+    planted = QUALIFY.planted_false_high_score(records[1])
+    assert planted["assistant_output"] == "planted-false-output"
+    assert planted["result"]["measurements"][0]["mean"] == 999_999_999
+    assert planted["result"]["experiment_hash"] == planted["experiment_hash"]
 
 
 def test_live_qualification_requires_named_secret(monkeypatch):

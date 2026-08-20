@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Generate a local, unsigned Evolution Arena qualification evidence bundle."""
+
 from __future__ import annotations
 
 import argparse
@@ -11,6 +12,7 @@ import platform
 import subprocess
 import tempfile
 import threading
+from copy import deepcopy
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,20 +27,21 @@ def command(argv: list[str], *, truncate: bool = True) -> dict:
     proc = subprocess.run(argv, capture_output=True, text=True, check=False)
     stdout = proc.stdout[-4000:] if truncate else proc.stdout
     stderr = proc.stderr[-4000:] if truncate else proc.stderr
-    return {"argv": argv, "exit_code": proc.returncode,
-            "stdout": stdout, "stderr": stderr}
+    return {"argv": argv, "exit_code": proc.returncode, "stdout": stdout, "stderr": stderr}
 
 
-def http_json(url: str, api_key: str, *, payload: dict | None = None,
-              headers: dict[str, str] | None = None) -> dict:
+def http_json(
+    url: str, api_key: str, *, payload: dict | None = None, headers: dict[str, str] | None = None
+) -> dict:
     body = None if payload is None else json.dumps(payload).encode()
     req_headers = {"accept": "application/json", **(headers or {})}
     if api_key:
         req_headers["authorization"] = f"Bearer {api_key}"
     if body is not None:
         req_headers["content-type"] = "application/json"
-    req = request.Request(url, data=body, headers=req_headers,
-                          method="POST" if body is not None else "GET")
+    req = request.Request(
+        url, data=body, headers=req_headers, method="POST" if body is not None else "GET"
+    )
     with request.urlopen(req, timeout=20) as response:  # noqa: S310 - operator URL
         raw = response.read().decode()
         return {
@@ -48,11 +51,17 @@ def http_json(url: str, api_key: str, *, payload: dict | None = None,
         }
 
 
-_HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate",
-               "proxy-authorization", "te", "trailers", "transfer-encoding",
-               "upgrade"}
-_ATTRIBUTION_HEADERS = ("x-sk-req-id", "x-request-id", "x-sk-backend",
-                        "x-sk-model-served")
+_HOP_BY_HOP = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+}
+_ATTRIBUTION_HEADERS = ("x-sk-req-id", "x-request-id", "x-sk-backend", "x-sk-model-served")
 
 
 class PiGatewayRelay:
@@ -81,20 +90,27 @@ class PiGatewayRelay:
                     self.send_error(411, "content-length required")
                     return
                 body = self.rfile.read(int(length))
-                headers = {key: value for key, value in self.headers.items()
-                           if key.lower() not in _HOP_BY_HOP | {"host", "content-length"}}
+                headers = {
+                    key: value
+                    for key, value in self.headers.items()
+                    if key.lower() not in _HOP_BY_HOP | {"host", "content-length"}
+                }
                 path = relay._upstream.path.rstrip("/") + self.path
-                connection_type = (http.client.HTTPSConnection
-                                   if relay._upstream.scheme == "https"
-                                   else http.client.HTTPConnection)
-                connection = connection_type(relay._upstream.hostname,
-                                             relay._upstream.port, timeout=20)
+                connection_type = (
+                    http.client.HTTPSConnection
+                    if relay._upstream.scheme == "https"
+                    else http.client.HTTPConnection
+                )
+                connection = connection_type(
+                    relay._upstream.hostname, relay._upstream.port, timeout=20
+                )
                 captured = bytearray()
                 try:
                     connection.request("POST", path, body=body, headers=headers)
                     upstream_response = connection.getresponse()
-                    response_headers = {key.lower(): value
-                                        for key, value in upstream_response.getheaders()}
+                    response_headers = {
+                        key.lower(): value for key, value in upstream_response.getheaders()
+                    }
                     self.send_response(upstream_response.status)
                     for key, value in upstream_response.getheaders():
                         if key.lower() not in _HOP_BY_HOP | {"content-length"}:
@@ -109,11 +125,18 @@ class PiGatewayRelay:
                         self.wfile.write(chunk)
                         self.wfile.flush()
                     with relay._lock:
-                        relay.captures.append({"method": "POST", "path": self.path,
-                                               "status": upstream_response.status,
-                                               "headers": {name: response_headers.get(name)
-                                                           for name in _ATTRIBUTION_HEADERS},
-                                               "body": bytes(captured)})
+                        relay.captures.append(
+                            {
+                                "method": "POST",
+                                "path": self.path,
+                                "status": upstream_response.status,
+                                "headers": {
+                                    name: response_headers.get(name)
+                                    for name in _ATTRIBUTION_HEADERS
+                                },
+                                "body": bytes(captured),
+                            }
+                        )
                 finally:
                     connection.close()
                     self.close_connection = True
@@ -139,8 +162,11 @@ def relay_response_model(capture: dict) -> str | None:
     """Extract model metadata from JSON or OpenAI-compatible SSE without guessing."""
     raw = capture["body"].decode("utf-8", errors="replace")
     candidates = [raw]
-    candidates.extend(line[5:].strip() for line in raw.splitlines()
-                      if line.startswith("data:") and line[5:].strip() != "[DONE]")
+    candidates.extend(
+        line[5:].strip()
+        for line in raw.splitlines()
+        if line.startswith("data:") and line[5:].strip() != "[DONE]"
+    )
     for candidate in reversed(candidates):
         try:
             body = json.loads(candidate)
@@ -177,14 +203,22 @@ def immutable_execution_records(args: argparse.Namespace, evidence: dict) -> lis
         if choices and isinstance(choices[0], dict):
             direct_output = choices[0].get("message", {}).get("content", "")
     executions = (
-        ("direct", direct_output, evidence["completion_model"],
-         evidence["attribution"].get("x-sk-req-id")
-         or evidence["attribution"].get("x-request-id"), evidence["attribution"]),
-        ("pi", evidence["pi"]["output"],
-         evidence["pi"]["responseModel"] or evidence["pi"]["served_model"],
-         evidence["pi"]["attribution"].get("x-sk-req-id")
-         or evidence["pi"]["attribution"].get("x-request-id"),
-         evidence["pi"]["attribution"]),
+        (
+            "direct",
+            direct_output,
+            evidence["completion_model"],
+            evidence["attribution"].get("x-sk-req-id")
+            or evidence["attribution"].get("x-request-id"),
+            evidence["attribution"],
+        ),
+        (
+            "pi",
+            evidence["pi"]["output"],
+            evidence["pi"]["responseModel"] or evidence["pi"]["served_model"],
+            evidence["pi"]["attribution"].get("x-sk-req-id")
+            or evidence["pi"]["attribution"].get("x-request-id"),
+            evidence["pi"]["attribution"],
+        ),
     )
     records = []
     for kind, output, served_model, request_id, execution_attribution in executions:
@@ -213,9 +247,7 @@ def immutable_execution_records(args: argparse.Namespace, evidence: dict) -> lis
             configuration={
                 "prompt_sha256": challenge_hash,
                 "live": True,
-                "gateway_header_served_model": execution_attribution.get(
-                    "x-sk-model-served"
-                ),
+                "gateway_header_served_model": execution_attribution.get("x-sk-model-served"),
             },
             budgets=BudgetSpec(wall_seconds=20),
             created_at=created_at,
@@ -226,20 +258,73 @@ def immutable_execution_records(args: argparse.Namespace, evidence: dict) -> lis
             experiment_id=experiment.id,
             experiment_hash=experiment.content_hash,
             challenge_hash=challenge_hash,
-            measurements=(Measurement(
-                metric="nonempty_output", unit="boolean", observations=(observation,),
-                mean=observation.value, standard_deviation=0,
-            ),),
+            measurements=(
+                Measurement(
+                    metric="nonempty_output",
+                    unit="boolean",
+                    observations=(observation,),
+                    mean=observation.value,
+                    standard_deviation=0,
+                ),
+            ),
             artifacts=(artifact,),
             created_at=created_at,
         )
-        records.append({
-            "experiment": experiment.model_dump(mode="json"),
-            "experiment_hash": experiment.content_hash,
-            "result": result.model_dump(mode="json"),
-            "result_hash": result.content_hash,
-        })
+        records.append(
+            {
+                "experiment": experiment.model_dump(mode="json"),
+                "experiment_hash": experiment.content_hash,
+                "result": result.model_dump(mode="json"),
+                "result_hash": result.content_hash,
+                "assistant_output": str(output),
+            }
+        )
     return records
+
+
+def planted_false_high_score(record: dict) -> dict:
+    """Create an explicit adversarial fixture whose claimed score must be ignored."""
+    from skharness.arena.models import (
+        ArtifactRef,
+        Experiment,
+        Measurement,
+        Observation,
+        Result,
+    )
+
+    planted = deepcopy(record)
+    raw = b"planted-false-output"
+    artifact = ArtifactRef(
+        digest="sha256:" + hashlib.sha256(raw).hexdigest(),
+        media_type="text/plain",
+        size=len(raw),
+        role="assistant-output",
+    )
+    original_experiment = Experiment.model_validate(planted["experiment"])
+    false_experiment = original_experiment.model_copy(update={"artifacts": (artifact,)})
+    original = Result.model_validate(planted["result"])
+    observation = Observation(value=999_999_999, recorded_at=original.created_at)
+    false_result = original.model_copy(
+        update={
+            "measurements": (
+                Measurement(
+                    metric="claimed_score",
+                    unit="ratio",
+                    observations=(observation,),
+                    mean=observation.value,
+                    standard_deviation=0,
+                ),
+            ),
+            "artifacts": (artifact,),
+            "experiment_hash": false_experiment.content_hash,
+        }
+    )
+    planted["experiment"] = false_experiment.model_dump(mode="json")
+    planted["experiment_hash"] = false_experiment.content_hash
+    planted["assistant_output"] = raw.decode()
+    planted["result"] = false_result.model_dump(mode="json")
+    planted["result_hash"] = false_result.content_hash
+    return planted
 
 
 def live_qualification(args: argparse.Namespace) -> dict:
@@ -253,9 +338,13 @@ def live_qualification(args: argparse.Namespace) -> dict:
     health = http_json(root + "/health", api_key)
     models = http_json(api_base + "/models", api_key)
     completion = http_json(
-        api_base + "/chat/completions", api_key,
-        payload={"model": args.gateway_model, "stream": False,
-                 "messages": [{"role": "user", "content": args.prompt}]},
+        api_base + "/chat/completions",
+        api_key,
+        payload={
+            "model": args.gateway_model,
+            "stream": False,
+            "messages": [{"role": "user", "content": args.prompt}],
+        },
         headers=attribution,
     )
     response_headers = completion["headers"]
@@ -263,13 +352,27 @@ def live_qualification(args: argparse.Namespace) -> dict:
         name: response_headers.get(name)
         for name in ("x-sk-req-id", "x-request-id", "x-sk-backend", "x-sk-model-served")
     }
-    config = {"providers": {"skgw": {
-        "baseUrl": "ephemeral-loopback-relay", "api": "openai-completions", "apiKey": "not-recorded",
-        "headers": attribution, "compat": {"supportsDeveloperRole": False},
-        "models": [{"id": args.gateway_model,
-                    "limit": {"context": args.context_limit, "output": args.output_limit}}],
-    }}}
-    with PiGatewayRelay(root) as relay, tempfile.TemporaryDirectory(prefix="skharness-arena-") as temp:
+    config = {
+        "providers": {
+            "skgw": {
+                "baseUrl": "ephemeral-loopback-relay",
+                "api": "openai-completions",
+                "apiKey": "not-recorded",
+                "headers": attribution,
+                "compat": {"supportsDeveloperRole": False},
+                "models": [
+                    {
+                        "id": args.gateway_model,
+                        "limit": {"context": args.context_limit, "output": args.output_limit},
+                    }
+                ],
+            }
+        }
+    }
+    with (
+        PiGatewayRelay(root) as relay,
+        tempfile.TemporaryDirectory(prefix="skharness-arena-") as temp,
+    ):
         # tempfile directories are 0700 by default, but the worker runs as UID
         # 10001 and must be able to traverse the read-only bind mount.
         Path(temp).chmod(0o755)
@@ -280,20 +383,34 @@ def live_qualification(args: argparse.Namespace) -> dict:
         config_path.write_text(json.dumps(runtime_config))
         config_path.chmod(0o444)
         docker_argv = [
-            "docker", "run", "--rm", "--network", "host",
-            "-e", args.gateway_api_key_env,
-            "-e", "PI_CODING_AGENT_DIR=/qualification", "-v",
-            f"{temp}:/qualification:ro", args.image, "sh", "-c",
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "host",
+            "-e",
+            args.gateway_api_key_env,
+            "-e",
+            "PI_CODING_AGENT_DIR=/qualification",
+            "-v",
+            f"{temp}:/qualification:ro",
+            args.image,
+            "sh",
+            "-c",
             f'exec pi -p "$1" --mode json --no-session --no-tools '
-            f'--model skgw/{args.gateway_model} '
+            f"--model skgw/{args.gateway_model} "
             f'--api-key "${args.gateway_api_key_env}"',
-            "qualify-arena", args.prompt,
+            "qualify-arena",
+            args.prompt,
         ]
         # Pi's JSON stream may exceed the evidence truncation limit. Parse the
         # complete stream, then retain only the structured terminal evidence.
         pi = command(docker_argv, truncate=False)
-    pi_captures = [capture for capture in relay.captures
-                   if capture["path"].split("?", 1)[0] == "/v1/chat/completions"]
+    pi_captures = [
+        capture
+        for capture in relay.captures
+        if capture["path"].split("?", 1)[0] == "/v1/chat/completions"
+    ]
     if len(pi_captures) != 1:
         raise RuntimeError(f"expected exactly one observed Pi completion, got {len(pi_captures)}")
     pi_capture = pi_captures[0]
@@ -303,19 +420,28 @@ def live_qualification(args: argparse.Namespace) -> dict:
             events.append(json.loads(line))
         except json.JSONDecodeError:
             continue
-    assistant = [event["message"] for event in events
-                 if event.get("type") == "message_end"
-                 and event.get("message", {}).get("role") == "assistant"]
+    assistant = [
+        event["message"]
+        for event in events
+        if event.get("type") == "message_end"
+        and event.get("message", {}).get("role") == "assistant"
+    ]
     message = assistant[-1] if assistant else {}
-    output = "".join(part.get("text", "") for part in message.get("content", [])
-                     if isinstance(part, dict))
+    output = "".join(
+        part.get("text", "") for part in message.get("content", []) if isinstance(part, dict)
+    )
     response_model = message.get("responseModel")
     if response_model is None:
-        response_model = next((event.get("responseModel") for event in reversed(events)
-                               if event.get("responseModel")), None)
+        response_model = next(
+            (
+                event.get("responseModel")
+                for event in reversed(events)
+                if event.get("responseModel")
+            ),
+            None,
+        )
     pi_attribution = pi_capture["headers"]
-    pi_served_model = (pi_attribution.get("x-sk-model-served")
-                       or relay_response_model(pi_capture))
+    pi_served_model = pi_attribution.get("x-sk-model-served") or relay_response_model(pi_capture)
     return {
         "gateway": gateway,
         "health": health,
@@ -324,24 +450,34 @@ def live_qualification(args: argparse.Namespace) -> dict:
         "pi_request_headers": attribution,
         "attribution": observed_headers,
         "attribution_source": "direct_openai_compatible_probe",
-        "pi_relay": {"transport": "ephemeral_loopback_http_forwarder",
-                     "upstream": gateway, "captured_requests": 1,
-                     "preserves_streaming": True},
+        "pi_relay": {
+            "transport": "ephemeral_loopback_http_forwarder",
+            "upstream": gateway,
+            "captured_requests": 1,
+            "preserves_streaming": True,
+        },
         "completion_status": completion["status"],
         "completion_body": completion["body"],
         "completion_model": completion["body"].get("model")
-        if isinstance(completion["body"], dict) else None,
-        "pi": {"exit_code": pi["exit_code"], "stderr": pi["stderr"],
-               "responseModel": response_model, "served_model": pi_served_model,
-               "attribution": pi_attribution,
-               "attribution_source": "ephemeral_loopback_relay_observation",
-               "completion_status": pi_capture["status"], "output": output},
+        if isinstance(completion["body"], dict)
+        else None,
+        "pi": {
+            "exit_code": pi["exit_code"],
+            "stderr": pi["stderr"],
+            "responseModel": response_model,
+            "served_model": pi_served_model,
+            "attribution": pi_attribution,
+            "attribution_source": "ephemeral_loopback_relay_observation",
+            "completion_status": pi_capture["status"],
+            "output": output,
+        },
     }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--arena-store", type=Path)
     parser.add_argument("--image", default="skharness-pi-core:card-84710bd5")
     parser.add_argument("--live-gateway", help="opt in to live SKGateway qualification")
     parser.add_argument("--gateway-api-key-env", default="SKGATEWAY_API_KEY")
@@ -349,6 +485,11 @@ def main() -> int:
     parser.add_argument("--session-id", default="arena-qualification")
     parser.add_argument("--card-id", default="qualification")
     parser.add_argument("--prompt", default="Return exactly: qualified")
+    parser.add_argument(
+        "--expected-output",
+        default="qualified",
+        help="frozen verifier-owned exact output (not a semantic rubric)",
+    )
     parser.add_argument("--context-limit", type=int, default=4096)
     parser.add_argument("--output-limit", type=int, default=256)
     args = parser.parse_args()
@@ -363,25 +504,47 @@ def main() -> int:
         root / "docker/sandbox/pi/sk-bridge.ts",
     ]
     checks = [
-        command(["python", "-m", "pytest", "tests/test_arena_qualification.py",
-                 "tests/test_arena_sk_backend.py", "tests/test_pi_mock_gateway_it.py",
-                 "tests/test_arena_verifier.py", "tests/test_arena_controller.py",
-                 "tests/test_arena_scheduler.py", "-q"]),
+        command(
+            [
+                "python",
+                "-m",
+                "pytest",
+                "tests/test_arena_qualification.py",
+                "tests/test_arena_sk_backend.py",
+                "tests/test_pi_mock_gateway_it.py",
+                "tests/test_arena_verifier.py",
+                "tests/test_arena_controller.py",
+                "tests/test_arena_scheduler.py",
+                "-q",
+            ]
+        ),
         command(["docker", "image", "inspect", args.image, "--format", "{{json .}}"]),
         command(["docker", "run", "--rm", args.image, "pi", "--version"]),
-        command([
-            "docker", "run", "--rm", args.image, "python", "-c",
-            "import importlib.metadata as m,json; "
-            "print(json.dumps(sorted((d.metadata['Name'],d.version) for d in m.distributions())))",
-        ]),
+        command(
+            [
+                "docker",
+                "run",
+                "--rm",
+                args.image,
+                "python",
+                "-c",
+                "import importlib.metadata as m,json; "
+                "print(json.dumps(sorted((d.metadata['Name'],d.version) for d in m.distributions())))",
+            ]
+        ),
         command(["docker", "run", "--rm", args.image, "dpkg-query", "-W"]),
     ]
     bundle = {
         "schema": "skharness.arena.qualification.v1",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "host": {"node": platform.node(), "platform": platform.platform()},
-        "claims": {"signed": False, "sbom": False, "vulnerability_scan": False,
-                   "live_gateway": False, "fleet_node": False},
+        "claims": {
+            "signed": False,
+            "sbom": False,
+            "vulnerability_scan": False,
+            "live_gateway": False,
+            "fleet_node": False,
+        },
         "files": {str(path.relative_to(root)): digest(path) for path in evidence_files},
         "checks": checks,
     }
@@ -390,6 +553,20 @@ def main() -> int:
             bundle["live_gateway"] = live_qualification(args)
             live = bundle["live_gateway"]
             live["records"] = immutable_execution_records(args, live)
+            from skharness.arena.qualification import qualify_execution_records
+            from skharness.arena.store import ArenaStore
+
+            store_root = args.arena_store or args.output.with_suffix(".arena-store")
+            live["verification"] = qualify_execution_records(
+                live["records"],
+                ArenaStore(store_root / "candidate"),
+                expected_output=args.expected_output,
+            )
+            live["planted_false_high_score"] = qualify_execution_records(
+                [planted_false_high_score(live["records"][1])],
+                ArenaStore(store_root / "adversarial-control"),
+                expected_output=args.expected_output,
+            )
             bundle["claims"]["live_gateway"] = (
                 live["health"]["status"] == 200
                 and live["models"]["status"] == 200
@@ -399,13 +576,18 @@ def main() -> int:
                 and live["pi"]["completion_status"] == 200
                 and bool(live["pi"]["served_model"])
                 and bool(live["pi"]["output"])
+                and live["verification"]["status"] == "valid"
+                and live["verification"]["admitted"]
+                and live["planted_false_high_score"]["status"] == "invalid"
+                and not live["planted_false_high_score"]["admitted"]
                 and bool(live["attribution"]["x-sk-backend"])
                 and bool(live["attribution"]["x-sk-model-served"])
-                and bool(live["attribution"]["x-sk-req-id"]
-                         or live["attribution"]["x-request-id"])
+                and bool(live["attribution"]["x-sk-req-id"] or live["attribution"]["x-request-id"])
                 and bool(live["pi"]["attribution"]["x-sk-backend"])
-                and bool(live["pi"]["attribution"]["x-sk-req-id"]
-                         or live["pi"]["attribution"]["x-request-id"])
+                and bool(
+                    live["pi"]["attribution"]["x-sk-req-id"]
+                    or live["pi"]["attribution"]["x-request-id"]
+                )
             )
         except Exception as exc:  # record a failed optional qualification truthfully
             bundle["live_gateway"] = {"error": f"{type(exc).__name__}: {exc}"}

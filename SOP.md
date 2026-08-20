@@ -211,6 +211,14 @@ Its default remains offline. Operators may add `--live-gateway URL` and provide 
 credential only through `SKGATEWAY_API_KEY` (or the environment-variable name selected
 by `--gateway-api-key-env`) to record health/models probes, redacted generated Pi
 configuration, gateway attribution, and the Pi container's response model and output.
+For the frozen transport gate, also pass `--expected-output VALUE` and optionally
+`--arena-store PATH`. The qualifier persists content-addressed Experiment/Result and
+assistant-output artifacts, independently repeats exact-output observations, and admits
+only the verified-valid Pi result to the Pareto frontier. It also executes a planted
+false-output result claiming score `999999999`; a live claim fails unless that control
+is invalid and excluded. This narrow gate proves execution, evidence, and admission
+plumbing only. It is not a semantic-quality evaluator and does not replace private,
+operator-owned challenge verification.
 
 The host-side `skharness-sk-backend` provides exact-schema SKCapstone/SKMemory and arena
 operations for the worker bridge. Arena/scratch writes are idempotent files; an

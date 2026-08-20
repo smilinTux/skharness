@@ -153,8 +153,8 @@ class ArenaStatusService:
     ) -> None:
         self.store = store
         self.scheduler = scheduler
-        self._experiments = experiments or (lambda: ())
-        self._results = results or (lambda: ())
+        self._experiments = experiments or (store.read_experiments if store else lambda: ())
+        self._results = results or (store.read_results if store else lambda: ())
         self._probes = {
             "store": self._store_probe,
             "skgateway": gateway_probe,
@@ -173,7 +173,9 @@ class ArenaStatusService:
         if self.store is None:
             return ProbeResult(None, "arena store not configured")
         self.store.read_all_events()
-        required_dirs = (self.store.events_dir, self.store.artifacts_dir, self.store.specs_dir)
+        required_dirs = (self.store.events_dir, self.store.artifacts_dir,
+                         self.store.specs_dir, self.store.experiments_dir,
+                         self.store.results_dir)
         unwritable = [str(path) for path in required_dirs if not os.access(path, os.W_OK)]
         if unwritable:
             return ProbeResult(False, "unwritable arena directories: " + ", ".join(unwritable))

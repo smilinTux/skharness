@@ -11,6 +11,11 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ### Fixed
 
+- Persisted live Arena Experiment/Result records and output artifacts by canonical hash,
+  then added an independent frozen exact-output gate whose verified-valid Pi result can
+  enter the Pareto frontier. Live qualification now executes a planted false output with
+  a claimed score of 999,999,999 and fails unless the verifier rejects and excludes it;
+  the gate is explicitly scoped to execution/evidence plumbing, not semantic quality.
 - Made Arena qualification evidence fail closed: live SKGateway claims now require
   attributed direct and Dockerized Pi requests, and supply-chain scans retain their
   reports but exit non-zero whenever any critical or high vulnerability is present.
