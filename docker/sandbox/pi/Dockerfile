@@ -2,7 +2,9 @@
 # Build context is the repository root; targets are pi-core and pi-polyglot.
 ARG NODE_IMAGE=node:24-trixie-slim@sha256:0711b541c1c33a8a530ac4f0d391baa9a15b3d804695b1b24a47daa5fb60e74d
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.9.27@sha256:143b40f4ab56a780f43377604702107b5a35f83a4453daf1e4be691358718a6a
+ARG GO_IMAGE=golang:1.26.6-bookworm@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36
 FROM ${UV_IMAGE} AS uv-tools
+FROM ${GO_IMAGE} AS go-tools
 FROM ${NODE_IMAGE} AS pi-node-builder
 
 ARG PI_VERSION=0.84.2
@@ -12,6 +14,11 @@ COPY docker/sandbox/pi/package.json docker/sandbox/pi/package-lock.json ./
 # remains in the builder, keeping its unrelated dependency tree out of runtime.
 RUN test "$(node -p "require('./package-lock.json').packages['node_modules/@earendil-works/pi-coding-agent'].version")" = "${PI_VERSION}" \
     && npm ci --ignore-scripts --omit=dev
+
+FROM ${NODE_IMAGE} AS npm-security-builder
+WORKDIR /build/npm-security
+COPY docker/sandbox/pi/npm-security/package.json docker/sandbox/pi/npm-security/package-lock.json ./
+RUN npm ci --ignore-scripts --omit=dev
 
 FROM ${NODE_IMAGE} AS pi-python-builder
 RUN apt-get update \
@@ -69,14 +76,24 @@ FROM pi-base AS pi-polyglot
 USER root
 COPY --from=pi-node-builder /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 COPY --from=uv-tools /uv /uvx /usr/local/bin/
+COPY --from=go-tools /usr/local/go /usr/local/go
+RUN rm -rf /usr/local/lib/node_modules/npm/node_modules/brace-expansion \
+       /usr/local/lib/node_modules/npm/node_modules/ip-address \
+       /usr/local/lib/node_modules/npm/node_modules/tar \
+       /usr/local/lib/node_modules/npm/node_modules/undici
+COPY --from=npm-security-builder /build/npm-security/node_modules/brace-expansion /usr/local/lib/node_modules/npm/node_modules/brace-expansion
+COPY --from=npm-security-builder /build/npm-security/node_modules/ip-address /usr/local/lib/node_modules/npm/node_modules/ip-address
+COPY --from=npm-security-builder /build/npm-security/node_modules/tar /usr/local/lib/node_modules/npm/node_modules/tar
+COPY --from=npm-security-builder /build/npm-security/node_modules/undici /usr/local/lib/node_modules/npm/node_modules/undici
 RUN apt-get update \
     && apt-get install -y --no-install-recommends cargo=1.85.0+dfsg3-1 \
-       golang-go=2:1.24~2 openjdk-21-jdk-headless=21.0.12+8-1~deb13u1 \
+       openjdk-21-jdk-headless=21.0.12+8-1~deb13u1 \
        pkg-config=1.8.1-4 rustc=1.85.0+dfsg3-1 \
     && ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 WORKDIR /work
+ENV PATH="/usr/local/go/bin:${PATH}"
 USER 10001:10001
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["pi", "--version"]

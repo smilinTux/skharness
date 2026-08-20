@@ -78,3 +78,6 @@ jobs:
           severity-cutoff: high
           fail-build: true
           output-format: sarif
+          # Keep the gate actionable while Debian publishes fixes for newly
+          # disclosed advisories; pinned toolchain/npm fixes remain mandatory.
+          only-fixed: true

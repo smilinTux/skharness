@@ -147,6 +147,13 @@ def test_image_manifest_pins_base_pi_and_two_targets():
     assert "ghcr.io/astral-sh/uv:0.9.27@sha256:" in dockerfile
     assert "COPY --from=uv-tools /uv /uvx /usr/local/bin/" in dockerfile
     assert "COPY --from=pi-node-builder /usr/local/lib/node_modules/npm" in dockerfile
+    assert "golang:1.26.6-bookworm@sha256:" in dockerfile
+    assert "COPY --from=go-tools /usr/local/go /usr/local/go" in dockerfile
+    assert "npm-security/package-lock.json" in dockerfile
+    assert "node_modules/brace-expansion" in dockerfile
+    assert "node_modules/ip-address" in dockerfile
+    assert "node_modules/tar" in dockerfile
+    assert "node_modules/undici" in dockerfile
     assert '].version")" = "${PI_VERSION}"' in dockerfile
     assert lock["npm"]["integrity"].startswith("sha512-")
 

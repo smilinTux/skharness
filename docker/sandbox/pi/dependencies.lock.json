@@ -13,10 +13,10 @@
   "python_test_tools": {"coverage": "7.13.4", "pytest": "9.0.2"},
   "polyglot": {
     "node": "24 from the immutable base image",
-    "npm": "transitive npm tree from the immutable base image",
+    "npm": "base-image npm with integrity-locked security overrides",
     "python": "3.13.5-1 from the pinned Debian image",
     "uv": "0.9.27@sha256:143b40f4ab56a780f43377604702107b5a35f83a4453daf1e4be691358718a6a",
-    "go": "distribution package from the pinned Debian image",
+    "go": "1.26.6 from golang@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36",
     "java": "openjdk-21-jdk-headless from the pinned Debian image",
     "rust": "rustc/cargo distribution packages from the pinned Debian image"
   },

@@ -241,8 +241,12 @@ blocked rather than passed.
 
 Tag pushes run `.github/workflows/pi-image.yml`: both targets are published to GHCR by
 immutable digest with BuildKit SBOM/provenance, keyless-signed using GitHub OIDC, and
-immediately signature-verified. A separate Anchore job fails on any High or Critical;
-publication or signing success cannot turn a failed vulnerability gate green.
+immediately signature-verified. A separate Anchore job fails on every High or Critical
+for which a vendor fix exists; unfixed distribution advisories stay visible in the
+signed evidence and are rechecked on every build. The polyglot image replaces Debian's
+stale Go package with a digest-pinned official toolchain and overlays npm's vulnerable
+bundled packages from a dedicated integrity lock. Publication or signing success cannot
+turn an actionable failed vulnerability gate green.
 
 Arena admission CPU and RAM reservations become Docker `--cpus`, `--memory`, and
 no-extra-swap cgroup limits. Both worker and egress proxy use read-only root filesystems,
