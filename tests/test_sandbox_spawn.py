@@ -15,6 +15,33 @@ def test_spawn_disabled_raises_when_not_live():
         Sandbox(live_execution=False).spawn(_spec(), repo_remote_host="github.com", ci_host=None)
 
 
+def test_proxy_readiness_retries_until_listening(monkeypatch):
+    results = iter([1, 1, 0])
+
+    def fake_run(argv, **kw):
+        class P:
+            returncode = next(results)
+            stdout = ""
+            stderr = ""
+        return P()
+
+    monkeypatch.setattr("skharness.autocode.sandbox.subprocess.run", fake_run)
+    Sandbox()._wait_for_proxy("proxy", attempts=3)
+
+
+def test_proxy_readiness_fails_closed_with_logs(monkeypatch):
+    def fake_run(argv, **kw):
+        class P:
+            returncode = 1
+            stdout = ""
+            stderr = "startup failed" if "logs" in argv else ""
+        return P()
+
+    monkeypatch.setattr("skharness.autocode.sandbox.subprocess.run", fake_run)
+    with pytest.raises(HarnessUnavailable, match="startup failed"):
+        Sandbox()._wait_for_proxy("proxy", attempts=2)
+
+
 def test_spawn_runs_container_and_tears_down(monkeypatch):
     calls = []
     def fake_run(argv, **kw):

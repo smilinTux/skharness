@@ -16,6 +16,7 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 
 from .claude_code import HarnessUnavailable
@@ -129,6 +130,27 @@ class Sandbox:
             raise HarnessUnavailable(
                 f"sandbox image {spec.image!r} not present; build it before live run (fail closed)")
 
+    def _wait_for_proxy(self, name: str, attempts: int = 50) -> None:
+        """Do not launch a worker until its only permitted egress route listens."""
+        probe = (
+            "import socket; s=socket.create_connection(('127.0.0.1', "
+            f"{PROXY_PORT}), 0.2); s.close()"
+        )
+        for _ in range(attempts):
+            ready = subprocess.run(
+                [self.docker, "exec", name, "python", "-c", probe],
+                capture_output=True, text=True,
+            )
+            if ready.returncode == 0:
+                return
+            time.sleep(0.1)
+        logs = subprocess.run(
+            [self.docker, "logs", "--tail", "20", name],
+            capture_output=True, text=True,
+        )
+        detail = (logs.stderr or logs.stdout or "proxy did not become ready").strip()
+        raise HarnessUnavailable(f"sandbox egress proxy unavailable (fail closed): {detail[:240]}")
+
     def spawn(self, spec: LaunchSpec, *, repo_remote_host=None, ci_host=None) -> dict:
         if not self.live_execution:
             raise HarnessUnavailable(
@@ -162,6 +184,7 @@ class Sandbox:
                 capture_output=True, text=True, check=True)
             subprocess.run([self.docker, "network", "connect", "bridge", proxy_name],
                            capture_output=True, text=True)          # give proxy outward egress
+            self._wait_for_proxy(proxy_name)
             run_kwargs = {"capture_output": True, "text": True, "cwd": spec.worktree,
                           "timeout": self.run_timeout}
             if spec.stdin is not None:
