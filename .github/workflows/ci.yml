@@ -89,6 +89,13 @@ jobs:
             echo "::error::the cross-repo round trip SKIPPED instead of running"
             exit 1
           fi
+      - name: Provision the pinned Pi CLI integration fixture
+        # The full suite includes a real Pi -> mock SKGateway contract. Reuse
+        # the image's integrity-pinned lockfile instead of relying on mutable
+        # globally installed runner state.
+        run: |
+          npm ci --ignore-scripts --omit=dev --prefix docker/sandbox/pi
+          echo "$GITHUB_WORKSPACE/docker/sandbox/pi/node_modules/.bin" >> "$GITHUB_PATH"
       - name: Full suite
         run: python -m pytest tests/ -q
 
