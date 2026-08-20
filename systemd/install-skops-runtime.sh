@@ -2,7 +2,11 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-skos_root="${SKOS_REPO:-$(dirname "$repo_root")/skos}"
+default_skos="$HOME/clawd/skos"
+if [[ ! -f "$default_skos/pyproject.toml" ]]; then
+    default_skos="$(dirname "$repo_root")/skos"
+fi
+skos_root="${SKOS_REPO:-$default_skos}"
 python_bin="${SKOPS_BOOTSTRAP_PYTHON:-$HOME/.pyenv/versions/3.12.3/bin/python}"
 venv="${SKOPS_VENV:-$HOME/.venvs/skops}"
 

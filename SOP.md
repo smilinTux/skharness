@@ -148,6 +148,9 @@ and desktop-audio packages must not be installed into it:
 ~/.venvs/skops/bin/python -m pip check
 ```
 
+The installer resolves `skos` at the fleet-standard `~/clawd/skos`, then falls back to
+a repository sibling; override explicitly with `SKOS_REPO=/absolute/path`.
+
 Distribution build (what CI's `build` job runs):
 
 ```bash
