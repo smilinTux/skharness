@@ -1,9 +1,8 @@
 {
   "schema": "skharness.pi-image-lock.v1",
   "base_image": {
-    "reference": "node:24-trixie-slim",
-    "index_digest": "sha256:0711b541c1c33a8a530ac4f0d391baa9a15b3d804695b1b24a47daa5fb60e74d",
-    "linux_amd64_manifest_digest": "sha256:f2925910482dc53394bc0034c5f4abffcd01de400794c050ca343fe0d733b486"
+    "reference": "cgr.dev/chainguard/wolfi-base:latest",
+    "index_digest": "sha256:bfcffaf1336b26a3fd33c8cb31a86a09324d2048420d7f49b983f323b0d33e8d"
   },
   "npm": {
     "package": "@earendil-works/pi-coding-agent",
@@ -12,17 +11,17 @@
   },
   "python_test_tools": {"coverage": "7.13.4", "pytest": "9.0.2"},
   "polyglot": {
-    "node": "24 from the immutable base image",
-    "npm": "transitive npm tree from the immutable base image",
-    "python": "3.13.5-1 from the pinned Debian image",
+    "node": "24.19.0-r0 from the pinned Wolfi repository package",
+    "npm": "12.0.2-r2 from the pinned Wolfi repository package",
+    "python": "3.13.15-r1 from the pinned Wolfi repository package",
     "uv": "0.9.27@sha256:143b40f4ab56a780f43377604702107b5a35f83a4453daf1e4be691358718a6a",
-    "go": "distribution package from the pinned Debian image",
-    "java": "openjdk-21-jdk-headless from the pinned Debian image",
-    "rust": "rustc/cargo distribution packages from the pinned Debian image"
+    "go": "1.27.0-r1 from the pinned Wolfi repository package",
+    "java": "OpenJDK 21.0.12.1-r0 from the pinned Wolfi repository package",
+    "rust": "rustc/cargo 1.97.1-r0 from the pinned Wolfi repository package"
   },
   "notes": [
     "The image digest and Pi package are immutable inputs.",
-    "Direct Debian package versions are pinned; transitive packages remain tied to the immutable base and repository state until an apt snapshot is pinned.",
+    "Direct Wolfi package versions and the base image digest are pinned.",
     "package-lock.json pins and integrity-checks the complete Pi npm dependency graph.",
     "The Python requirements lock is resolved for Python 3.13.",
     "SBOM generation, signing, and registry publication are release evidence, not lockfile claims."

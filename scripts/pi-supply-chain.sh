@@ -13,7 +13,10 @@ mkdir -p "$output_dir"
 image_id="$(docker image inspect "$image" --format '{{.Id}}')"
 printf '%s\n' "$image_id" >"$output_dir/image-id.txt"
 syft "$image" -o cyclonedx-json="$output_dir/sbom.cdx.json"
-grype "sbom:$output_dir/sbom.cdx.json" -o json >"$output_dir/vulnerabilities.json"
+vex_document="$(dirname "$0")/../docker/sandbox/pi/openvex.json"
+test -f "$vex_document" || { echo "missing required VEX document: $vex_document" >&2; exit 1; }
+grype "sbom:$output_dir/sbom.cdx.json" --vex "$vex_document" \
+  -o json >"$output_dir/vulnerabilities.json"
 python - "$output_dir/vulnerabilities.json" >"$output_dir/vulnerability-summary.json" <<'PY'
 import collections
 import json

@@ -1,0 +1,68 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "https://github.com/smilinTux/skharness/security/vex/pi-wolfi-2026-08-20",
+  "author": "SKHarness maintainers",
+  "timestamp": "2026-08-20T00:00:00Z",
+  "version": 1,
+  "statements": [
+    {
+      "vulnerability": {"name": "CVE-2019-1010022"},
+      "products": [{"@id": "pkg:apk/wolfi/glibc-2.43@2.43-r14"}],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "Upstream glibc, NVD, Debian, Ubuntu, and Red Hat dispute this as a security vulnerability; the worker also runs non-root with a read-only root filesystem."
+    },
+    {
+      "vulnerability": {"name": "CVE-2019-1010023"},
+      "products": [{"@id": "pkg:apk/wolfi/glibc-2.43@2.43-r14"}],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "The reported behavior requires running ldd on an attacker-supplied ELF; upstream treats it as a non-security bug and the worker does not expose ldd or an ldd execution path."
+    },
+    {
+      "vulnerability": {"name": "CVE-2026-5450"},
+      "products": [{"@id": "pkg:apk/wolfi/glibc-2.43@2.43-r14"}],
+      "status": "fixed",
+      "action_statement": "Wolfi glibc-2.43-r14 is built from release/2.43/master commit dae425b554207f7c4599c7fac707ad4c08545674, which contains upstream fix 4070d808bea1c077eb7e7d52b52b91cae98205d5."
+    },
+    {
+      "vulnerability": {"name": "CVE-2026-4046"},
+      "products": [{"@id": "pkg:apk/wolfi/glibc-2.43@2.43-r14"}],
+      "status": "fixed",
+      "action_statement": "The pinned Wolfi source commit contains upstream fix 8362e8ce10b24068bacc19552c128dd10e082fd9 and Wolfi removes the affected IBM1390/IBM1399 charsets."
+    },
+    {
+      "vulnerability": {"name": "CVE-2026-0861"},
+      "products": [{"@id": "pkg:apk/wolfi/glibc-2.43@2.43-r14"}],
+      "status": "fixed",
+      "action_statement": "The pinned Wolfi source commit contains upstream fix c9188d333717d3ceb7e3020011651f424f749f93."
+    },
+    {
+      "vulnerability": {"name": "CVE-2026-5928"},
+      "products": [{"@id": "pkg:apk/wolfi/glibc-2.43@2.43-r14"}],
+      "status": "fixed",
+      "action_statement": "The pinned Wolfi source commit contains upstream fix 2890b35cd361df2517525bf2c5f8c63f6f0d4a20."
+    },
+    {
+      "vulnerability": {"name": "CVE-2026-4437"},
+      "products": [{"@id": "pkg:apk/wolfi/glibc-2.43@2.43-r14"}],
+      "status": "fixed",
+      "action_statement": "The pinned Wolfi source commit contains upstream fix 5c6fca0c62ce5bd6e68e259f138097756cbafd4d."
+    },
+    {
+      "vulnerability": {"name": "CVE-2026-5435"},
+      "products": [{"@id": "pkg:apk/wolfi/glibc-2.43@2.43-r14"}],
+      "status": "fixed",
+      "action_statement": "The pinned Wolfi source commit contains upstream fix e64ae5a591f0604b7504df4df631857bb11cc78b."
+    },
+    {
+      "vulnerability": {"name": "CVE-2026-14456"},
+      "products": [
+        {"@id": "pkg:apk/wolfi/libcrypto3@3.6.3-r5"},
+        {"@id": "pkg:apk/wolfi/libssl3@3.6.3-r5"}
+      ],
+      "status": "fixed",
+      "action_statement": "Wolfi OpenSSL 3.6.3-r5 explicitly applies upstream fix 4084152e040329ca0194c4c1750b9b46d00a5b6b."
+    }
+  ]
+}

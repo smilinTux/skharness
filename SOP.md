@@ -178,8 +178,8 @@ placeholder like `0.1.dev1`. Every CI checkout therefore sets `fetch-depth: 0` a
 ./docker/sandbox/build.sh
 ```
 
-The Pi Dockerfile now has `pi-core` and `pi-polyglot` targets. The slim Trixie base
-image digest, exact Pi version, and complete npm transitive integrity lock are recorded in
+The Pi Dockerfile has `pi-core` and `pi-polyglot` targets. The Wolfi base image
+digest, exact direct APKs, exact Pi version, and complete npm transitive integrity lock are recorded in
 `docker/sandbox/pi/dependencies.lock.json`; both targets run as UID/GID `10001`, and
 `docker/sandbox/build.sh pi` deliberately builds `pi-core` as `sandbox-pi:1`.
 
@@ -197,12 +197,14 @@ the selected profile. A runtime controller must mount an absolute backend execut
 and set `SKHARNESS_SK_BRIDGE_BACKEND`; no backend credentials or sovereign agent home
 are baked into either image.
 
-Direct apt versions are pinned in `apt-packages.lock`; Python runtime and test
+Direct APK versions are pinned in `apt-packages.lock`; Python runtime and test
 dependencies are transitively pinned with hashes in `requirements.lock` and
 `test-requirements.lock`. `scripts/qualify-arena.py` emits an explicitly unsigned local
 evidence bundle, and `scripts/pi-supply-chain.sh` requires Syft and Grype to generate a
 CycloneDX SBOM and vulnerability report (optionally signing provenance with Cosign).
-The script retains its reports but exits non-zero for any critical or high match;
+The script applies the reviewed `docker/sandbox/pi/openvex.json`, retains its reports,
+and exits non-zero for every unaccounted Critical or High match. Each VEX statement is
+bound to an exact package PURL and upstream patch or supported not-affected evidence;
 generating an SBOM is never treated as a passing vulnerability gate. The core runtime
 omits npm, pip, setuptools, compilers, and test-only dependencies after its multi-stage
 build. Package inventory evidence uses Python package metadata rather than requiring a
@@ -228,20 +230,20 @@ operations for the worker bridge. Arena/scratch writes are idempotent files; an
 idempotency-key collision fails rather than overwriting evidence. Runtime launch still
 must mount this executable and scoped SK credentials/home explicitly.
 
-These are buildable and CPU-transport-qualified images, not production-qualified
-artifacts. Live qualification now observes distinct direct and Pi SKGateway request
-IDs, backend, gateway served-model header, Pi response model, and immutable unverified
-experiment/result records. The remediated core image is 511 MB and removed all npm and
-Python critical/high findings; its 2026-08-20 scan still fails closed on 40 critical
-and 82 high Debian findings for which Grype reports no available fixes. It therefore
-does not claim a passing vulnerability scan, signature, registry digest, or GPU E2E.
-The identical prior image digest completed a CPU Pi-to-SKGateway probe on `.41`, but
-`nvidia-smi` still cannot communicate with its driver, so GPU qualification remains
-blocked rather than passed.
+Fresh 2026-08-20 Wolfi builds are locally runtime-, confinement-, and vulnerability-
+qualified: core and polyglot each report zero unaccounted High/Critical Grype matches,
+and polyglot proves Node/npm, Python/uv, Go, Rust/Cargo, and Java. Live qualification
+observes distinct direct and Pi SKGateway request IDs, backend, served model, and
+immutable Experiment/Result records. `.41` is the Intel/iGPU fleet node; do not require
+NVIDIA telemetry there. `.100` is the RTX 5060 Ti GPU/model node and passed a real
+CUDA 13 Docker `nvidia-smi` probe (16,311 MiB VRAM, driver 580.173.02). Each release
+must still regenerate and verify its immutable registry digest, SBOM/provenance,
+signature, vulnerability report, and full Arena evidence bundle.
 
 Tag pushes run `.github/workflows/pi-image.yml`: both targets are published to GHCR by
 immutable digest with BuildKit SBOM/provenance, keyless-signed using GitHub OIDC, and
-immediately signature-verified. A separate Anchore job fails on any High or Critical;
+immediately signature-verified. A separate Anchore job consumes the reviewed OpenVEX
+document and fails on any remaining High or Critical;
 publication or signing success cannot turn a failed vulnerability gate green.
 
 Arena admission CPU and RAM reservations become Docker `--cpus`, `--memory`, and

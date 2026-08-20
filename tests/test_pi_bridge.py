@@ -146,7 +146,8 @@ def test_image_manifest_pins_base_pi_and_two_targets():
     assert "package-lock.json" in dockerfile
     assert "ghcr.io/astral-sh/uv:0.9.27@sha256:" in dockerfile
     assert "COPY --from=uv-tools /uv /uvx /usr/local/bin/" in dockerfile
-    assert "COPY --from=pi-node-builder /usr/local/lib/node_modules/npm" in dockerfile
+    polyglot = dockerfile.split("FROM pi-base AS pi-polyglot", 1)[1]
+    assert "npm-12=12.0.2-r2" in polyglot
     assert '].version")" = "${PI_VERSION}"' in dockerfile
     assert lock["npm"]["integrity"].startswith("sha512-")
 
@@ -155,16 +156,16 @@ def test_core_image_keeps_build_and_package_managers_out_of_runtime():
     root = Path(__file__).parents[1]
     dockerfile = (root / "docker/sandbox/pi/Dockerfile").read_text()
     package_lock = json.loads((root / "docker/sandbox/pi/package-lock.json").read_text())
-    runtime = dockerfile.split("FROM ${NODE_IMAGE} AS pi-base", 1)[1].split(
+    runtime = dockerfile.split("FROM ${WOLFI_IMAGE} AS pi-base", 1)[1].split(
         "FROM pi-base AS pi-core", 1
     )[0]
 
     assert "COPY --from=pi-node-builder" in runtime
     assert "COPY --from=pi-python-builder" in runtime
-    assert "build-essential" not in runtime
-    assert "python3-pip" not in runtime
+    assert "build-base" not in runtime
+    assert "py3.13-pip" not in runtime
     assert "test-requirements.lock" not in runtime
-    assert "/usr/local/lib/node_modules/npm" in runtime
+    assert "npm-12" not in runtime
     pi_package = package_lock["packages"]["node_modules/@earendil-works/pi-coding-agent"]
     assert pi_package["version"] == "0.84.2"
     assert (

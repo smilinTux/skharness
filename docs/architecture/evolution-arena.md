@@ -256,7 +256,8 @@ unbounded kitchen-sink image:
 
 ### `skharness-pi-core`
 
-- Debian trixie slim base pinned by index digest (with the amd64 manifest recorded);
+- Wolfi base pinned by index digest, with exact direct APK versions and a stable
+  non-root UID/GID contract;
   non-root UID/GID contract;
 - Pi npm package and its complete transitive graph pinned with lockfile/integrity;
 - git, ca-certificates, curl, `jq`, `rg`, `fd`, and process tools;
@@ -270,7 +271,9 @@ Native build dependencies, pip/setuptools, npm itself, and test-only Python tool
 exist only in builder/test stages. They are deliberately absent from `pi-core`; image
 qualification runs the repository's tests outside the published runtime and scans the
 final target. This reduces the attack surface without changing the fail-closed rule:
-any Critical or High Grype match still blocks qualification.
+any Critical or High Grype match still blocks qualification unless an OpenVEX
+statement binds the exact package PURL to a documented upstream fix or a supported
+not-affected determination. VEX is reviewed source evidence, not a severity waiver.
 
 ### `skharness-pi-polyglot`
 
@@ -280,17 +283,17 @@ that are read-only to ordinary jobs or isolated per experiment. Flutter/Android 
 GPU compiler stacks remain separate heavyweight variants; they must not inflate every
 worker startup.
 
-Implementation truth (repository audit, 2026-08-20): the Dockerfile pins the base
-image, Pi/npm graph, direct Debian packages, and hashed Python wheels, but the complete
-image acceptance criterion is not yet earned. `scripts/pi-supply-chain.sh` can produce
-an SBOM, vulnerability report, and optionally a signed provenance blob, but no generated
-SBOM, signature, registry digest, or publication verification is checked into or
-enforced by CI. Debian transitive resolution is not tied to a snapshot repository. The
-polyglot target installs Go/Rust/Java Debian packages, but does not install `uv`, and
-its npm availability is not established by the current Dockerfile after npm is removed
-from `pi-base`. Local mutable tags may also predate the current Dockerfile and therefore
-are not supply-chain evidence. Qualification must inspect a freshly built immutable
-digest and attach generated evidence before making any signed/SBOMed claim.
+Implementation truth (repository audit, 2026-08-20): the Dockerfile now pins a Wolfi
+base digest, exact direct APKs, the Pi/npm graph, and hashed Python wheels. Core omits
+package/build managers; polyglot supplies verified Node/npm, Python/uv, Go, Rust/Cargo,
+and Java toolchains. A fresh read-only local build passed runtime and confinement smoke.
+Syft plus Grype reported zero blocking Critical/High matches for both targets after
+applying the checked-in OpenVEX document: six glibc matches bind to fixes present in
+Wolfi's pinned upstream commit, two disputed 2019 glibc records are not exposed by the
+worker, and OpenSSL binds to Wolfi's explicit upstream fix. CI consumes the same VEX
+and still fails on every unaccounted High/Critical match. Registry publication,
+keyless signing, SBOM/provenance attestations, and immutable digest verification remain
+release evidence and must be regenerated for each tag.
 
 Preinstallation saves cold-start time, but mutability moves out of the image:
 
@@ -422,7 +425,8 @@ promotion.
 ### Sprint E: polyglot and GPU-node qualification
 
 Publish the polyglot variant and conduct failure-injection and reproducible E2E tests
-on `.41` and the designated GPU/model node. Capture image, driver, GPU, gateway,
+on `.41` (Intel/iGPU fleet execution) and `.100` (the designated RTX 5060 Ti
+GPU/model node). Capture image, driver, GPU, gateway,
 requested/served model and test evidence.
 
 ### Sprint F: optional trace/RL export

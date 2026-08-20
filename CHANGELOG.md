@@ -11,6 +11,13 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ### Fixed
 
+- Replaced the Pi worker's vulnerable Debian runtime graph with a digest-pinned Wolfi
+  base and exact APKs while preserving Node 24, Python 3.13, Pi 0.84.2, the scoped SK
+  bridge, and UID 10001. Core and polyglot now scan with zero unaccounted High/Critical
+  matches; reviewed OpenVEX statements bind generic CPE matches to exact upstream fixes
+  or supported not-affected evidence. Restored the complete polyglot npm/uv/Go/Rust/Java
+  toolchain and corrected fleet qualification: `.41` is Intel/iGPU, while `.100` passed
+  Docker GPU access on its RTX 5060 Ti.
 - Added two-worker live Pi qualification with distinct request/experiment identity and
   independent verification for every worker; hardened scheduler chaos/recovery,
   container-isolated verification, and refinement promotion evidence policy. Repaired

@@ -63,6 +63,7 @@ jobs:
       matrix:
         target: [pi-core, pi-polyglot]
     steps:
+      - uses: actions/checkout@v4
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -78,3 +79,4 @@ jobs:
           severity-cutoff: high
           fail-build: true
           output-format: sarif
+          vex: docker/sandbox/pi/openvex.json
