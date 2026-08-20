@@ -1,0 +1,4 @@
+# False positive: prose phrase "keyless signing" in the Arena architecture was
+# parsed as a generic key assignment. This fingerprint is commit/path/rule/line
+# specific and does not suppress any other finding.
+02941d3ff8031de339592af59c134d2e7702ab80:docs/architecture/evolution-arena.md:generic-api-key:295

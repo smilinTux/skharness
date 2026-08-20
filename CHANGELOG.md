@@ -21,6 +21,8 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 - Pinned the release vulnerability gate to Grype v0.116.1 so CI applies the same
   OpenVEX semantics proven by local qualification instead of scan-action's older
   bundled scanner.
+- Added one fingerprint-specific Gitleaks ignore for the prose phrase “keyless
+  signing”; full-history scanning remains enabled and every other finding still fails.
 - Added two-worker live Pi qualification with distinct request/experiment identity and
   independent verification for every worker; hardened scheduler chaos/recovery,
   container-isolated verification, and refinement promotion evidence policy. Repaired
