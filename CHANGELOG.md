@@ -9,6 +9,12 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ## [Unreleased]
 
+### Architecture
+
+- Replaced the malformed `88i9j0k1` farming plan with canonical epic `4aca533c`
+  and documented the production Pi execution plane plus reward-hack-resistant continual
+  improvement design in `docs/architecture/continual-harness.md`.
+
 ### Documentation
 
 - Added the complete T-shirt-sizing dispatch runbook: the stored `work_grade`

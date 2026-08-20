@@ -124,6 +124,11 @@ flowchart TD
 | `src/skharness/autocode/engineering.py` | The merge choke point: worktree, sandbox, grade, twin gate, `finalize()`. Nothing merges without passing through it. |
 | `src/skharness/autocode/buckets.py` | Mechanical, fail-closed mapping from a complete card `work_grade` to the SKGateway bucket id carried as the per-call model override. |
 
+Continual improvement and the production Pi execution image are governed by
+[`docs/architecture/continual-harness.md`](./docs/architecture/continual-harness.md).
+That design keeps execution, verification, refinement, and optional training as
+separately versioned planes and records the canonical coordination epic (`4aca533c`).
+
 ---
 
 ## 3. Build
@@ -605,4 +610,6 @@ checks:
     run: grep -qF 'if not self.supports_model_override()' src/skharness/autocode/adapters/base.py && grep -qF 'def supports_model_override(self) -> bool:' src/skharness/autocode/adapters/pi.py
   - name: ungraded work does not construct or attach a bucket
     run: grep -qF 'if grade is None:' src/skharness/autocode/buckets.py && grep -qF 'return None' src/skharness/autocode/buckets.py && grep -qF 'dispatch_model = self._dispatch_model(item)' src/skharness/autocode/engineering.py
+  - name: continual harness architecture and canonical epic remain discoverable
+    run: test -f docs/architecture/continual-harness.md && grep -qF 'Canonical epic: `4aca533c`' docs/architecture/continual-harness.md
 -->
