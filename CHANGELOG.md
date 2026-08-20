@@ -18,7 +18,7 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   or supported not-affected evidence. Restored the complete polyglot npm/uv/Go/Rust/Java
   toolchain and corrected fleet qualification: `.41` is Intel/iGPU, while `.100` passed
   Docker GPU access on its RTX 5060 Ti.
-- Pinned the release vulnerability gate to Grype 0.116.1 so CI applies the same
+- Pinned the release vulnerability gate to Grype v0.116.1 so CI applies the same
   OpenVEX semantics proven by local qualification instead of scan-action's older
   bundled scanner.
 - Added two-worker live Pi qualification with distinct request/experiment identity and
