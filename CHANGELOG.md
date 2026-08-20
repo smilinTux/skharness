@@ -9,6 +9,12 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ## [Unreleased]
 
+### Fixed
+
+- Made Arena qualification evidence fail closed: live SKGateway claims now require
+  attributed direct and Dockerized Pi requests, and supply-chain scans retain their
+  reports but exit non-zero whenever any critical or high vulnerability is present.
+
 ### Operations
 
 - Moved `skcode-hostd` from the mutable shared `.skenv` to the owned

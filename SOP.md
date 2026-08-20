@@ -202,6 +202,10 @@ dependencies are transitively pinned with hashes in `requirements.lock` and
 `test-requirements.lock`. `scripts/qualify-arena.py` emits an explicitly unsigned local
 evidence bundle, and `scripts/pi-supply-chain.sh` requires Syft and Grype to generate a
 CycloneDX SBOM and vulnerability report (optionally signing provenance with Cosign).
+Its default remains offline. Operators may add `--live-gateway URL` and provide the
+credential only through `SKGATEWAY_API_KEY` (or the environment-variable name selected
+by `--gateway-api-key-env`) to record health/models probes, redacted generated Pi
+configuration, gateway attribution, and the Pi container's response model and output.
 
 The host-side `skharness-sk-backend` provides exact-schema SKCapstone/SKMemory and arena
 operations for the worker bridge. Arena/scratch writes are idempotent files; an
