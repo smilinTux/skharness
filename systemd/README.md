@@ -11,7 +11,7 @@ stages the unit; the operator decides when to enable and start it.
 `src/skharness/serve.py`:
 
 ```
-%h/.skenv/bin/python -m skharness --host ${SKCODE_HOSTD_TAILSCALE_IP} --port 9394 --host-id ${SKCODE_HOSTD_HOST_ID}
+%h/.venvs/skops/bin/python -m skharness --host ${SKCODE_HOSTD_TAILSCALE_IP} --port 9394 --host-id ${SKCODE_HOSTD_HOST_ID}
 ```
 
 It owns one harness (the claude-code tmux adapter) and serves the capauth-gated
