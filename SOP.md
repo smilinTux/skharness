@@ -140,10 +140,12 @@ git clone https://github.com/smilinTux/skharness && cd skharness
 python -m pip install -e ".[dev]"
 ```
 
-Fleet installs go into the shared venv:
+Fleet service installs use the owned operational venv. ML, TTS, security tooling,
+and desktop-audio packages must not be installed into it:
 
 ```bash
-~/.skenv/bin/python -m pip install -e .
+./systemd/install-skops-runtime.sh
+~/.venvs/skops/bin/python -m pip check
 ```
 
 Distribution build (what CI's `build` job runs):
@@ -268,7 +270,7 @@ next patch tag. Verify the workflow-created tag before pulling nodes. On each no
 git -C ~/clawd/skcapstone-repos/skharness fetch --tags origin
 git -C ~/clawd/skcapstone-repos/skharness status --short
 git -C ~/clawd/skcapstone-repos/skharness pull --ff-only origin main
-~/.skenv/bin/python -m pip install -e ~/clawd/skcapstone-repos/skharness
+~/clawd/skcapstone-repos/skharness/systemd/install-skops-runtime.sh
 systemctl --user restart skcode-hostd
 systemctl --user is-active skcode-hostd
 ```
@@ -294,7 +296,7 @@ journalctl --user -u skcode-hostd -f
 Effective `ExecStart` on the deployed node (`noroc2027`):
 
 ```
-/home/cbrd21/.skenv/bin/python -m skharness --host ${SKCODE_HOSTD_TAILSCALE_IP} --port 9394 --host-id ${SKCODE_HOSTD_HOST_ID}
+/home/cbrd21/.venvs/skops/bin/python -m skharness --host ${SKCODE_HOSTD_TAILSCALE_IP} --port 9394 --host-id ${SKCODE_HOSTD_HOST_ID}
 ```
 
 Note that the deployed unit runs `python -m skharness` (`src/skharness/__main__.py`),
@@ -324,7 +326,7 @@ Unit hardening shipped in `systemd/skcode-hostd.service`: `NoNewPrivileges=true`
 
 ```bash
 systemctl --user stop skcode-hostd                     # immediate: the surface goes away
-~/.skenv/bin/python -m pip install -e .                # reinstall from a known-good checkout
+./systemd/install-skops-runtime.sh                    # rebuild the owned runtime
 systemctl --user restart skcode-hostd
 ```
 
@@ -534,6 +536,7 @@ verdict, not an exception.
 | An ungraded card uses a bucket | This is a defect. `bucket_for_payload()` must return `None`, leaving the adapter's static sovereign model unchanged. `sk-s-secret` exists only as an explicit future floor, not the default path. |
 | Daemon OOM-killed or the whole cgroup died | `resource-limits.conf` did its job (`MemoryMax=8G`, `OOMPolicy=kill`). Inspect the build that ran away before raising the limit. |
 | Installed unit does not match the repo | `./systemd/install.sh --diff`. Remember drop-ins are separate files: read `systemctl --user cat skcode-hostd` for the effective unit. |
+| `pip install` reports Click/Typer conflicts | Effective `ExecStart` must name `~/.venvs/skops/bin/python`; rebuild with `install-skops-runtime.sh` and run its `pip check`. Do not repair it by changing ML packages. |
 
 ---
 
@@ -591,7 +594,9 @@ checks:
   - name: wildcard bind is still refused in code
     run: grep -q '_WILDCARD = {"0.0.0.0", "::"}' src/skharness/serve.py && grep -q 'refuses to bind a wildcard/public address' src/skharness/serve.py
   - name: shipped unit ExecStart still matches the documented invocation
-    run: grep -qF 'ExecStart=%h/.skenv/bin/python -m skharness --host ${SKCODE_HOSTD_TAILSCALE_IP} --port 9394 --host-id ${SKCODE_HOSTD_HOST_ID}' systemd/skcode-hostd.service
+    run: grep -qF 'ExecStart=%h/.venvs/skops/bin/python -m skharness --host ${SKCODE_HOSTD_TAILSCALE_IP} --port 9394 --host-id ${SKCODE_HOSTD_HOST_ID}' systemd/skcode-hostd.service
+  - name: owned runtime installer carries capauth and checks both CLIs
+    run: grep -qF 'service = ["capauth>=0.3.1,<0.4"]' pyproject.toml && grep -qF 'python" -m pip check' systemd/install-skops-runtime.sh && grep -qF 'bin/skos" --help' systemd/install-skops-runtime.sh
   - name: the documented write surface actually exists
     run: grep -q '@app.post("/api/v1/sessions/{sid}/inject")' src/skharness/daemon.py && grep -q '@app.post("/api/v1/dispatch")' src/skharness/daemon.py
   - name: scope split constants match the documented scope names

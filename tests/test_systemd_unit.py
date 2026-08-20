@@ -29,6 +29,7 @@ def test_unit_is_valid_ini_with_expected_sections() -> None:
 
 def test_execstart_uses_port_9394_and_module_invocation() -> None:
     exec_start = _parse_unit()["Service"]["ExecStart"]
+    assert exec_start.startswith("%h/.venvs/skops/bin/python ")
     assert "-m skharness" in exec_start
     assert "--port 9394" in exec_start
     assert "--host-id" in exec_start

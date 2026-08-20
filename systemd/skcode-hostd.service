@@ -37,7 +37,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h
 # --host is sourced from the env file; serve.py refuses a wildcard/public bind.
-ExecStart=%h/.skenv/bin/python -m skharness --host ${SKCODE_HOSTD_TAILSCALE_IP} --port 9394 --host-id ${SKCODE_HOSTD_HOST_ID}
+ExecStart=%h/.venvs/skops/bin/python -m skharness --host ${SKCODE_HOSTD_TAILSCALE_IP} --port 9394 --host-id ${SKCODE_HOSTD_HOST_ID}
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
@@ -50,7 +50,7 @@ SyslogIdentifier=skcode-hostd
 EnvironmentFile=%h/.config/skcode-hostd/skcode-hostd.env
 
 Environment=PYTHONUNBUFFERED=1
-Environment=PATH=%h/.skenv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=%h/.venvs/skops/bin:/usr/local/bin:/usr/bin:/bin
 
 # Standard sk hardening. ProtectHome=read-only with explicit ReadWritePaths for
 # the two dirs the daemon persists into (session registry + transcripts).

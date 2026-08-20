@@ -9,6 +9,13 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ## [Unreleased]
 
+### Operations
+
+- Moved `skcode-hostd` from the mutable shared `.skenv` to the owned
+  `~/.venvs/skops` runtime. Added an idempotent installer, a service extra for
+  the real CapAuth verifier, CLI smoke checks, and a mandatory `pip check` so
+  ML/TTS package churn cannot silently invalidate the operational daemon.
+
 ### Architecture
 
 - Replaced the malformed `88i9j0k1` farming plan with canonical epic `4aca533c`
