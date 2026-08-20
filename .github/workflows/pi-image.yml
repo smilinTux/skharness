@@ -14,6 +14,7 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         target: [pi-core, pi-polyglot]
     steps:
@@ -50,14 +51,15 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: >-
           cosign verify "$IMAGE@$DIGEST"
-          --certificate-identity-regexp
-          "^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/pi-image.yml@refs/tags/v"
+          --certificate-identity
+          "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/pi-image.yml@${GITHUB_REF}"
           --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
 
   vulnerability-gate:
     needs: publish
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         target: [pi-core, pi-polyglot]
     steps:
