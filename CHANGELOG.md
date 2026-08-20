@@ -9,6 +9,8 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ## [Unreleased]
 
+## [0.3.28] - 2026-08-20
+
 ### Fixed
 
 - Replaced the Pi worker's vulnerable Debian runtime graph with a digest-pinned Wolfi
@@ -23,6 +25,10 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   bundled scanner.
 - Added one fingerprint-specific Gitleaks ignore for the prose phrase “keyless
   signing”; full-history scanning remains enabled and every other finding still fails.
+- Pinned the CI Ruff install to the locally qualified 0.15.4 release so lint results
+  cannot change because an unrelated upstream release was published.
+- Corrected Arena lease renewal to derive its interval from the configured TTL; short
+  leases can no longer expire before a fixed 50 ms heartbeat floor wakes up.
 - Added two-worker live Pi qualification with distinct request/experiment identity and
   independent verification for every worker; hardened scheduler chaos/recovery,
   container-isolated verification, and refinement promotion evidence policy. Repaired

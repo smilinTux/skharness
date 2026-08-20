@@ -372,6 +372,19 @@ systemctl --user is-active skcode-hostd
 Stop before pull when the checkout is dirty; never overwrite node-local work to make a
 deployment look clean.
 
+The two current qualification targets have deliberately different roles. Do not infer
+GPU capability from an address or reuse one node's readiness criteria for the other:
+
+| Node | Hardware role | Required deployment validation |
+|---|---|---|
+| `192.168.0.41` | Intel CPU/iGPU control and service node | Fast-forward GitHub pull, owned-runtime install, affected-service restart, liveness/readiness, and Intel/iGPU-safe execution. NVIDIA telemetry is optional and must not gate readiness. |
+| `192.168.0.100` | NVIDIA RTX 5060 Ti 16 GiB model/GPU node | Fast-forward GitHub pull, exact signed image digest, affected-service restart, `nvidia-smi`/container GPU visibility, attributed SKGateway model response, and bounded-concurrency evidence. |
+
+Record the pre-deploy commit, post-deploy commit/tag, effective unit or image digest,
+restart result, and health evidence. A code pull alone is not a deployment. If either
+node is dirty, unreachable, cannot fast-forward, or fails readiness, leave the prior
+service running where safe and open/update an incident with the observed evidence.
+
 ### Service deploy (`skcode-hostd`)
 
 The unit is a **systemd user unit**, installed from the repo and never auto-started.

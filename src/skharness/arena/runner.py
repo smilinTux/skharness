@@ -231,41 +231,60 @@ class PiExperimentRunner:
         admission = self.controller.admit(request, attempt_number=attempt)
         if not admission.admitted or admission.duplicate:
             return admission
-        resources = request.resources
-        spec = replace(
-            spec,
-            cpu_limit=resources.cpu if resources.cpu > 0 else None,
-            memory_gb_limit=resources.ram_gb if resources.ram_gb > 0 else None,
-        )
-        directory = self._attempt_dir(request.experiment_id, attempt)
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / "run.json").write_text(
-            json.dumps(
-                {
-                    "experiment_id": request.experiment_id,
-                    "attempt": attempt,
-                    "lease_id": admission.lease.lease_id,
-                    "state": "admitted",
-                },
-                sort_keys=True,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        self.controller.running(request.experiment_id, attempt)
         heartbeat_stop = threading.Event()
         lease_lost = threading.Event()
 
         def _heartbeat() -> None:
-            interval = max(0.05, self.controller.scheduler.lease_ttl_s / 3)
+            # Heartbeat at one third of the configured TTL. A fixed lower bound
+            # can exceed short test/edge TTLs and allow the lease to expire before
+            # its first renewal. The scheduler already requires a positive TTL;
+            # cap only the *upper* interval so long production TTLs still receive
+            # periodic liveness evidence.
+            interval = min(10.0, self.controller.scheduler.lease_ttl_s / 3)
             while not heartbeat_stop.wait(interval):
                 if not self.controller.heartbeat(request.experiment_id, attempt):
                     lease_lost.set()
                     self.supervisor.cancel()
                     return
 
+        # Admission itself starts the TTL. Begin renewal before durable run-file
+        # and RUNNING-event fsyncs, which can legitimately exceed a very short TTL
+        # on a busy or slow disk.
         heartbeat = threading.Thread(target=_heartbeat, name="arena-lease-heartbeat", daemon=True)
         heartbeat.start()
+        try:
+            resources = request.resources
+            spec = replace(
+                spec,
+                cpu_limit=resources.cpu if resources.cpu > 0 else None,
+                memory_gb_limit=resources.ram_gb if resources.ram_gb > 0 else None,
+            )
+            directory = self._attempt_dir(request.experiment_id, attempt)
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "run.json").write_text(
+                json.dumps(
+                    {
+                        "experiment_id": request.experiment_id,
+                        "attempt": attempt,
+                        "lease_id": admission.lease.lease_id,
+                        "state": "admitted",
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            self.controller.running(request.experiment_id, attempt)
+        except Exception:
+            heartbeat_stop.set()
+            heartbeat.join(timeout=1)
+            self.controller.cancel(
+                request.experiment_id,
+                attempt,
+                stop=self.supervisor.cancel,
+                payload={"reason": "preparation_failed"},
+            )
+            raise
         try:
             exit_code, classification = self.supervisor.run(spec, directory, timeout_s)
         except Exception as exc:

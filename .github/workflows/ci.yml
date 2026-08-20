@@ -34,7 +34,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install ruff
+      # Keep the lint gate reproducible: a new Ruff release must not change
+      # main's result without a reviewed dependency update.
+      - run: pip install "ruff==0.15.4"
       - run: ruff check src/ tests/
 
   test:

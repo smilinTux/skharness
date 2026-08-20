@@ -172,7 +172,9 @@ def test_duplicate_delivery_does_not_spawn_a_second_pi_process(tmp_path):
 
 
 def test_long_running_attempt_heartbeats_its_lease(tmp_path):
-    scheduler = LeaseScheduler(ResourceRequest(cpu=2, ram_gb=4, gateway_slots=2), lease_ttl_s=0.09)
+    # Keep a clear heartbeat-vs-runtime relationship without relying on a
+    # sub-100 ms host scheduling deadline (which is flaky under parallel CI/load).
+    scheduler = LeaseScheduler(ResourceRequest(cpu=2, ram_gb=4, gateway_slots=2), lease_ttl_s=0.3)
     controller = _controller(tmp_path, scheduler)
     controller.propose("experiment")
     calls = []
@@ -186,7 +188,7 @@ def test_long_running_attempt_heartbeats_its_lease(tmp_path):
 
     class SlowSupervisor(ScriptedSupervisor):
         def run(self, spec, attempt_dir, timeout_s):
-            time.sleep(0.12)
+            time.sleep(0.45)
             return super().run(spec, attempt_dir, timeout_s)
 
     outcome = PiExperimentRunner(controller, SlowSupervisor(), tmp_path / "runs").execute(
