@@ -79,4 +79,5 @@ jobs:
           severity-cutoff: high
           fail-build: true
           output-format: sarif
+          grype-version: 0.116.1
           vex: docker/sandbox/pi/openvex.json
