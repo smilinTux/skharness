@@ -19,10 +19,12 @@ from skharness.arena.collaboration import (
     NegativeKnowledgeIndex,
     PositiveEvidence,
     RefinementEvent,
+    RefinementEvidenceKind,
     RefinementJournal,
     RefinementProposal,
     RefinementScope,
     RefinementState,
+    RefinementTargetKind,
     evidence_id,
 )
 from skharness.arena.lineage import LineageGraph
@@ -71,6 +73,7 @@ from skharness.arena.verifier import (
     VerificationStatus,
     VerificationVerdict,
 )
+from skharness.arena.verifier_boundary import IsolatedVerifierBoundary
 
 __all__ = [
     "ArenaStore",
@@ -93,6 +96,7 @@ __all__ = [
     "ExperimentState",
     "ExecutableRuntimeBackend",
     "IndependentVerifier",
+    "IsolatedVerifierBoundary",
     "LineageGraph",
     "Measurement",
     "MetricDirection",
@@ -114,10 +118,12 @@ __all__ = [
     "RuntimeSKMemoryAdapter",
     "SandboxProcessSupervisor",
     "RefinementEvent",
+    "RefinementEvidenceKind",
     "RefinementJournal",
     "RefinementProposal",
     "RefinementScope",
     "RefinementState",
+    "RefinementTargetKind",
     "TrialEvidence",
     "VerificationPolicy",
     "VerificationStatus",

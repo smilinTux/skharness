@@ -5,6 +5,7 @@ and a JSON object to ``skharness-pi-bridge``; this policy layer authorizes the o
 before a configured backend sees it.  It never evaluates a shell string and it never
 turns an arbitrary MCP method name into authority.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -38,28 +39,60 @@ PI_PROFILES: Mapping[str, PiCapabilityProfile] = {
     "arena-build": PiCapabilityProfile(
         "arena-build",
         ("read", "edit", "write", "bash", "grep", "find", "ls"),
-        frozenset({"capstone.card.read", "arena.experiment.search",
-                   "arena.experiment.reproduce", "arena.experiment.mutate",
-                   "arena.negative.search", "arena.progress.append", "arena.result.append",
-                   "memory.recall", "memory.scratch.append"}),
+        frozenset(
+            {
+                "capstone.card.read",
+                "arena.experiment.search",
+                "arena.experiment.reproduce",
+                "arena.experiment.mutate",
+                "arena.negative.search",
+                "arena.progress.append",
+                "arena.result.append",
+                "memory.recall",
+                "memory.scratch.append",
+            }
+        ),
     ),
     "arena-verify": PiCapabilityProfile(
-        "arena-verify", ("read", "bash", "grep", "find", "ls"),
+        "arena-verify",
+        ("read", "bash", "grep", "find", "ls"),
         frozenset({"capstone.card.read", "arena.verdict.append"}),
     ),
     "project-full": PiCapabilityProfile(
         "project-full",
         ("read", "edit", "write", "bash", "grep", "find", "ls"),
-        frozenset({"capstone.card.read", "capstone.card.claim", "capstone.progress.append",
-                   "arena.experiment.search", "arena.experiment.reproduce",
-                   "arena.experiment.mutate", "arena.negative.search",
-                   "arena.result.append", "memory.recall", "memory.scratch.append",
-                   "memory.proposal.append"}),
+        frozenset(
+            {
+                "capstone.card.read",
+                "capstone.card.claim",
+                "capstone.progress.append",
+                "arena.experiment.search",
+                "arena.experiment.reproduce",
+                "arena.experiment.mutate",
+                "arena.negative.search",
+                "arena.result.append",
+                "memory.recall",
+                "memory.scratch.append",
+                "memory.proposal.append",
+            }
+        ),
     ),
     # Empty by construction: operator authority must arrive as an explicit,
     # CapAuth-approved operation set at launch, never as a baked image default.
     "operator": PiCapabilityProfile("operator", (), frozenset()),
 }
+
+# Load-bearing negative authority for the untrusted build worker. These names are
+# deliberately canonical even though no backend implements them: adding one to a
+# profile later must break the profile contract test rather than silently widening it.
+ARENA_BUILD_PROHIBITIONS = frozenset(
+    {
+        "capstone.card.complete",
+        "arena.hidden_tests.read",
+        "memory.promote",
+        "gateway.policy.update",
+    }
+)
 
 
 class ScopedPiBridge:
@@ -73,12 +106,16 @@ class ScopedPiBridge:
     def invoke(self, operation: str, payload: object) -> dict:
         if operation not in self.profile.sk_operations:
             raise BridgeDeniedError(
-                f"operation {operation!r} is not granted by profile {self.profile.name!r}")
+                f"operation {operation!r} is not granted by profile {self.profile.name!r}"
+            )
         if not _TOKEN.fullmatch(operation):
             raise BridgeDeniedError("operation is not a safe canonical token")
         if not isinstance(payload, dict):
             raise BridgeDeniedError("bridge payload must be a JSON object")
-        result = self.backend(operation, payload)
+        try:
+            result = self.backend(operation, payload)
+        except PermissionError as exc:
+            raise BridgeDeniedError(f"SK backend authorization denied: {exc}") from exc
         if not isinstance(result, dict):
             raise RuntimeError("SK bridge backend returned a non-object response")
         return result
@@ -93,12 +130,21 @@ def _exec_backend(operation: str, payload: dict) -> dict:
     executable = os.environ.get("SKHARNESS_SK_BRIDGE_BACKEND")
     if not executable or not os.path.isabs(executable):
         raise RuntimeError("SKHARNESS_SK_BRIDGE_BACKEND must name an absolute mounted executable")
-    proc = subprocess.run(
-        [executable, operation], input=json.dumps(payload), text=True,
-        capture_output=True, timeout=30, check=False,
-    )
+    try:
+        proc = subprocess.run(
+            [executable, operation],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"SK bridge backend could not start: {type(exc).__name__}") from exc
     if proc.returncode:
-        raise RuntimeError(f"SK bridge backend failed with exit {proc.returncode}: {proc.stderr[:500]}")
+        # Backend stderr may contain credential-provider diagnostics. Authority
+        # failure is observable by exit code without reflecting secret-bearing text.
+        raise RuntimeError(f"SK bridge backend failed with exit {proc.returncode}")
     try:
         value = json.loads(proc.stdout)
     except json.JSONDecodeError as exc:

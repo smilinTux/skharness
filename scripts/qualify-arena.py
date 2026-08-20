@@ -328,6 +328,25 @@ def planted_false_high_score(record: dict) -> dict:
     return planted
 
 
+def independent_workers_valid(workers: list[dict], required: int) -> bool:
+    """Require distinct, attributed, independently verified Pi executions."""
+    if len(workers) != required:
+        return False
+    request_ids = {worker.get("request_id") for worker in workers}
+    experiment_hashes = {worker.get("record", {}).get("experiment_hash") for worker in workers}
+    if None in request_ids or len(request_ids) != required:
+        return False
+    if None in experiment_hashes or len(experiment_hashes) != required:
+        return False
+    return all(
+        worker.get("backend")
+        and worker.get("served_model")
+        and worker.get("verification", {}).get("status") == "valid"
+        and worker.get("verification", {}).get("admitted") is True
+        for worker in workers
+    )
+
+
 def live_qualification(args: argparse.Namespace) -> dict:
     api_key = os.environ.get(args.gateway_api_key_env)
     if not api_key:
@@ -484,6 +503,12 @@ def main() -> int:
     parser.add_argument("--gateway-api-key-env", default="SKGATEWAY_API_KEY")
     parser.add_argument("--gateway-model", default="reference")
     parser.add_argument("--session-id", default="arena-qualification")
+    parser.add_argument(
+        "--pi-workers",
+        type=int,
+        default=2,
+        help="independent Dockerized Pi executions required for the live gate",
+    )
     parser.add_argument("--card-id", default="qualification")
     parser.add_argument("--prompt", default="Return exactly: qualified")
     parser.add_argument(
@@ -494,6 +519,8 @@ def main() -> int:
     parser.add_argument("--context-limit", type=int, default=4096)
     parser.add_argument("--output-limit", type=int, default=256)
     args = parser.parse_args()
+    if args.pi_workers < 2:
+        parser.error("--pi-workers must be at least 2 for Arena fleet qualification")
     root = Path(__file__).resolve().parents[1]
     evidence_files = [
         root / "tests/data/arena-reference-challenge-v1.json",
@@ -563,6 +590,39 @@ def main() -> int:
                 ArenaStore(store_root / "candidate"),
                 expected_output=args.expected_output,
             )
+            live["independent_workers"] = [
+                {
+                    "session_id": args.session_id,
+                    "record": live["records"][1],
+                    "verification": live["verification"],
+                    "request_id": live["pi"]["attribution"].get("x-sk-req-id")
+                    or live["pi"]["attribution"].get("x-request-id"),
+                    "backend": live["pi"]["attribution"].get("x-sk-backend"),
+                    "served_model": live["pi"]["served_model"],
+                }
+            ]
+            for worker_index in range(1, args.pi_workers):
+                worker_args = deepcopy(args)
+                worker_args.session_id = f"{args.session_id}:worker-{worker_index + 1}"
+                worker_live = live_qualification(worker_args)
+                worker_records = immutable_execution_records(worker_args, worker_live)
+                worker_verification = qualify_execution_records(
+                    worker_records,
+                    ArenaStore(store_root / f"candidate-worker-{worker_index + 1}"),
+                    expected_output=args.expected_output,
+                )
+                live["independent_workers"].append(
+                    {
+                        "session_id": worker_args.session_id,
+                        "record": worker_records[1],
+                        "verification": worker_verification,
+                        "request_id": worker_live["pi"]["attribution"].get("x-sk-req-id")
+                        or worker_live["pi"]["attribution"].get("x-request-id"),
+                        "backend": worker_live["pi"]["attribution"].get("x-sk-backend"),
+                        "served_model": worker_live["pi"]["served_model"],
+                        "output": worker_live["pi"]["output"],
+                    }
+                )
             live["planted_false_high_score"] = qualify_execution_records(
                 [planted_false_high_score(live["records"][1])],
                 ArenaStore(store_root / "adversarial-control"),
@@ -589,6 +649,7 @@ def main() -> int:
                     live["pi"]["attribution"]["x-sk-req-id"]
                     or live["pi"]["attribution"]["x-request-id"]
                 )
+                and independent_workers_valid(live["independent_workers"], args.pi_workers)
             )
         except Exception as exc:  # record a failed optional qualification truthfully
             bundle["live_gateway"] = {"error": f"{type(exc).__name__}: {exc}"}

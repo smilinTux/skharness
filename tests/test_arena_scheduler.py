@@ -22,8 +22,9 @@ def request(key="key", attempt="a", *, gpu=0, gateway=1):
         experiment_id="experiment",
         attempt_id=attempt,
         idempotency_key=key,
-        resources=ResourceRequest(cpu=1, ram_gb=2, gpu=gpu, vram_gb=8 if gpu else 0,
-                                  gateway_slots=gateway),
+        resources=ResourceRequest(
+            cpu=1, ram_gb=2, gpu=gpu, vram_gb=8 if gpu else 0, gateway_slots=gateway
+        ),
     )
 
 
@@ -39,6 +40,35 @@ def test_admission_reserves_capacity_and_rejects_overload():
     assert not second.admitted
     assert second.reason == AdmissionReason.CAPACITY
     assert scheduler.snapshot()["active_leases"] == 1
+
+
+def test_each_declared_admission_dimension_fails_closed_with_an_exact_reason():
+    capacity = ResourceRequest(
+        cpu=2,
+        ram_gb=4,
+        gpu=1,
+        vram_gb=8,
+        gateway_slots=2,
+        budget_units=10,
+        verifier_slots=1,
+    )
+    requests = {
+        "cpu": ResourceRequest(cpu=3),
+        "ram_gb": ResourceRequest(ram_gb=5),
+        "gpu": ResourceRequest(gpu=2),
+        "vram_gb": ResourceRequest(vram_gb=9),
+        "gateway_slots": ResourceRequest(gateway_slots=3),
+        "budget_units": ResourceRequest(budget_units=11),
+        "verifier_slots": ResourceRequest(verifier_slots=2),
+    }
+    for dimension, resources in requests.items():
+        scheduler = LeaseScheduler(capacity)
+        admission = scheduler.admit(
+            AttemptRequest("challenge", "experiment", "1", dimension, resources)
+        )
+        assert not admission.admitted
+        assert admission.reason is AdmissionReason.CAPACITY
+        assert dimension in admission.blocked_resources
 
 
 def test_duplicate_delivery_returns_same_active_lease():

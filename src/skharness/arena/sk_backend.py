@@ -3,6 +3,7 @@
 The worker invokes this executable through a runtime mount.  Imports of SK packages
 remain host-side; no agent home or board is copied into the worker image.
 """
+
 from __future__ import annotations
 
 import json
@@ -19,19 +20,30 @@ class BackendInputError(ValueError):
     """An operation payload failed its exact schema."""
 
 
-BACKEND_OPERATIONS = frozenset({
-    "capstone.card.read", "capstone.card.claim", "capstone.progress.append",
-    "arena.progress.append", "arena.result.append", "arena.verdict.append",
-    "arena.experiment.search", "arena.experiment.reproduce", "arena.experiment.mutate",
-    "arena.negative.search",
-    "memory.recall", "memory.scratch.append", "memory.proposal.append",
-})
+BACKEND_OPERATIONS = frozenset(
+    {
+        "capstone.card.read",
+        "capstone.card.claim",
+        "capstone.progress.append",
+        "arena.progress.append",
+        "arena.result.append",
+        "arena.verdict.append",
+        "arena.experiment.search",
+        "arena.experiment.reproduce",
+        "arena.experiment.mutate",
+        "arena.negative.search",
+        "memory.recall",
+        "memory.scratch.append",
+        "memory.proposal.append",
+    }
+)
 
 
 def _keys(payload: dict, required: set[str], optional: set[str] = set()) -> None:
     if set(payload) - required - optional or not required <= set(payload):
         raise BackendInputError(
-            f"payload keys must be required={sorted(required)}, optional={sorted(optional)}")
+            f"payload keys must be required={sorted(required)}, optional={sorted(optional)}"
+        )
 
 
 def _jsonable(value):
@@ -81,12 +93,16 @@ class LocalSKBackend:
 
     def _board(self):
         from skcapstone.coordination import Board
+
         return Board(self.capstone_home)
 
     def card_read(self, payload: dict) -> dict:
         _keys(payload, {"card_id"})
-        matches = [task for task in self._board().load_tasks(include_archived=True)
-                   if task.id == payload["card_id"]]
+        matches = [
+            task
+            for task in self._board().load_tasks(include_archived=True)
+            if task.id == payload["card_id"]
+        ]
         return {"found": bool(matches), "card": _jsonable(matches[0]) if matches else None}
 
     def card_claim(self, payload: dict) -> dict:
@@ -95,11 +111,18 @@ class LocalSKBackend:
         return {"claimed": True, "agent": _jsonable(agent)}
 
     def progress_append(self, payload: dict) -> dict:
-        _keys(payload, {"card_id", "run_id", "round", "outcome", "tried", "why_failed"},
-              {"replacement_hint"})
+        _keys(
+            payload,
+            {"card_id", "run_id", "round", "outcome", "tried", "why_failed"},
+            {"replacement_hint"},
+        )
         path = self._board().record_attempt(
-            str(payload["card_id"]), str(payload["run_id"]), int(payload["round"]),
-            str(payload["outcome"]), str(payload["tried"]), str(payload["why_failed"]),
+            str(payload["card_id"]),
+            str(payload["run_id"]),
+            int(payload["round"]),
+            str(payload["outcome"]),
+            str(payload["tried"]),
+            str(payload["why_failed"]),
             str(payload.get("replacement_hint", "")),
         )
         return {"appended": True, "path": str(path)}
@@ -110,7 +133,10 @@ class LocalSKBackend:
             raise BackendInputError("record must be an object")
         self.event_dir.mkdir(parents=True, exist_ok=True)
         key = str(payload["idempotency_key"])
-        if not key or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_." for c in key):
+        if not key or any(
+            c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+            for c in key
+        ):
             raise BackendInputError("invalid idempotency_key")
         target = self.event_dir / f"{key}.json"
         encoded = json.dumps(payload["record"], sort_keys=True, separators=(",", ":")) + "\n"
@@ -127,7 +153,10 @@ class LocalSKBackend:
     def memory_recall(self, payload: dict) -> dict:
         _keys(payload, {"query"}, {"limit"})
         from skmemory.store import MemoryStore
-        rows = MemoryStore().search(str(payload["query"]), limit=min(int(payload.get("limit", 5)), 20))
+
+        rows = MemoryStore().search(
+            str(payload["query"]), limit=min(int(payload.get("limit", 5)), 20)
+        )
         return {"memories": [_jsonable(row) for row in rows]}
 
     def memory_append(self, payload: dict) -> dict:
@@ -200,28 +229,47 @@ class LocalSKBackend:
     def experiment_reproduce(self, payload: dict) -> dict:
         _keys(
             payload,
-            {"immutable_evidence_id", "experiment_id", "attempt_id", "run_id",
-             "created_at", "idempotency_key"},
+            {
+                "immutable_evidence_id",
+                "experiment_id",
+                "attempt_id",
+                "run_id",
+                "created_at",
+                "idempotency_key",
+            },
         )
         access = self._require_collaboration_access()
         from datetime import datetime
 
         record = access.reproduce(
-            self._catalog(), str(payload["immutable_evidence_id"]),
+            self._catalog(),
+            str(payload["immutable_evidence_id"]),
             experiment_id=str(payload["experiment_id"]),
-            attempt_id=str(payload["attempt_id"]), actor=self.agent,
-            run_id=str(payload["run_id"]), created_at=datetime.fromisoformat(payload["created_at"]),
+            attempt_id=str(payload["attempt_id"]),
+            actor=self.agent,
+            run_id=str(payload["run_id"]),
+            created_at=datetime.fromisoformat(payload["created_at"]),
         )
-        return self.arena_append({
-            "idempotency_key": str(payload["idempotency_key"]),
-            "record": record.model_dump(mode="json"),
-        }) | {"experiment_hash": record.content_hash}
+        return self.arena_append(
+            {
+                "idempotency_key": str(payload["idempotency_key"]),
+                "record": record.model_dump(mode="json"),
+            }
+        ) | {"experiment_hash": record.content_hash}
 
     def experiment_mutate(self, payload: dict) -> dict:
         _keys(
             payload,
-            {"parent_id", "experiment_id", "attempt_id", "run_id", "created_at",
-             "changed_dimensions", "configuration", "idempotency_key"},
+            {
+                "parent_id",
+                "experiment_id",
+                "attempt_id",
+                "run_id",
+                "created_at",
+                "changed_dimensions",
+                "configuration",
+                "idempotency_key",
+            },
         )
         if not isinstance(payload["changed_dimensions"], list):
             raise BackendInputError("changed_dimensions must be an array")
@@ -231,18 +279,22 @@ class LocalSKBackend:
         from datetime import datetime
 
         record = access.mutate(
-            self._catalog(), str(payload["parent_id"]),
+            self._catalog(),
+            str(payload["parent_id"]),
             experiment_id=str(payload["experiment_id"]),
-            attempt_id=str(payload["attempt_id"]), actor=self.agent,
+            attempt_id=str(payload["attempt_id"]),
+            actor=self.agent,
             run_id=str(payload["run_id"]),
             changed_dimensions=payload["changed_dimensions"],
             configuration=payload["configuration"],
             created_at=datetime.fromisoformat(payload["created_at"]),
         )
-        return self.arena_append({
-            "idempotency_key": str(payload["idempotency_key"]),
-            "record": record.model_dump(mode="json"),
-        }) | {"experiment_hash": record.content_hash}
+        return self.arena_append(
+            {
+                "idempotency_key": str(payload["idempotency_key"]),
+                "record": record.model_dump(mode="json"),
+            }
+        ) | {"experiment_hash": record.content_hash}
 
     def _require_collaboration_access(self):
         if self.collaboration_access is None:
@@ -265,7 +317,8 @@ def main(argv: list[str] | None = None) -> int:
         event_dir = Path(os.environ["SKHARNESS_ARENA_EVENT_DIR"])
         agent = os.environ["SKAGENT"]
         result = LocalSKBackend(capstone_home=home, event_dir=event_dir, agent=agent).invoke(
-            args[0], payload)
+            args[0], payload
+        )
     except (
         AccessDeniedError,
         BackendInputError,

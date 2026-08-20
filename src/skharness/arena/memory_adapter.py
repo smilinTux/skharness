@@ -203,18 +203,18 @@ class RuntimeSKMemoryAdapter:
 
     def _last(self, proposal_id: str, state: RefinementState):
         matches = [
-            event for event in self.journal.events()
+            event
+            for event in self.journal.events()
             if event.proposal_id == proposal_id and event.to_state is state
         ]
         if not matches:
             raise CollaborationError(f"missing refinement event: {state.value}")
         return matches[-1]
 
-    def _recorded(
-        self, proposal_id: str, state: RefinementState
-    ) -> MemoryReceipt | None:
+    def _recorded(self, proposal_id: str, state: RefinementState) -> MemoryReceipt | None:
         matches = [
-            event for event in self.journal.events()
+            event
+            for event in self.journal.events()
             if event.proposal_id == proposal_id and event.to_state is state
         ]
         if not matches:

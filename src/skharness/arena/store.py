@@ -43,8 +43,11 @@ class ArenaStore:
         self.experiments_dir = self.root / "experiments"
         self.results_dir = self.root / "results"
         for directory in (
-            self.events_dir, self.artifacts_dir, self.specs_dir,
-            self.experiments_dir, self.results_dir,
+            self.events_dir,
+            self.artifacts_dir,
+            self.specs_dir,
+            self.experiments_dir,
+            self.results_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
 
@@ -173,9 +176,7 @@ class ArenaStore:
         if path.exists() and path.read_bytes() != payload:
             raise CorruptEventLogError(f"record content does not match existing hash {digest}")
         if not path.exists():
-            temporary = path.with_name(
-                f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
-            )
+            temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
             try:
                 with temporary.open("xb") as stream:
                     stream.write(payload)

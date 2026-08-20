@@ -11,6 +11,12 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ### Fixed
 
+- Added two-worker live Pi qualification with distinct request/experiment identity and
+  independent verification for every worker; hardened scheduler chaos/recovery,
+  container-isolated verification, and refinement promotion evidence policy. Repaired
+  Pi bridge operation parity and completed the polyglot Node/npm, Python/uv, Go, Rust,
+  and Java toolchain image. Added tag-driven GHCR publication, SBOM/provenance, keyless
+  Cosign signing, signature verification, and a separate fail-closed vulnerability job.
 - Completed the Arena's locally testable contract, verifier, and observability gates:
   mandatory card/repository provenance and schema-version/concurrency/lineage tests;
   warm-cache and capability enforcement with executable verifier controls; and a

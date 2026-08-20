@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import signal
+import subprocess
 import threading
 import time
 from datetime import datetime, timezone
+
+import pytest
 
 from skharness.arena.controller import ArenaController
 from skharness.arena.models import ExperimentState
@@ -15,7 +18,7 @@ from skharness.arena.runner import (
     pi_launch_spec,
 )
 from skharness.arena.scheduler import AttemptRequest, LeaseScheduler, ResourceRequest
-from skharness.arena.store import ArenaStore
+from skharness.arena.store import ArenaStore, CorruptEventLogError
 from skharness.autocode.adapters.pi import PiAdapter
 from skharness.autocode.sandbox import LaunchSpec, Sandbox
 from skharness.spawner import FakeSpawner
@@ -62,7 +65,10 @@ def _controller(tmp_path, scheduler=None):
     return ArenaController(
         ArenaStore(tmp_path / "store"),
         scheduler or LeaseScheduler(ResourceRequest(cpu=2, ram_gb=4, gateway_slots=2)),
-        writer_id="runner", actor="agent", node="node", session_id="session",
+        writer_id="runner",
+        actor="agent",
+        node="node",
+        session_id="session",
         now=lambda: datetime(2026, 8, 20, tzinfo=timezone.utc),
     )
 
@@ -78,8 +84,9 @@ def _spec(tmp_path):
 def test_success_runs_pi_attempt_and_persists_artifacts_before_terminal_event(tmp_path):
     controller = _controller(tmp_path)
     controller.propose("experiment")
-    runner = PiExperimentRunner(controller, ScriptedSupervisor(stdout=b"trajectory"),
-                                tmp_path / "runs")
+    runner = PiExperimentRunner(
+        controller, ScriptedSupervisor(stdout=b"trajectory"), tmp_path / "runs"
+    )
     outcome = runner.execute(_request(), _spec(tmp_path), timeout_s=10)
     assert isinstance(outcome, RunOutcome) and outcome.successful
     assert controller.state("experiment") is ExperimentState.PROVISIONAL
@@ -93,7 +100,10 @@ def test_admitted_resources_become_container_cpu_and_memory_limits(tmp_path):
     supervisor = ScriptedSupervisor()
     runner = PiExperimentRunner(controller, supervisor, tmp_path / "runs")
     request = AttemptRequest(
-        "challenge", "experiment", "1", "experiment:1",
+        "challenge",
+        "experiment",
+        "1",
+        "experiment:1",
         resources=ResourceRequest(cpu=1.5, ram_gb=3.25),
     )
     outcome = runner.execute(request, _spec(tmp_path))
@@ -121,6 +131,33 @@ def test_timeout_and_oom_are_failed_with_durable_partial_evidence(tmp_path):
         assert event.payload["reason"] == classification
 
 
+def test_gateway_outage_is_classified_and_retains_diagnostics(tmp_path):
+    controller = _controller(tmp_path)
+    controller.propose("experiment")
+    supervisor = ScriptedSupervisor(
+        exit_code=1,
+        classification="exit",
+        stderr=b"gateway unavailable: connection refused",
+    )
+    outcome = PiExperimentRunner(controller, supervisor, tmp_path / "runs").execute(
+        _request(), _spec(tmp_path)
+    )
+    assert outcome.classification == "gateway_outage"
+    assert outcome.partial and not outcome.successful
+    assert controller.store.get_artifact(outcome.stderr_digest) == supervisor.stderr
+
+
+def test_corrupt_committed_event_tail_stops_restart_recovery(tmp_path):
+    controller = _controller(tmp_path)
+    controller.propose("experiment")
+    segment = controller.store.events_dir / "runner.jsonl"
+    with segment.open("ab") as stream:
+        stream.write(b"corrupt-committed-tail\n")
+    runner = PiExperimentRunner(controller, ScriptedSupervisor(), tmp_path / "runs")
+    with pytest.raises(CorruptEventLogError):
+        runner.recover_incomplete()
+
+
 def test_duplicate_delivery_does_not_spawn_a_second_pi_process(tmp_path):
     controller = _controller(tmp_path)
     controller.propose("experiment")
@@ -135,8 +172,7 @@ def test_duplicate_delivery_does_not_spawn_a_second_pi_process(tmp_path):
 
 
 def test_long_running_attempt_heartbeats_its_lease(tmp_path):
-    scheduler = LeaseScheduler(ResourceRequest(cpu=2, ram_gb=4, gateway_slots=2),
-                               lease_ttl_s=0.09)
+    scheduler = LeaseScheduler(ResourceRequest(cpu=2, ram_gb=4, gateway_slots=2), lease_ttl_s=0.09)
     controller = _controller(tmp_path, scheduler)
     controller.propose("experiment")
     calls = []
@@ -170,8 +206,9 @@ def test_restart_recovery_terminalizes_running_attempt_and_captures_partial_logs
     run_dir.mkdir(parents=True)
     (run_dir / "stdout.log").write_bytes(b"survived-crash")
 
-    restarted = _controller(tmp_path, LeaseScheduler(ResourceRequest(
-        cpu=2, ram_gb=4, gateway_slots=2)))
+    restarted = _controller(
+        tmp_path, LeaseScheduler(ResourceRequest(cpu=2, ram_gb=4, gateway_slots=2))
+    )
     runner = PiExperimentRunner(restarted, ScriptedSupervisor(), tmp_path / "runs")
     duplicate = runner.execute(_request(), _spec(tmp_path))
     assert not duplicate.admitted
@@ -216,8 +253,11 @@ def test_cancel_racing_process_exit_does_not_overwrite_terminal_state(tmp_path):
 
 def test_pi_launch_spec_reuses_adapter_routing_profile_and_model_config(tmp_path):
     adapter = PiAdapter(
-        Sandbox(), model="build", base_url="http://skgateway:18780/v1",
-        capability_profile="arena-build", image="pi-pinned",
+        Sandbox(),
+        model="build",
+        base_url="http://skgateway:18780/v1",
+        capability_profile="arena-build",
+        image="pi-pinned",
     )
     spec = pi_launch_spec(adapter, prompt="optimize", worktree=str(tmp_path))
     assert spec.image == "pi-pinned"
@@ -244,6 +284,11 @@ def test_real_supervisor_cancel_kills_container_and_process_group(monkeypatch):
         def poll():
             return None
 
+        @staticmethod
+        def wait(*, timeout):
+            assert timeout == 10.0
+            return 143
+
     supervisor._process = Process()
     supervisor._container_name = "arena-pi-live"
     docker_calls = []
@@ -259,3 +304,30 @@ def test_real_supervisor_cancel_kills_container_and_process_group(monkeypatch):
     supervisor.cancel()
     assert docker_calls == [["docker", "rm", "-f", "arena-pi-live"]]
     assert signals == [(4242, signal.SIGTERM)]
+
+
+def test_real_supervisor_shutdown_is_bounded_and_escalates_to_kill(monkeypatch):
+    supervisor = SandboxProcessSupervisor(Sandbox(live_execution=True), shutdown_grace_s=0.25)
+
+    class Process:
+        pid = 4242
+
+        @staticmethod
+        def poll():
+            return None
+
+        @staticmethod
+        def wait(*, timeout):
+            assert timeout == 0.25
+            raise subprocess.TimeoutExpired("pi", timeout)
+
+    supervisor._process = Process()
+    supervisor._container_name = "arena-pi-live"
+    signals = []
+    monkeypatch.setattr("skharness.arena.runner.subprocess.run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "skharness.arena.runner.os.killpg",
+        lambda pid, sig: signals.append((pid, sig)),
+    )
+    supervisor.cancel()
+    assert signals == [(4242, signal.SIGTERM), (4242, signal.SIGKILL)]

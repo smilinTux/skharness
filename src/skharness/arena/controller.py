@@ -20,13 +20,22 @@ class InvalidTransitionError(RuntimeError):
 _TRANSITIONS = {
     None: {ExperimentState.PROPOSED},
     ExperimentState.PROPOSED: {ExperimentState.ADMITTED, ExperimentState.CANCELLED},
-    ExperimentState.ADMITTED: {ExperimentState.RUNNING, ExperimentState.CANCELLED,
-                               ExperimentState.FAILED},
-    ExperimentState.RUNNING: {ExperimentState.PROVISIONAL, ExperimentState.CANCELLED,
-                              ExperimentState.FAILED},
+    ExperimentState.ADMITTED: {
+        ExperimentState.RUNNING,
+        ExperimentState.CANCELLED,
+        ExperimentState.FAILED,
+    },
+    ExperimentState.RUNNING: {
+        ExperimentState.PROVISIONAL,
+        ExperimentState.CANCELLED,
+        ExperimentState.FAILED,
+    },
     ExperimentState.PROVISIONAL: {ExperimentState.VERIFYING},
-    ExperimentState.VERIFYING: {ExperimentState.VALID, ExperimentState.INVALID,
-                                ExperimentState.INCONCLUSIVE},
+    ExperimentState.VERIFYING: {
+        ExperimentState.VALID,
+        ExperimentState.INVALID,
+        ExperimentState.INCONCLUSIVE,
+    },
 }
 
 
@@ -62,8 +71,11 @@ class ArenaController:
         self._transition_lock = threading.RLock()
 
     def _events(self, experiment_id: str, attempt: int) -> list[ExperimentEvent]:
-        return [event for event in self.store.read_all_events()
-                if event.experiment_id == experiment_id and event.attempt == attempt]
+        return [
+            event
+            for event in self.store.read_all_events()
+            if event.experiment_id == experiment_id and event.attempt == attempt
+        ]
 
     def state(self, experiment_id: str, attempt: int = 1) -> ExperimentState | None:
         events = self._events(experiment_id, attempt)
@@ -118,7 +130,9 @@ class ArenaController:
             raise ValueError("AttemptRequest.attempt_id must equal attempt_number")
         current = self.state(request.experiment_id, attempt_number)
         if current not in {
-            ExperimentState.PROPOSED, ExperimentState.ADMITTED, ExperimentState.RUNNING
+            ExperimentState.PROPOSED,
+            ExperimentState.ADMITTED,
+            ExperimentState.RUNNING,
         }:
             raise InvalidTransitionError("attempt must be proposed before admission")
         admission = self.scheduler.admit(request)
@@ -135,8 +149,10 @@ class ArenaController:
                 self.metrics.admission("duplicate")
             return Admission(False, reason=AdmissionReason.DUPLICATE)
         if self.metrics is not None:
-            outcome = "admitted" if admission.admitted else (
-                admission.reason.value if admission.reason is not None else "invalid"
+            outcome = (
+                "admitted"
+                if admission.admitted
+                else (admission.reason.value if admission.reason is not None else "invalid")
             )
             self.metrics.admission(outcome)
         if admission.admitted and not admission.duplicate and current == ExperimentState.PROPOSED:
@@ -149,7 +165,9 @@ class ArenaController:
             )
             self._lease_by_attempt[(request.experiment_id, attempt_number)] = lease.lease_id
         elif admission.admitted and admission.duplicate:
-            self._lease_by_attempt[(request.experiment_id, attempt_number)] = admission.lease.lease_id
+            self._lease_by_attempt[(request.experiment_id, attempt_number)] = (
+                admission.lease.lease_id
+            )
         return admission
 
     def running(self, experiment_id: str, attempt: int = 1) -> ExperimentEvent:
@@ -192,8 +210,9 @@ class ArenaController:
                 stop()
             if self.metrics is not None:
                 self.metrics.add("cancellation")
-            event = self._append(experiment_id, attempt, ExperimentState.CANCELLED,
-                                 payload=payload)
+            event = self._append(
+                experiment_id, attempt, ExperimentState.CANCELLED, payload=payload
+            )
             self._release(experiment_id, attempt)
             return event
 
@@ -213,8 +232,12 @@ class ArenaController:
                 if self.metrics is not None:
                     self.metrics.admission("expired")
                     self.metrics.add("lease_expiry")
-                events.append(self._append(
-                    key[0], key[1], ExperimentState.FAILED,
-                    payload={"reason": "lease_expired", "lease_id": lease.lease_id},
-                ))
+                events.append(
+                    self._append(
+                        key[0],
+                        key[1],
+                        ExperimentState.FAILED,
+                        payload={"reason": "lease_expired", "lease_id": lease.lease_id},
+                    )
+                )
         return events

@@ -115,10 +115,7 @@ class CollaborationAccess:
             owned = [item for item in self._ownership.values() if item.owner == actor]
         return tuple(
             sorted(
-                (
-                    item for item in owned
-                    if self.scheduler.active_lease(item.lease_id) is not None
-                ),
+                (item for item in owned if self.scheduler.active_lease(item.lease_id) is not None),
                 key=lambda item: (item.experiment_id, item.attempt_id),
             )
         )

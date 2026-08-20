@@ -2,6 +2,7 @@ import importlib.util
 import json
 import threading
 from argparse import Namespace
+from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib import request
@@ -23,8 +24,11 @@ class Gateway(BaseHTTPRequestHandler):
 
     def do_GET(self):
         type(self).requests.append((self.command, self.path, dict(self.headers), None))
-        body = {"status": "ok"} if self.path == "/health" else {
-            "object": "list", "data": [{"id": "arena-model"}]}
+        body = (
+            {"status": "ok"}
+            if self.path == "/health"
+            else {"object": "list", "data": [{"id": "arena-model"}]}
+        )
         self.send_response(200)
         self.send_header("content-type", "application/json")
         self.end_headers()
@@ -35,8 +39,11 @@ class Gateway(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length))
         type(self).requests.append((self.command, self.path, dict(self.headers), body))
         request_number = len([item for item in type(self).requests if item[0] == "POST"])
-        response = {"id": f"completion-{request_number}", "model": "served-model",
-                    "choices": [{"message": {"content": "qualified"}}]}
+        response = {
+            "id": f"completion-{request_number}",
+            "model": "served-model",
+            "choices": [{"message": {"content": "qualified"}}],
+        }
         self.send_response(200)
         self.send_header("content-type", "application/json")
         self.send_header("x-sk-req-id", f"request-{request_number}")
@@ -46,8 +53,7 @@ class Gateway(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(response).encode())
 
 
-def test_live_qualification_records_gateway_and_pi_evidence_without_secret(
-        tmp_path, monkeypatch):
+def test_live_qualification_records_gateway_and_pi_evidence_without_secret(tmp_path, monkeypatch):
     Gateway.requests = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), Gateway)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -63,28 +69,48 @@ def test_live_qualification_records_gateway_and_pi_evidence_without_secret(
         assert config["providers"]["skgw"]["apiKey"] == secret
         relay_request = request.Request(
             config["providers"]["skgw"]["baseUrl"] + "/chat/completions",
-            data=json.dumps({"model": "arena-model", "stream": True,
-                             "messages": [{"role": "user", "content": "qualify"}]}).encode(),
-            headers={"authorization": f"Bearer {secret}",
-                     "content-type": "application/json",
-                     "x-session-id": "session-1", "x-sk-card-id": "card-1"},
-            method="POST")
+            data=json.dumps(
+                {
+                    "model": "arena-model",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "qualify"}],
+                }
+            ).encode(),
+            headers={
+                "authorization": f"Bearer {secret}",
+                "content-type": "application/json",
+                "x-session-id": "session-1",
+                "x-sk-card-id": "card-1",
+            },
+            method="POST",
+        )
         with request.urlopen(relay_request, timeout=5) as response:
             assert json.loads(response.read())["model"] == "served-model"
         assert config_dir.stat().st_mode & 0o777 == 0o755
         assert (config_dir / "models.json").stat().st_mode & 0o777 == 0o444
-        message = {"role": "assistant", "responseModel": "served-model-variant",
-                   "content": [{"type": "text", "text": "qualified"}]}
-        return {"argv": argv, "exit_code": 0,
-                "stdout": json.dumps({"type": "message_end", "message": message}),
-                "stderr": ""}
+        message = {
+            "role": "assistant",
+            "responseModel": "served-model-variant",
+            "content": [{"type": "text", "text": "qualified"}],
+        }
+        return {
+            "argv": argv,
+            "exit_code": 0,
+            "stdout": json.dumps({"type": "message_end", "message": message}),
+            "stderr": "",
+        }
 
     monkeypatch.setattr(QUALIFY, "command", fake_command)
     args = Namespace(
         live_gateway=f"http://127.0.0.1:{server.server_port}",
-        gateway_api_key_env="TEST_GATEWAY_KEY", gateway_model="arena-model",
-        session_id="session-1", card_id="card-1", prompt="qualify", context_limit=4096,
-        output_limit=256, image="pi:test",
+        gateway_api_key_env="TEST_GATEWAY_KEY",
+        gateway_model="arena-model",
+        session_id="session-1",
+        card_id="card-1",
+        prompt="qualify",
+        context_limit=4096,
+        output_limit=256,
+        image="pi:test",
     )
     try:
         evidence = QUALIFY.live_qualification(args)
@@ -107,20 +133,31 @@ def test_live_qualification_records_gateway_and_pi_evidence_without_secret(
         assert result.experiment_hash == experiment.content_hash
         assert result.verification is VerificationState.UNVERIFIED
     assert evidence["attribution"] == {
-        "x-sk-req-id": "request-1", "x-request-id": None,
-        "x-sk-backend": "reg:ornith-1", "x-sk-model-served": "served-model",
+        "x-sk-req-id": "request-1",
+        "x-request-id": None,
+        "x-sk-backend": "reg:ornith-1",
+        "x-sk-model-served": "served-model",
     }
     assert evidence["attribution_source"] == "direct_openai_compatible_probe"
     assert evidence["pi_request_headers"] == {
-        "x-session-id": "session-1", "x-sk-card-id": "card-1"}
+        "x-session-id": "session-1",
+        "x-sk-card-id": "card-1",
+    }
     assert evidence["pi"] == {
-        "exit_code": 0, "stderr": "", "responseModel": "served-model-variant",
-        "served_model": "served-model", "completion_status": 200,
-        "attribution": {"x-sk-req-id": "request-2", "x-request-id": None,
-                        "x-sk-backend": "reg:ornith-2",
-                        "x-sk-model-served": "served-model"},
+        "exit_code": 0,
+        "stderr": "",
+        "responseModel": "served-model-variant",
+        "served_model": "served-model",
+        "completion_status": 200,
+        "attribution": {
+            "x-sk-req-id": "request-2",
+            "x-request-id": None,
+            "x-sk-backend": "reg:ornith-2",
+            "x-sk-model-served": "served-model",
+        },
         "attribution_source": "ephemeral_loopback_relay_observation",
-        "output": "qualified"}
+        "output": "qualified",
+    }
     assert evidence["pi_relay"]["captured_requests"] == 1
     assert secret not in json.dumps(evidence)
     post = next(item for item in Gateway.requests if item[0] == "POST")
@@ -131,9 +168,9 @@ def test_live_qualification_records_gateway_and_pi_evidence_without_secret(
     assert records[1]["experiment"]["gateway_request_id"] == "request-2"
     assert records[1]["experiment"]["gateway_backend_id"] == "reg:ornith-2"
     assert records[1]["experiment"]["served_model"] == "served-model-variant"
-    assert records[1]["experiment"]["configuration"][
-        "gateway_header_served_model"
-    ] == "served-model"
+    assert (
+        records[1]["experiment"]["configuration"]["gateway_header_served_model"] == "served-model"
+    )
     planted = QUALIFY.planted_false_high_score(records[1])
     assert planted["assistant_output"] == "planted-false-output"
     assert planted["result"]["measurements"][0]["mean"] == 999_999_999
@@ -151,10 +188,42 @@ def test_live_qualification_requires_named_secret(monkeypatch):
         raise AssertionError("missing key should fail before network or Docker access")
 
 
+def test_independent_worker_gate_requires_distinct_attributed_verified_runs():
+    workers = [
+        {
+            "request_id": f"request-{index}",
+            "backend": "chiap08",
+            "served_model": "qwen3.8-27b",
+            "record": {"experiment_hash": f"sha256:experiment-{index}"},
+            "verification": {"status": "valid", "admitted": True},
+        }
+        for index in (1, 2)
+    ]
+
+    assert QUALIFY.independent_workers_valid(workers, 2)
+    for field in ("request_id", "backend", "served_model"):
+        broken = deepcopy(workers)
+        broken[1][field] = None
+        assert not QUALIFY.independent_workers_valid(broken, 2)
+    duplicate = deepcopy(workers)
+    duplicate[1]["request_id"] = duplicate[0]["request_id"]
+    assert not QUALIFY.independent_workers_valid(duplicate, 2)
+    duplicate = deepcopy(workers)
+    duplicate[1]["record"] = duplicate[0]["record"]
+    assert not QUALIFY.independent_workers_valid(duplicate, 2)
+    invalid = deepcopy(workers)
+    invalid[1]["verification"] = {"status": "invalid", "admitted": False}
+    assert not QUALIFY.independent_workers_valid(invalid, 2)
+
+
 def test_relay_extracts_served_model_from_stream_body():
-    capture = {"body": (b'data: {"id":"one","model":"served-stream"}\n\n'
-                        b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
-                        b'data: [DONE]\n\n')}
+    capture = {
+        "body": (
+            b'data: {"id":"one","model":"served-stream"}\n\n'
+            b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+            b"data: [DONE]\n\n"
+        )
+    }
     assert QUALIFY.relay_response_model(capture) == "served-stream"
 
 

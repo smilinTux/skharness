@@ -212,8 +212,11 @@ credential only through `SKGATEWAY_API_KEY` (or the environment-variable name se
 by `--gateway-api-key-env`) to record health/models probes, redacted generated Pi
 configuration, gateway attribution, and the Pi container's response model and output.
 For the frozen transport gate, also pass `--expected-output VALUE` and optionally
-`--arena-store PATH`. The qualifier persists content-addressed Experiment/Result and
-assistant-output artifacts, independently repeats exact-output observations, and admits
+`--arena-store PATH`. The default `--pi-workers 2` is a hard minimum: each Dockerized
+worker must have a distinct attributed gateway request and immutable experiment, and
+each must independently verify as valid. The qualifier persists content-addressed
+Experiment/Result and assistant-output artifacts, independently repeats exact-output
+observations, and admits
 only the verified-valid Pi result to the Pareto frontier. It also executes a planted
 false-output result claiming score `999999999`; a live claim fails unless that control
 is invalid and excluded. This narrow gate proves execution, evidence, and admission
@@ -235,6 +238,11 @@ does not claim a passing vulnerability scan, signature, registry digest, or GPU 
 The identical prior image digest completed a CPU Pi-to-SKGateway probe on `.41`, but
 `nvidia-smi` still cannot communicate with its driver, so GPU qualification remains
 blocked rather than passed.
+
+Tag pushes run `.github/workflows/pi-image.yml`: both targets are published to GHCR by
+immutable digest with BuildKit SBOM/provenance, keyless-signed using GitHub OIDC, and
+immediately signature-verified. A separate Anchore job fails on any High or Critical;
+publication or signing success cannot turn a failed vulnerability gate green.
 
 Arena admission CPU and RAM reservations become Docker `--cpus`, `--memory`, and
 no-extra-swap cgroup limits. Both worker and egress proxy use read-only root filesystems,

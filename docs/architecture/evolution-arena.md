@@ -280,6 +280,18 @@ that are read-only to ordinary jobs or isolated per experiment. Flutter/Android 
 GPU compiler stacks remain separate heavyweight variants; they must not inflate every
 worker startup.
 
+Implementation truth (repository audit, 2026-08-20): the Dockerfile pins the base
+image, Pi/npm graph, direct Debian packages, and hashed Python wheels, but the complete
+image acceptance criterion is not yet earned. `scripts/pi-supply-chain.sh` can produce
+an SBOM, vulnerability report, and optionally a signed provenance blob, but no generated
+SBOM, signature, registry digest, or publication verification is checked into or
+enforced by CI. Debian transitive resolution is not tied to a snapshot repository. The
+polyglot target installs Go/Rust/Java Debian packages, but does not install `uv`, and
+its npm availability is not established by the current Dockerfile after npm is removed
+from `pi-base`. Local mutable tags may also predate the current Dockerfile and therefore
+are not supply-chain evidence. Qualification must inspect a freshly built immutable
+digest and attach generated evidence before making any signed/SBOMed claim.
+
 Preinstallation saves cold-start time, but mutability moves out of the image:
 
 - lock files and image digest define the environment;
@@ -440,6 +452,9 @@ opaque private-evaluation handle, and only a verified-valid result may enter the
 frontier. Exact-output equality is intentionally limited to validating the transport,
 lineage, independent-verification, and admission path. General challenge quality still
 requires withheld operator-owned tests, richer metrics, and the complete controls above.
+The live transport gate requires at least two independent Dockerized Pi executions.
+Distinct session, gateway-request, and Experiment hashes are mandatory, and each worker
+is independently verified; one successful worker cannot stand in for a fleet proof.
 
 ## 13. Standards compliance and documentation ownership
 
@@ -463,5 +478,6 @@ requires withheld operator-owned tests, richer metrics, and the complete control
 3. `src/skharness/autocode/orchestrator.py` — current phase and dispatch loop.
 4. `src/skharness/autocode/engineering.py` — worktree, grade and finalize choke point.
 5. `src/skharness/autocode/attribution.py` — run-to-gateway evidence join.
-6. `docker/sandbox/pi/Dockerfile` — current prototype image; not yet reproducibly
-   pinned or arena-qualified.
+6. `docker/sandbox/pi/Dockerfile` — digest/lock-pinned core and polyglot targets; tag
+   publication signs immutable GHCR digests, while the vulnerability and GPU fleet
+   gates remain independent release requirements.

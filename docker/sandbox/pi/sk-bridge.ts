@@ -8,6 +8,8 @@ const run = promisify(execFile);
 const operations = [
   "capstone.card.read", "capstone.card.claim", "capstone.progress.append",
   "arena.progress.append", "arena.result.append", "arena.verdict.append",
+  "arena.experiment.search", "arena.experiment.reproduce", "arena.experiment.mutate",
+  "arena.negative.search",
   "memory.recall", "memory.scratch.append", "memory.proposal.append",
 ] as const;
 

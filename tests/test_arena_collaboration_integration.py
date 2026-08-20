@@ -15,6 +15,7 @@ from skharness.arena import (
     MetricDirection,
     MetricObjective,
     MetricSummary,
+    RefinementEvidenceKind,
     RefinementJournal,
     RefinementProposal,
     RefinementScope,
@@ -227,7 +228,14 @@ class FakeMemory:
 def ready_journal(tmp_path):
     evidence = {"verified", "canary", "approval", "incident"}
     journal = RefinementJournal(
-        tmp_path, approvers={"operator:casey"}, evidence_exists=evidence.__contains__
+        tmp_path,
+        approvers={"operator:casey"},
+        evidence_exists=evidence.__contains__,
+        evidence_kind=lambda item: {
+            "verified": RefinementEvidenceKind.VERIFIED_RESULT,
+            "canary": RefinementEvidenceKind.CANARY_RESULT,
+            "approval": RefinementEvidenceKind.OPERATOR_APPROVAL,
+        }.get(item, RefinementEvidenceKind.RAW_REWARD),
     )
     proposal = RefinementProposal(
         id="refine-1",
@@ -251,7 +259,9 @@ def ready_journal(tmp_path):
     )
     journal.approve(proposal.id, provenance("operator:casey", "approve"), ("approval",))
     journal.authorize_promotion(
-        proposal.id, provenance("operator:casey", "promote.authorize"), ("approval",)
+        proposal.id,
+        provenance("operator:casey", "promote.authorize"),
+        ("verified", "canary", "approval"),
     )
     return journal, proposal
 
@@ -307,6 +317,11 @@ def test_runtime_skmemory_adapter_canary_rollback_through_executable(tmp_path):
         journal.root,
         approvers={"operator:casey"},
         evidence_exists={"verified", "canary", "approval", "incident"}.__contains__,
+        evidence_kind=lambda item: {
+            "verified": RefinementEvidenceKind.VERIFIED_RESULT,
+            "canary": RefinementEvidenceKind.CANARY_RESULT,
+            "approval": RefinementEvidenceKind.OPERATOR_APPROVAL,
+        }.get(item, RefinementEvidenceKind.RAW_REWARD),
     )
     restarted = RuntimeSKMemoryAdapter(restarted_journal, ExecutableRuntimeBackend(runtime))
     assert restarted.promote(proposal.id, provenance("service:skmemory", "promote")) == promoted

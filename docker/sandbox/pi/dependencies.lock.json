@@ -12,6 +12,10 @@
   },
   "python_test_tools": {"coverage": "7.13.4", "pytest": "9.0.2"},
   "polyglot": {
+    "node": "24 from the immutable base image",
+    "npm": "transitive npm tree from the immutable base image",
+    "python": "3.13.5-1 from the pinned Debian image",
+    "uv": "0.9.27@sha256:143b40f4ab56a780f43377604702107b5a35f83a4453daf1e4be691358718a6a",
     "go": "distribution package from the pinned Debian image",
     "java": "openjdk-21-jdk-headless from the pinned Debian image",
     "rust": "rustc/cargo distribution packages from the pinned Debian image"
@@ -20,6 +24,7 @@
     "The image digest and Pi package are immutable inputs.",
     "Direct Debian package versions are pinned; transitive packages remain tied to the immutable base and repository state until an apt snapshot is pinned.",
     "package-lock.json pins and integrity-checks the complete Pi npm dependency graph.",
-    "SBOM generation, signing, and registry publication are not claimed here."
+    "The Python requirements lock is resolved for Python 3.13.",
+    "SBOM generation, signing, and registry publication are release evidence, not lockfile claims."
   ]
 }

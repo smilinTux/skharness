@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1.7
 # Build context is the repository root; targets are pi-core and pi-polyglot.
 ARG NODE_IMAGE=node:24-trixie-slim@sha256:0711b541c1c33a8a530ac4f0d391baa9a15b3d804695b1b24a47daa5fb60e74d
+ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.9.27@sha256:143b40f4ab56a780f43377604702107b5a35f83a4453daf1e4be691358718a6a
+FROM ${UV_IMAGE} AS uv-tools
 FROM ${NODE_IMAGE} AS pi-node-builder
 
 ARG PI_VERSION=0.84.2
@@ -65,10 +67,14 @@ CMD ["pi", "--version"]
 
 FROM pi-base AS pi-polyglot
 USER root
+COPY --from=pi-node-builder /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+COPY --from=uv-tools /uv /uvx /usr/local/bin/
 RUN apt-get update \
     && apt-get install -y --no-install-recommends cargo=1.85.0+dfsg3-1 \
        golang-go=2:1.24~2 openjdk-21-jdk-headless=21.0.12+8-1~deb13u1 \
        pkg-config=1.8.1-4 rustc=1.85.0+dfsg3-1 \
+    && ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 WORKDIR /work
 USER 10001:10001

@@ -10,10 +10,12 @@ from skharness.arena import (
     NegativeKind,
     NegativeKnowledge,
     NegativeKnowledgeIndex,
+    RefinementEvidenceKind,
     RefinementJournal,
     RefinementProposal,
     RefinementScope,
     RefinementState,
+    RefinementTargetKind,
     evidence_id,
 )
 from skharness.arena.models import (
@@ -161,8 +163,16 @@ def test_refinement_is_fail_closed_and_rollback_is_evidence_linked(tmp_path):
         evidence_id(b"incident"),
         evidence_id(b"rollback receipt"),
     }
+    evidence_kinds = {
+        evidence_id(b"verified experiment"): RefinementEvidenceKind.VERIFIED_RESULT,
+        evidence_id(b"canary report"): RefinementEvidenceKind.CANARY_RESULT,
+        evidence_id(b"approval"): RefinementEvidenceKind.OPERATOR_APPROVAL,
+    }
     journal = RefinementJournal(
-        tmp_path, approvers={"operator:casey"}, evidence_exists=evidence.__contains__
+        tmp_path,
+        approvers={"operator:casey"},
+        evidence_exists=evidence.__contains__,
+        evidence_kind=lambda item: evidence_kinds.get(item, RefinementEvidenceKind.RAW_REWARD),
     )
     proposal = RefinementProposal(
         id="refine-1",
@@ -185,7 +195,11 @@ def test_refinement_is_fail_closed_and_rollback_is_evidence_linked(tmp_path):
         journal.authorize_promotion(
             proposal.id,
             provenance("operator:casey", "refinement.promote.authorize"),
-            proposal.evidence_ids,
+            (
+                evidence_id(b"verified experiment"),
+                evidence_id(b"canary report"),
+                evidence_id(b"approval"),
+            ),
         )
 
     journal.authorize_canary(
@@ -216,7 +230,11 @@ def test_refinement_is_fail_closed_and_rollback_is_evidence_linked(tmp_path):
     journal.authorize_promotion(
         proposal.id,
         provenance("operator:casey", "refinement.promote.authorize"),
-        (evidence_id(b"approval"),),
+        (
+            evidence_id(b"verified experiment"),
+            evidence_id(b"canary report"),
+            evidence_id(b"approval"),
+        ),
     )
     journal.record_promoted(
         proposal.id,
@@ -269,3 +287,145 @@ def test_unknown_evidence_and_corrupt_journal_fail_closed(tmp_path):
     path.write_text("not-json\n")
     with pytest.raises(CollaborationError, match="invalid refinement event"):
         journal.events()
+
+
+@pytest.mark.parametrize("target_kind", tuple(RefinementTargetKind))
+def test_raw_reward_cannot_promote_any_durable_refinement_surface(tmp_path, target_kind):
+    evidence = {"raw-reward", "verified", "canary", "approval", "security"}
+    kinds = {
+        "raw-reward": RefinementEvidenceKind.RAW_REWARD,
+        "verified": RefinementEvidenceKind.VERIFIED_RESULT,
+        "canary": RefinementEvidenceKind.CANARY_RESULT,
+        "approval": RefinementEvidenceKind.OPERATOR_APPROVAL,
+        "security": RefinementEvidenceKind.SECURITY_REVIEW,
+    }
+    journal = RefinementJournal(
+        tmp_path / target_kind.value,
+        approvers={"operator:casey"},
+        evidence_exists=evidence.__contains__,
+        evidence_kind=kinds.__getitem__,
+    )
+    proposal = RefinementProposal(
+        id=f"raw-{target_kind.value}",
+        scope=RefinementScope.GLOBAL,
+        target=f"global:{target_kind.value}",
+        target_kind=target_kind,
+        proposed_content="worker-selected durable mutation",
+        evidence_ids=("raw-reward",),
+        proposer="agent:worker",
+        created_at=NOW,
+    )
+    journal.propose(proposal, provenance("agent:worker", "refinement.propose"))
+    journal.authorize_canary(
+        proposal.id,
+        provenance("operator:casey", "refinement.canary.authorize"),
+        ("raw-reward",),
+    )
+    journal.record_canary(
+        proposal.id,
+        provenance("service:canary", "refinement.canary.result"),
+        passed=True,
+        evidence_ids=("canary",),
+        receipt="canary:isolated",
+    )
+    journal.approve(
+        proposal.id,
+        provenance("operator:casey", "refinement.approve"),
+        ("approval",),
+    )
+
+    with pytest.raises(CollaborationError, match="lacks governed evidence"):
+        journal.authorize_promotion(
+            proposal.id,
+            provenance("operator:casey", "refinement.promote.authorize"),
+            ("raw-reward",),
+        )
+    assert journal.state(proposal.id) is RefinementState.APPROVED
+
+
+def test_executable_extension_requires_security_review_beyond_normal_governance(tmp_path):
+    kinds = {
+        "verified": RefinementEvidenceKind.VERIFIED_RESULT,
+        "canary": RefinementEvidenceKind.CANARY_RESULT,
+        "approval": RefinementEvidenceKind.OPERATOR_APPROVAL,
+        "security": RefinementEvidenceKind.SECURITY_REVIEW,
+    }
+    journal = RefinementJournal(
+        tmp_path,
+        approvers={"operator:casey"},
+        evidence_exists=kinds.__contains__,
+        evidence_kind=kinds.__getitem__,
+    )
+    proposal = RefinementProposal(
+        id="extension",
+        scope=RefinementScope.GLOBAL,
+        target="extension:pi",
+        target_kind=RefinementTargetKind.EXECUTABLE_EXTENSION,
+        proposed_content="sha256:pinned-extension",
+        evidence_ids=("verified",),
+        proposer="agent:worker",
+        created_at=NOW,
+    )
+    journal.propose(proposal, provenance("agent:worker", "refinement.propose"))
+    journal.authorize_canary(
+        proposal.id,
+        provenance("operator:casey", "refinement.canary.authorize"),
+        ("verified",),
+    )
+    journal.record_canary(
+        proposal.id,
+        provenance("service:canary", "refinement.canary.result"),
+        passed=True,
+        evidence_ids=("canary",),
+        receipt="canary:extension",
+    )
+    journal.approve(proposal.id, provenance("operator:casey", "refinement.approve"), ("approval",))
+    governed = ("verified", "canary", "approval")
+    with pytest.raises(CollaborationError, match="security_review"):
+        journal.authorize_promotion(
+            proposal.id,
+            provenance("operator:casey", "refinement.promote.authorize"),
+            governed,
+        )
+    event = journal.authorize_promotion(
+        proposal.id,
+        provenance("operator:casey", "refinement.promote.authorize"),
+        (*governed, "security"),
+    )
+    assert event.to_state is RefinementState.PROMOTION_AUTHORIZED
+
+
+def test_missing_controller_evidence_classifier_disables_promotion(tmp_path):
+    evidence = {"verified", "canary", "approval"}
+    journal = RefinementJournal(
+        tmp_path, approvers={"operator:casey"}, evidence_exists=evidence.__contains__
+    )
+    proposal = RefinementProposal(
+        id="classifier-absent",
+        scope=RefinementScope.PROJECT,
+        target="memory:project",
+        proposed_content="candidate",
+        evidence_ids=("verified",),
+        proposer="agent:worker",
+        created_at=NOW,
+    )
+    journal.propose(proposal, provenance("agent:worker", "refinement.propose"))
+    journal.authorize_canary(
+        proposal.id,
+        provenance("operator:casey", "refinement.canary.authorize"),
+        ("verified",),
+    )
+    journal.record_canary(
+        proposal.id,
+        provenance("service:canary", "refinement.canary.result"),
+        passed=True,
+        evidence_ids=("canary",),
+        receipt="canary:passed",
+    )
+    journal.approve(proposal.id, provenance("operator:casey", "refinement.approve"), ("approval",))
+    with pytest.raises(CollaborationError, match="classifier required"):
+        journal.authorize_promotion(
+            proposal.id,
+            provenance("operator:casey", "refinement.promote.authorize"),
+            tuple(evidence),
+        )

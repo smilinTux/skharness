@@ -31,6 +31,7 @@ class ResourceRequest:
     gpu: int = 0
     vram_gb: float = 0.0
     gateway_slots: int = 1
+    budget_units: float = 0.0
     verifier_slots: int = 0
 
     def __post_init__(self) -> None:
@@ -43,14 +44,14 @@ class ResourceRequest:
         return all(getattr(self, key) <= getattr(available, key) for key in vars(self))
 
     def plus(self, other: "ResourceRequest") -> "ResourceRequest":
-        return ResourceRequest(**{
-            key: getattr(self, key) + getattr(other, key) for key in vars(self)
-        })
+        return ResourceRequest(
+            **{key: getattr(self, key) + getattr(other, key) for key in vars(self)}
+        )
 
     def minus(self, other: "ResourceRequest") -> "ResourceRequest":
-        return ResourceRequest(**{
-            key: getattr(self, key) - getattr(other, key) for key in vars(self)
-        })
+        return ResourceRequest(
+            **{key: getattr(self, key) - getattr(other, key) for key in vars(self)}
+        )
 
 
 @dataclass(frozen=True)
@@ -91,6 +92,7 @@ class Admission:
     lease: Lease | None = None
     reason: AdmissionReason | None = None
     duplicate: bool = False
+    blocked_resources: tuple[str, ...] = ()
 
 
 class LeaseScheduler:
@@ -124,8 +126,9 @@ class LeaseScheduler:
         """Return the resource vector held by active leases."""
         with self._lock:
             now = self._clock()
-            total = ResourceRequest(cpu=0, ram_gb=0, gpu=0, vram_gb=0,
-                                    gateway_slots=0, verifier_slots=0)
+            total = ResourceRequest(
+                cpu=0, ram_gb=0, gpu=0, vram_gb=0, gateway_slots=0, verifier_slots=0
+            )
             for lease in self._active(now):
                 total = total.plus(lease.request.resources)
             return total
@@ -148,7 +151,17 @@ class LeaseScheduler:
                 # The same exact attempt may be retried after expiry. It receives a
                 # new lease id, while the durable attempt/event history remains intact.
             if not request.resources.fits(self.available()):
-                return Admission(False, reason=AdmissionReason.CAPACITY)
+                available = self.available()
+                blocked = tuple(
+                    name
+                    for name in vars(request.resources)
+                    if getattr(request.resources, name) > getattr(available, name)
+                )
+                return Admission(
+                    False,
+                    reason=AdmissionReason.CAPACITY,
+                    blocked_resources=blocked,
+                )
             lease = Lease(
                 lease_id=uuid.uuid4().hex,
                 request=request,
@@ -198,8 +211,11 @@ class LeaseScheduler:
         """Remove and return expired leases for controller orphan finalization."""
         with self._lock:
             now = self._clock()
-            expired = [lease for lease in self._leases.values()
-                       if not lease.cancelled and now >= lease.expires_at]
+            expired = [
+                lease
+                for lease in self._leases.values()
+                if not lease.cancelled and now >= lease.expires_at
+            ]
             for lease in expired:
                 self.release(lease.lease_id)
             return expired

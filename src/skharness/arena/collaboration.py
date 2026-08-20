@@ -63,9 +63,7 @@ class ExperimentCatalog:
         for result in results:
             previous = self._results.get(result.experiment_id)
             if previous is not None and previous.content_hash != result.content_hash:
-                raise CollaborationError(
-                    f"conflicting result identity: {result.experiment_id}"
-                )
+                raise CollaborationError(f"conflicting result identity: {result.experiment_id}")
             experiment = self._experiments.get(result.experiment_id)
             if experiment is None or experiment.content_hash != result.experiment_hash:
                 raise CollaborationError("result is not bound to the catalog experiment")
@@ -112,7 +110,8 @@ class ExperimentCatalog:
         **new_experiment: Any,
     ) -> Experiment:
         matches = [
-            record for record in self.positive_evidence()
+            record
+            for record in self.positive_evidence()
             if record.evidence_id == immutable_evidence_id
         ]
         if len(matches) != 1:
@@ -131,7 +130,8 @@ class ExperimentCatalog:
     ) -> Experiment:
         source = self._source(source_id, experiment_id)
         return Experiment.model_validate(
-            source.model_dump() | {
+            source.model_dump()
+            | {
                 "id": experiment_id,
                 "attempt": attempt,
                 "parent_id": None,
@@ -168,7 +168,8 @@ class ExperimentCatalog:
         if dict(configuration) == parent.configuration:
             raise CollaborationError("mutation configuration must differ from its parent")
         return Experiment.model_validate(
-            parent.model_dump() | {
+            parent.model_dump()
+            | {
                 "id": experiment_id,
                 "attempt": attempt,
                 "parent_id": parent.id,
@@ -219,7 +220,10 @@ class PositiveEvidence(FrozenModel):
     def from_result(cls, experiment: Experiment, result: Result) -> "PositiveEvidence":
         if result.verification is not VerificationState.VALID:
             raise CollaborationError("positive evidence requires a verified-valid result")
-        if result.experiment_id != experiment.id or result.experiment_hash != experiment.content_hash:
+        if (
+            result.experiment_id != experiment.id
+            or result.experiment_hash != experiment.content_hash
+        ):
             raise CollaborationError("positive result is not bound to the experiment")
         if result.challenge_hash != experiment.challenge_hash:
             raise CollaborationError("positive result challenge does not match experiment")
@@ -262,7 +266,10 @@ class NegativeKnowledge(FrozenModel):
     ) -> "NegativeKnowledge":
         """Create searchable negative evidence bound to verifier/result identity."""
 
-        if result.experiment_id != experiment.id or result.experiment_hash != experiment.content_hash:
+        if (
+            result.experiment_id != experiment.id
+            or result.experiment_hash != experiment.content_hash
+        ):
             raise CollaborationError("negative result is not bound to the experiment")
         if result.challenge_hash != experiment.challenge_hash:
             raise CollaborationError("negative result challenge does not match experiment")
@@ -281,7 +288,9 @@ class NegativeKnowledge(FrozenModel):
             reason_codes=(reason,),
             summary=summary,
             changed_dimensions=experiment.changed_dimensions,
-            artifact_digests=tuple(sorted({item.digest for item in (*experiment.artifacts, *result.artifacts)})),
+            artifact_digests=tuple(
+                sorted({item.digest for item in (*experiment.artifacts, *result.artifacts)})
+            ),
             created_at=created_at or result.created_at,
         )
 
@@ -322,7 +331,10 @@ class NegativeKnowledgeIndex:
                 continue
             if kind is not None and record.kind is not kind:
                 continue
-            if changed_dimension is not None and changed_dimension not in record.changed_dimensions:
+            if (
+                changed_dimension is not None
+                and changed_dimension not in record.changed_dimensions
+            ):
                 continue
             haystack = " ".join(
                 (record.summary, *record.reason_codes, *record.changed_dimensions)
@@ -339,6 +351,25 @@ class RefinementScope(str, Enum):
     EXPERIMENT = "experiment"
     PROJECT = "project"
     GLOBAL = "global"
+
+
+class RefinementTargetKind(str, Enum):
+    """Durable surface a refinement proposes to change."""
+
+    MEMORY = "memory"
+    SKILL = "skill"
+    PROMPT = "prompt"
+    EXECUTABLE_EXTENSION = "executable_extension"
+
+
+class RefinementEvidenceKind(str, Enum):
+    """Trust class assigned by the controller, never by the worker."""
+
+    RAW_REWARD = "raw_reward"
+    VERIFIED_RESULT = "verified_result"
+    CANARY_RESULT = "canary_result"
+    OPERATOR_APPROVAL = "operator_approval"
+    SECURITY_REVIEW = "security_review"
 
 
 class RefinementState(str, Enum):
@@ -359,6 +390,7 @@ class RefinementProposal(FrozenModel):
     id: str
     scope: RefinementScope
     target: str
+    target_kind: RefinementTargetKind = RefinementTargetKind.MEMORY
     proposed_content: str
     evidence_ids: tuple[str, ...]
     proposer: str
@@ -425,6 +457,7 @@ class RefinementJournal:
         *,
         approvers: Iterable[str],
         evidence_exists: Callable[[str], bool],
+        evidence_kind: Callable[[str], RefinementEvidenceKind] | None = None,
     ) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
@@ -433,6 +466,7 @@ class RefinementJournal:
         self.lock_path = self.root / ".journal.lock"
         self.approvers = frozenset(approvers)
         self._evidence_exists = evidence_exists
+        self._evidence_kind = evidence_kind
         self._thread_lock = threading.RLock()
 
     def proposals(self) -> dict[str, RefinementProposal]:
@@ -451,8 +485,7 @@ class RefinementJournal:
             proposed = {
                 event.proposal_id: event.proposal_hash
                 for event in self.events()
-                if event.from_state is None
-                and event.to_state is RefinementState.PROPOSED
+                if event.from_state is None and event.to_state is RefinementState.PROPOSED
             }
             for proposal_id, proposal in records.items():
                 expected = proposed.get(proposal_id)
@@ -488,9 +521,7 @@ class RefinementJournal:
                 raise CollaborationError("proposal cites unknown evidence")
             if proposal.id in self.proposals():
                 raise CollaborationError(f"proposal already exists: {proposal.id}")
-            self._append_json(
-                self.proposals_path, proposal.model_dump_json().encode() + b"\n"
-            )
+            self._append_json(self.proposals_path, proposal.model_dump_json().encode() + b"\n")
             return self._transition(
                 proposal.id,
                 RefinementState.PROPOSED,
@@ -535,9 +566,30 @@ class RefinementJournal:
         self, proposal_id: str, provenance: Provenance, evidence_ids: Iterable[str]
     ) -> RefinementEvent:
         self._require_approver(proposal_id, provenance.actor)
+        self._require_governed_promotion_evidence(proposal_id, evidence_ids)
         return self._transition(
             proposal_id, RefinementState.PROMOTION_AUTHORIZED, provenance, evidence_ids
         )
+
+    def _require_governed_promotion_evidence(
+        self, proposal_id: str, evidence_ids: Iterable[str]
+    ) -> None:
+        """Reject reward-only promotion across every durable refinement surface."""
+        if self._evidence_kind is None:
+            raise CollaborationError("governed evidence classifier required for promotion")
+        proposal = self.proposals()[proposal_id]
+        kinds = {self._evidence_kind(item) for item in evidence_ids}
+        required = {
+            RefinementEvidenceKind.VERIFIED_RESULT,
+            RefinementEvidenceKind.CANARY_RESULT,
+            RefinementEvidenceKind.OPERATOR_APPROVAL,
+        }
+        if proposal.target_kind is RefinementTargetKind.EXECUTABLE_EXTENSION:
+            required.add(RefinementEvidenceKind.SECURITY_REVIEW)
+        missing = required - kinds
+        if missing:
+            names = ",".join(sorted(item.value for item in missing))
+            raise CollaborationError(f"promotion lacks governed evidence: {names}")
 
     def record_promoted(
         self,
@@ -596,12 +648,16 @@ class RefinementJournal:
             evidence = tuple(sorted(set(evidence_ids)))
             if not evidence or any(not self._evidence_exists(item) for item in evidence):
                 raise CollaborationError("transition requires known evidence")
-            if to_state in {
-                RefinementState.CANARY_PASSED,
-                RefinementState.CANARY_FAILED,
-                RefinementState.PROMOTED,
-                RefinementState.ROLLED_BACK,
-            } and not receipt:
+            if (
+                to_state
+                in {
+                    RefinementState.CANARY_PASSED,
+                    RefinementState.CANARY_FAILED,
+                    RefinementState.PROMOTED,
+                    RefinementState.ROLLED_BACK,
+                }
+                and not receipt
+            ):
                 raise CollaborationError("external state transitions require a receipt")
             events = self.events()
             relevant = [event for event in events if event.proposal_id == proposal_id]
@@ -623,9 +679,7 @@ class RefinementJournal:
                 receipt=receipt,
                 prior_event_hash=events[-1].event_hash if events else None,
             ).sealed()
-            self._append_json(
-                self.events_path, event.model_dump_json().encode() + b"\n"
-            )
+            self._append_json(self.events_path, event.model_dump_json().encode() + b"\n")
             return event
 
     @contextmanager
