@@ -63,11 +63,22 @@ class BoundedArenaMetrics:
     _STATES = frozenset(item.value for item in ExperimentState)
     _VERDICTS = frozenset({"unverified", "verifying", "valid", "invalid", "inconclusive"})
     _OUTCOMES = frozenset({"admitted", "capacity", "duplicate", "invalid", "expired"})
-    _SIGNALS = frozenset({
-        "attempts", "lease_expiry", "tokens", "cost", "joules", "oom",
-        "cancellation", "gateway_errors", "frontier_movement", "promotions",
-        "rollbacks", "delayed_incidents",
-    })
+    _SIGNALS = frozenset(
+        {
+            "attempts",
+            "lease_expiry",
+            "tokens",
+            "cost",
+            "joules",
+            "oom",
+            "cancellation",
+            "gateway_errors",
+            "frontier_movement",
+            "promotions",
+            "rollbacks",
+            "delayed_incidents",
+        }
+    )
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -122,15 +133,24 @@ class BoundedArenaMetrics:
             for state, value in sorted(self._transitions.items()):
                 lines.append(f'skharness_arena_transitions_total{{state="{state}"}} {value}')
             for verdict, value in sorted(self._verifications.items()):
-                lines.append(
-                    f'skharness_arena_verifications_total{{verdict="{verdict}"}} {value}'
-                )
+                lines.append(f'skharness_arena_verifications_total{{verdict="{verdict}"}} {value}')
             for outcome, value in sorted(self._admissions.items()):
                 lines.append(f'skharness_arena_admissions_total{{outcome="{outcome}"}} {value}')
             lines.append(f"skharness_arena_gateway_errors_total {self._gateway_errors}")
             for signal, value in sorted(self._signals.items()):
                 lines.append(f'skharness_arena_signal_total{{signal="{signal}"}} {value}')
         return "\n".join(lines) + "\n"
+
+    def snapshot(self) -> dict[str, Any]:
+        """Bounded counter values for authenticated status JSON."""
+        with self._lock:
+            return {
+                "transitions": dict(sorted(self._transitions.items())),
+                "verifications": dict(sorted(self._verifications.items())),
+                "admissions": dict(sorted(self._admissions.items())),
+                "gateway_errors": self._gateway_errors,
+                "signals": dict(sorted(self._signals.items())),
+            }
 
 
 class ArenaStatusService:
@@ -143,29 +163,39 @@ class ArenaStatusService:
         scheduler: LeaseScheduler | None = None,
         experiments: Callable[[], Iterable[Experiment]] | None = None,
         results: Callable[[], Iterable[Result]] | None = None,
+        refinements: Callable[[], Iterable[Any]] | None = None,
+        scheduled_runs: Callable[[], Iterable[Mapping[str, Any]]] | None = None,
         gateway_probe: Probe | None = None,
         verifier_probe: Probe | None = None,
         gpu_probe: Probe | None = None,
+        serving_backend_probe: Probe | None = None,
         require_gateway: bool = True,
         require_verifier: bool = True,
         require_gpu: bool = False,
+        require_serving_backend: bool | None = None,
         metrics: BoundedArenaMetrics | None = None,
     ) -> None:
         self.store = store
         self.scheduler = scheduler
         self._experiments = experiments or (store.read_experiments if store else lambda: ())
         self._results = results or (store.read_results if store else lambda: ())
+        self._refinements = refinements or (lambda: ())
+        self._scheduled_runs = scheduled_runs or (lambda: ())
         self._probes = {
             "store": self._store_probe,
             "skgateway": gateway_probe,
             "verifier": verifier_probe,
             "gpu": gpu_probe,
+            "serving_backend": serving_backend_probe,
         }
         self._required = {
             "store": store is not None,
             "skgateway": require_gateway,
             "verifier": require_verifier,
             "gpu": require_gpu,
+            "serving_backend": (
+                require_gpu if require_serving_backend is None else require_serving_backend
+            ),
         }
         self.metrics = metrics or BoundedArenaMetrics()
 
@@ -173,9 +203,13 @@ class ArenaStatusService:
         if self.store is None:
             return ProbeResult(None, "arena store not configured")
         self.store.read_all_events()
-        required_dirs = (self.store.events_dir, self.store.artifacts_dir,
-                         self.store.specs_dir, self.store.experiments_dir,
-                         self.store.results_dir)
+        required_dirs = (
+            self.store.events_dir,
+            self.store.artifacts_dir,
+            self.store.specs_dir,
+            self.store.experiments_dir,
+            self.store.results_dir,
+        )
         unwritable = [str(path) for path in required_dirs if not os.access(path, os.W_OK)]
         if unwritable:
             return ProbeResult(False, "unwritable arena directories: " + ", ".join(unwritable))
@@ -204,15 +238,89 @@ class ArenaStatusService:
         events = self._events()
         current = self._current_attempts(events)
         counts = Counter(row["state"] for row in current)
+        now = datetime.now(timezone.utc)
+        proposed = [row for row in current if row["state"] == ExperimentState.PROPOSED.value]
+        queue_ages = [
+            max(0.0, (now - datetime.fromisoformat(row["updated_at"])).total_seconds())
+            for row in proposed
+        ]
+        experiments = tuple(self._experiments())
+        results = tuple(self._results())
+        refinement_counts = Counter(
+            getattr(getattr(event, "to_state", None), "value", str(getattr(event, "to_state", "")))
+            for event in self._refinements()
+        )
+        scheduled = tuple(dict(row) for row in self._scheduled_runs())
         return {
             **self.liveness(),
             **ready,
             "observed_at": datetime.now(timezone.utc).isoformat(),
             "attempts": {"total": len(current), "by_state": dict(sorted(counts.items()))},
-            "scheduler": self.scheduler.snapshot() if self.scheduler else {
-                "active_leases": 0, "configured": False
+            "queue": {"depth": len(proposed), "oldest_age_s": max(queue_ages, default=None)},
+            "retries": {"attempts_after_first": sum(row["attempt"] > 1 for row in current)},
+            "budgets": _budget_status(experiments),
+            "models": _field_counts(experiments, "served_model", "requested_model"),
+            "backends": _field_counts(experiments, "gateway_backend_id"),
+            "verifications": dict(
+                sorted(Counter(result.verification.value for result in results).items())
+            ),
+            "promotions": refinement_counts.get("promoted", 0),
+            "rollbacks": refinement_counts.get("rolled_back", 0),
+            "observability": self.metrics.snapshot(),
+            "scheduled_jobs": {
+                "known": len({row.get("job") for row in scheduled if row.get("job")}),
+                "failed_runs": sum(_scheduled_failed(row) for row in scheduled),
+                "stale": sum(bool(row.get("stale")) for row in scheduled),
             },
+            "scheduler": self.scheduler.snapshot()
+            if self.scheduler
+            else {"active_leases": 0, "configured": False},
         }
+
+    def runs(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        """Immutable experiment/run ledger joined to lifecycle and result truth."""
+        latest = {
+            (row["experiment_id"], row["attempt"]): row
+            for row in self._current_attempts(self._events())
+        }
+        result_by_experiment = {row.experiment_id: row for row in self._results()}
+        rows = []
+        for experiment in sorted(self._experiments(), key=lambda row: (row.created_at, row.id)):
+            event = latest.get((experiment.id, experiment.attempt))
+            result = result_by_experiment.get(experiment.id)
+            rows.append(
+                {
+                    "run_id": experiment.run_id,
+                    "experiment_id": experiment.id,
+                    "attempt": experiment.attempt,
+                    "state": event["state"] if event else "not_started",
+                    "updated_at": event["updated_at"]
+                    if event
+                    else experiment.created_at.isoformat(),
+                    "requested_model": experiment.requested_model,
+                    "served_model": experiment.served_model,
+                    "backend": experiment.gateway_backend_id,
+                    "gateway_request_id": experiment.gateway_request_id,
+                    "budgets": experiment.budgets.model_dump(mode="json"),
+                    "verification": result.verification.value if result else "not_recorded",
+                    "verification_reason": result.verification_reason if result else None,
+                    "failure": event["payload"] if event and event["state"] == "failed" else None,
+                }
+            )
+        return rows[-max(1, min(limit, 500)) :]
+
+    def scheduled_jobs(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        rows = [dict(row) for row in self._scheduled_runs()]
+        return rows[-max(1, min(limit, 500)) :]
+
+    def failures(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        failures = [row for row in self.runs(limit=500) if row["failure"] is not None]
+        failures.extend(
+            {"source": "scheduled_job", **dict(row)}
+            for row in self._scheduled_runs()
+            if _scheduled_failed(row)
+        )
+        return failures[-max(1, min(limit, 500)) :]
 
     def _events(self) -> list[ExperimentEvent]:
         return self.store.read_all_events() if self.store is not None else []
@@ -224,7 +332,9 @@ class ArenaStatusService:
             key = (event.experiment_id, event.attempt)
             prior = latest.get(key)
             if prior is None or (event.timestamp, event.writer_id, event.sequence) > (
-                prior.timestamp, prior.writer_id, prior.sequence
+                prior.timestamp,
+                prior.writer_id,
+                prior.sequence,
             ):
                 latest[key] = event
         return [
@@ -253,8 +363,11 @@ class ArenaStatusService:
                 observed = event.payload.get("challenge_id")
                 if isinstance(observed, str):
                     challenge_by_attempt[(event.experiment_id, event.attempt)] = observed
-            rows = [row for row in rows if challenge_by_attempt.get(
-                (row["experiment_id"], row["attempt"])) == challenge_id]
+            rows = [
+                row
+                for row in rows
+                if challenge_by_attempt.get((row["experiment_id"], row["attempt"])) == challenge_id
+            ]
         if state is not None:
             rows = [row for row in rows if row["state"] == state]
         return rows[: max(1, min(limit, 500))]
@@ -268,14 +381,16 @@ class ArenaStatusService:
         rows = []
         for path in sorted(self.store.specs_dir.glob("*.json")):
             spec = ChallengeSpec.model_validate_json(path.read_bytes())
-            rows.append({
-                "id": spec.id,
-                "version": spec.version,
-                "title": spec.title,
-                "content_hash": spec.content_hash,
-                "hardware_class": spec.hardware.hardware_class,
-                "required_model": spec.model.model_id,
-            })
+            rows.append(
+                {
+                    "id": spec.id,
+                    "version": spec.version,
+                    "title": spec.title,
+                    "content_hash": spec.content_hash,
+                    "hardware_class": spec.hardware.hardware_class,
+                    "required_model": spec.model.model_id,
+                }
+            )
         return rows
 
     def verifications(self, *, limit: int = 100) -> list[dict[str, Any]]:
@@ -320,9 +435,13 @@ class ArenaStatusService:
             }
             candidates.append(VerifiedParetoCandidate.from_result(result, summaries))
         return [
-            {"experiment_id": row.candidate.experiment_id,
-             "metrics": {name: vars(summary) for name, summary in row.candidate.metrics.items()},
-             "verification_evidence_id": row.result_hash}
+            {
+                "experiment_id": row.candidate.experiment_id,
+                "metrics": {
+                    name: vars(summary) for name, summary in row.candidate.metrics.items()
+                },
+                "verification_evidence_id": row.result_hash,
+            }
             for row in verified_pareto_frontier(candidates, objectives)
         ]
 
@@ -338,10 +457,41 @@ def _measurement_summary(measurement):
         minimum=min(values),
         maximum=max(values),
         confidence_low=measurement.confidence_low
-        if measurement.confidence_low is not None else measurement.mean,
+        if measurement.confidence_low is not None
+        else measurement.mean,
         confidence_high=measurement.confidence_high
-        if measurement.confidence_high is not None else measurement.mean,
+        if measurement.confidence_high is not None
+        else measurement.mean,
     )
+
+
+def _field_counts(experiments: Iterable[Experiment], primary: str, fallback: str | None = None):
+    values = Counter()
+    unknown = 0
+    for experiment in experiments:
+        value = getattr(experiment, primary)
+        if not value and fallback:
+            value = getattr(experiment, fallback)
+        if value:
+            values[str(value)] += 1
+        else:
+            unknown += 1
+    return {"by_value": dict(sorted(values.items())), "unknown": unknown}
+
+
+def _budget_status(experiments: Iterable[Experiment]) -> dict[str, Any]:
+    rows = tuple(experiments)
+    fields = ("wall_seconds", "token_limit", "cost_limit", "energy_joules", "concurrency")
+    return {
+        "experiments": len(rows),
+        "configured": {
+            field: sum(getattr(row.budgets, field) is not None for row in rows) for field in fields
+        },
+    }
+
+
+def _scheduled_failed(row: Mapping[str, Any]) -> bool:
+    return row.get("ok") is False or row.get("status") in {"failed", "error"}
 
 
 def objectives_from_query(raw: str) -> tuple[MetricObjective, ...]:

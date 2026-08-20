@@ -12,9 +12,13 @@ from skharness.arena.models import (
     Observation,
     Result,
 )
-from skharness.arena.qualification import qualify_execution_records
+from skharness.arena.qualification import (
+    FrozenExactOutputBackend,
+    qualify_execution_records,
+)
 from skharness.arena.status import ArenaStatusService
 from skharness.arena.store import ArenaStore, CorruptEventLogError
+from skharness.arena.verifier import ControlKind, PrivateEvaluationHandle
 
 
 def record(output: str, *, claimed_score: float = 1.0) -> dict:
@@ -32,7 +36,9 @@ def record(output: str, *, claimed_score: float = 1.0) -> dict:
         challenge_hash="sha256:frozen-challenge",
         actor="service:test",
         harness="pi",
+        card_id="card-test",
         run_id="qualification:pi",
+        repository_url="https://example.invalid/repo.git",
         repository_base_sha="fixture",
         image_digest="pi:test",
         sbom_digest="fixture",
@@ -135,3 +141,14 @@ def test_store_rejects_record_whose_filename_is_not_its_content_hash(tmp_path):
         assert "hash mismatch" in str(exc)
     else:
         raise AssertionError("misnamed content-addressed record must fail closed")
+
+
+def test_frozen_evaluator_controls_execute_real_exact_output_behavior():
+    backend = FrozenExactOutputBackend(
+        expected_output=b"qualified", artifacts={}, expected_model="model"
+    )
+    handle = PrivateEvaluationHandle("frozen", "v1", "private")
+
+    assert backend.run_control(ControlKind.GOLD, handle) is True
+    assert backend.run_control(ControlKind.NO_OP, handle) is False
+    assert backend.run_control(ControlKind.ADVERSARIAL, handle) is False

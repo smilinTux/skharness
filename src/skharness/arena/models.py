@@ -13,7 +13,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 def canonical_bytes(value: BaseModel | dict[str, Any]) -> bytes:
     """Return stable UTF-8 JSON bytes; hashes never depend on key insertion order."""
-    raw = value.model_dump(mode="json", exclude_none=True) if isinstance(value, BaseModel) else value
+    raw = (
+        value.model_dump(mode="json", exclude_none=True) if isinstance(value, BaseModel) else value
+    )
     return json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
 
@@ -160,8 +162,9 @@ class Experiment(FrozenModel):
     challenge_hash: str
     actor: str
     harness: str
-    card_id: str | None = None
+    card_id: str
     run_id: str
+    repository_url: str
     repository_base_sha: str
     repository_result_sha: str | None = None
     image_digest: str
@@ -271,7 +274,9 @@ class ExperimentEvent(FrozenModel):
             },
         }
         if self.to_state not in allowed.get(self.from_state, set()):
-            raise ValueError(f"illegal experiment transition {self.from_state!r} -> {self.to_state!r}")
+            raise ValueError(
+                f"illegal experiment transition {self.from_state!r} -> {self.to_state!r}"
+            )
         return self
 
     def calculated_hash(self) -> str:

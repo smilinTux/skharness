@@ -236,6 +236,7 @@ def immutable_execution_records(args: argparse.Namespace, evidence: dict) -> lis
             harness=kind,
             card_id=args.card_id,
             run_id=f"{args.session_id}:{kind}",
+            repository_url="local://qualification-worktree",
             repository_base_sha="qualification-worktree-unresolved",
             image_digest=args.image if kind == "pi" else "gateway-managed",
             sbom_digest="not-observed",

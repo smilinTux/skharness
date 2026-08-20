@@ -33,7 +33,9 @@ def experiment(identifier: str = "base") -> Experiment:
         challenge_hash="sha256:challenge",
         actor="agent:worker",
         harness="pi",
+        card_id="card-test",
         run_id=f"run-{identifier}",
+        repository_url="https://example.invalid/repo.git",
         repository_base_sha="a" * 40,
         repository_result_sha="b" * 40,
         image_digest="sha256:image",
@@ -66,7 +68,10 @@ def test_discovery_reproduction_and_mutation_reset_runtime_evidence():
     assert catalog.discover(challenge_hash="sha256:challenge")[0].experiment == base
 
     reproduction = catalog.reproduce(
-        "base", experiment_id="repro", actor="agent:two", run_id="run-repro",
+        "base",
+        experiment_id="repro",
+        actor="agent:two",
+        run_id="run-repro",
         created_at=NOW,
     )
     assert reproduction.reproduces_id == "base"
@@ -76,8 +81,12 @@ def test_discovery_reproduction_and_mutation_reset_runtime_evidence():
     assert reproduction.repository_result_sha is None
 
     mutation = catalog.mutate(
-        "base", experiment_id="mutant", actor="agent:three", run_id="run-mutant",
-        changed_dimensions=("configuration.batch",), configuration={"batch": 2},
+        "base",
+        experiment_id="mutant",
+        actor="agent:three",
+        run_id="run-mutant",
+        changed_dimensions=("configuration.batch",),
+        configuration={"batch": 2},
         created_at=NOW,
     )
     assert mutation.parent_id == "base"
@@ -85,8 +94,12 @@ def test_discovery_reproduction_and_mutation_reset_runtime_evidence():
     assert mutation.configuration == {"batch": 2}
     with pytest.raises(CollaborationError, match="must differ"):
         catalog.mutate(
-            "base", experiment_id="noop", actor="agent:three", run_id="run-noop",
-            changed_dimensions=("configuration.batch",), configuration={"batch": 1},
+            "base",
+            experiment_id="noop",
+            actor="agent:three",
+            run_id="run-noop",
+            changed_dimensions=("configuration.batch",),
+            configuration={"batch": 1},
             created_at=NOW,
         )
 
@@ -102,11 +115,15 @@ def test_negative_results_are_searchable_by_reason_and_changed_dimension():
         changed_dimensions=("configuration.batch",),
         created_at=NOW,
     )
-    second = first.model_copy(update={
-        "evidence_id": "ev-cache", "experiment_id": "cache",
-        "reason_codes": ("cache_undisclosed",), "summary": "Undisclosed prompt cache",
-        "changed_dimensions": ("engine.cache",),
-    })
+    second = first.model_copy(
+        update={
+            "evidence_id": "ev-cache",
+            "experiment_id": "cache",
+            "reason_codes": ("cache_undisclosed",),
+            "summary": "Undisclosed prompt cache",
+            "changed_dimensions": ("engine.cache",),
+        }
+    )
     index = NegativeKnowledgeIndex((first, second))
     assert index.search("VRAM quality", changed_dimension="configuration.batch") == (first,)
     assert index.search("cache", kind=NegativeKind.INVALID) == (second,)
@@ -160,47 +177,63 @@ def test_refinement_is_fail_closed_and_rollback_is_evidence_linked(tmp_path):
 
     with pytest.raises(CollaborationError, match="independent authorized approver"):
         journal.authorize_canary(
-            proposal.id, provenance("agent:worker", "refinement.canary.authorize"),
+            proposal.id,
+            provenance("agent:worker", "refinement.canary.authorize"),
             proposal.evidence_ids,
         )
     with pytest.raises(CollaborationError, match="illegal refinement transition"):
         journal.authorize_promotion(
-            proposal.id, provenance("operator:casey", "refinement.promote.authorize"),
+            proposal.id,
+            provenance("operator:casey", "refinement.promote.authorize"),
             proposal.evidence_ids,
         )
 
     journal.authorize_canary(
-        proposal.id, provenance("operator:casey", "refinement.canary.authorize"),
+        proposal.id,
+        provenance("operator:casey", "refinement.canary.authorize"),
         proposal.evidence_ids,
     )
     with pytest.raises(CollaborationError, match="receipt"):
         journal.record_canary(
-            proposal.id, provenance("service:canary", "refinement.canary.result"),
-            passed=True, evidence_ids=(evidence_id(b"canary report"),), receipt="",
+            proposal.id,
+            provenance("service:canary", "refinement.canary.result"),
+            passed=True,
+            evidence_ids=(evidence_id(b"canary report"),),
+            receipt="",
         )
     journal.record_canary(
-        proposal.id, provenance("service:canary", "refinement.canary.result"),
-        passed=True, evidence_ids=(evidence_id(b"canary report"),), receipt="canary:42",
+        proposal.id,
+        provenance("service:canary", "refinement.canary.result"),
+        passed=True,
+        evidence_ids=(evidence_id(b"canary report"),),
+        receipt="canary:42",
     )
     journal.approve(
-        proposal.id, provenance("operator:casey", "refinement.approve"),
+        proposal.id,
+        provenance("operator:casey", "refinement.approve"),
         (evidence_id(b"approval"),),
     )
     journal.authorize_promotion(
-        proposal.id, provenance("operator:casey", "refinement.promote.authorize"),
+        proposal.id,
+        provenance("operator:casey", "refinement.promote.authorize"),
         (evidence_id(b"approval"),),
     )
     journal.record_promoted(
-        proposal.id, provenance("service:skmemory", "refinement.promote.result"),
-        evidence_ids=(evidence_id(b"promotion receipt"),), receipt="skmemory:version:2",
+        proposal.id,
+        provenance("service:skmemory", "refinement.promote.result"),
+        evidence_ids=(evidence_id(b"promotion receipt"),),
+        receipt="skmemory:version:2",
     )
     journal.authorize_rollback(
-        proposal.id, provenance("operator:casey", "refinement.rollback.authorize"),
+        proposal.id,
+        provenance("operator:casey", "refinement.rollback.authorize"),
         (evidence_id(b"incident"),),
     )
     journal.record_rolled_back(
-        proposal.id, provenance("service:skmemory", "refinement.rollback.result"),
-        evidence_ids=(evidence_id(b"rollback receipt"),), receipt="skmemory:version:1",
+        proposal.id,
+        provenance("service:skmemory", "refinement.rollback.result"),
+        evidence_ids=(evidence_id(b"rollback receipt"),),
+        receipt="skmemory:version:1",
     )
 
     assert journal.state(proposal.id) is RefinementState.ROLLED_BACK
@@ -221,9 +254,13 @@ def test_unknown_evidence_and_corrupt_journal_fail_closed(tmp_path):
         tmp_path, approvers={"operator:casey"}, evidence_exists=lambda _: False
     )
     proposal = RefinementProposal(
-        id="refine-unknown", scope=RefinementScope.GLOBAL, target="skmemory:global",
-        proposed_content="Never auto-promote this", evidence_ids=("missing",),
-        proposer="agent:worker", created_at=NOW,
+        id="refine-unknown",
+        scope=RefinementScope.GLOBAL,
+        target="skmemory:global",
+        proposed_content="Never auto-promote this",
+        evidence_ids=("missing",),
+        proposer="agent:worker",
+        created_at=NOW,
     )
     with pytest.raises(CollaborationError, match="unknown evidence"):
         journal.propose(proposal, provenance("agent:worker", "refinement.propose"))

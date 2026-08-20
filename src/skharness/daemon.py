@@ -12,6 +12,7 @@ skharness.auth bearer: with the P0 deny-all verifier still in force, every calle
 is 401/403 and NOTHING actuates, so inject is inert in prod until the real
 verifier lands (R2.4). Bind a Tailscale IP only (serve.py enforces this).
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -105,13 +106,15 @@ INJECT_CAPABILITY = SCOPE_WRITE
 # decision); ``skcode.inject`` and ``skcode.dispatch`` are additionally PDP-decided
 # and carry a capauth DEFAULT_RULES row.
 # --------------------------------------------------------------------------- #
-PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset({
-    ("GET", "/.well-known/skworld-module.json"),
-    ("GET", "/"),
-    ("GET", "/app"),
-    ("GET", "/livez"),
-    ("GET", "/readyz"),
-})
+PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("GET", "/.well-known/skworld-module.json"),
+        ("GET", "/"),
+        ("GET", "/app"),
+        ("GET", "/livez"),
+        ("GET", "/readyz"),
+    }
+)
 
 #: (METHOD, path_format) -> required scope for every gated route. "WS" is the
 #: websocket stream (browsers cannot set headers, so its token rides the query).
@@ -125,6 +128,9 @@ ROUTE_SCOPES: dict[tuple[str, str], str] = {
     ("GET", "/api/v1/arena/status"): SCOPE_READ,
     ("GET", "/api/v1/arena/challenges"): SCOPE_READ,
     ("GET", "/api/v1/arena/attempts"): SCOPE_READ,
+    ("GET", "/api/v1/arena/runs"): SCOPE_READ,
+    ("GET", "/api/v1/arena/jobs"): SCOPE_READ,
+    ("GET", "/api/v1/arena/failures"): SCOPE_READ,
     ("GET", "/api/v1/arena/leases"): SCOPE_READ,
     ("GET", "/api/v1/arena/verifications"): SCOPE_READ,
     ("GET", "/api/v1/arena/frontier"): SCOPE_READ,
@@ -278,9 +284,15 @@ def build_daemon_app(
         decision = authorize_inject(subject, resource, {})
         _emit_decision_obligations(decision)
         if not bool(getattr(decision, "allow", False)):
-            _emit_audit({"event": "skcode.inject", "subject": subject,
-                         "resource": resource, "decision": "deny",
-                         "reason": getattr(decision, "reason", "")})
+            _emit_audit(
+                {
+                    "event": "skcode.inject",
+                    "subject": subject,
+                    "resource": resource,
+                    "decision": "deny",
+                    "reason": getattr(decision, "reason", ""),
+                }
+            )
             raise HTTPException(403, "inject not authorized")
 
     @app.get("/.well-known/skworld-module.json")
@@ -311,20 +323,42 @@ def build_daemon_app(
         return JSONResponse({"challenges": arena.challenges()})
 
     @app.get("/api/v1/arena/attempts")
-    async def arena_attempts_route(challenge_id: str | None = None, state: str | None = None,
-                                   limit: int = 100,
-                                   authorization: str | None = Header(default=None)):
+    async def arena_attempts_route(
+        challenge_id: str | None = None,
+        state: str | None = None,
+        limit: int = 100,
+        authorization: str | None = Header(default=None),
+    ):
         _auth(authorization, SCOPE_READ)
         if state is not None and state not in {item.value for item in ExperimentState}:
             raise HTTPException(400, "unknown experiment state")
-        return JSONResponse({"attempts": arena.attempts(
-            challenge_id=challenge_id, state=state, limit=limit)})
+        return JSONResponse(
+            {"attempts": arena.attempts(challenge_id=challenge_id, state=state, limit=limit)}
+        )
 
     @app.get("/api/v1/arena/verifications")
-    async def arena_verifications_route(limit: int = 100,
-                                        authorization: str | None = Header(default=None)):
+    async def arena_verifications_route(
+        limit: int = 100, authorization: str | None = Header(default=None)
+    ):
         _auth(authorization, SCOPE_READ)
         return JSONResponse({"verifications": arena.verifications(limit=limit)})
+
+    @app.get("/api/v1/arena/runs")
+    async def arena_runs_route(limit: int = 100, authorization: str | None = Header(default=None)):
+        _auth(authorization, SCOPE_READ)
+        return JSONResponse({"runs": arena.runs(limit=limit)})
+
+    @app.get("/api/v1/arena/jobs")
+    async def arena_jobs_route(limit: int = 100, authorization: str | None = Header(default=None)):
+        _auth(authorization, SCOPE_READ)
+        return JSONResponse({"jobs": arena.scheduled_jobs(limit=limit)})
+
+    @app.get("/api/v1/arena/failures")
+    async def arena_failures_route(
+        limit: int = 100, authorization: str | None = Header(default=None)
+    ):
+        _auth(authorization, SCOPE_READ)
+        return JSONResponse({"failures": arena.failures(limit=limit)})
 
     @app.get("/api/v1/arena/leases")
     async def arena_leases_route(authorization: str | None = Header(default=None)):
@@ -332,8 +366,9 @@ def build_daemon_app(
         return JSONResponse({"leases": arena.leases()})
 
     @app.get("/api/v1/arena/frontier")
-    async def arena_frontier_route(challenge_hash: str, objectives: str,
-                                   authorization: str | None = Header(default=None)):
+    async def arena_frontier_route(
+        challenge_hash: str, objectives: str, authorization: str | None = Header(default=None)
+    ):
         _auth(authorization, SCOPE_READ)
         try:
             parsed = objectives_from_query(objectives)
@@ -343,8 +378,9 @@ def build_daemon_app(
         return JSONResponse({"challenge_hash": challenge_hash, "frontier": rows})
 
     @app.get("/api/v1/arena/lineage/{experiment_id}")
-    async def arena_lineage_route(experiment_id: str,
-                                  authorization: str | None = Header(default=None)):
+    async def arena_lineage_route(
+        experiment_id: str, authorization: str | None = Header(default=None)
+    ):
         _auth(authorization, SCOPE_READ)
         row = arena.lineage(experiment_id)
         if row is None:
@@ -376,8 +412,12 @@ def build_daemon_app(
         raise HTTPException(404, "session not found")
 
     @app.get("/api/v1/sessions/{sid}/events")
-    async def session_events(sid: str, before_seq: int | None = None, limit: int = 100,
-                             authorization: str | None = Header(default=None)):
+    async def session_events(
+        sid: str,
+        before_seq: int | None = None,
+        limit: int = 100,
+        authorization: str | None = Header(default=None),
+    ):
         # Archive paging over the capped per-session JSONL (spec 5.3): the client
         # reconnect/scrollback path, same read scope as the live WS tail. When the
         # daemon was built with no persisting event_store (persist=False, the
@@ -447,26 +487,41 @@ def build_daemon_app(
         if ctx is None:
             raise HTTPException(409, "session has no gradable worktree")
         repo, worktree, acceptance = ctx
-        result = _ratify(repo, worktree, acceptance, harness)   # grade only, no merge
+        result = _ratify(repo, worktree, acceptance, harness)  # grade only, no merge
         if audit_log is not None:
-            audit_log(f"ratify {sid} {'PASS' if result.passed else 'FAIL'} "
-                      f"score={result.score}")
+            audit_log(f"ratify {sid} {'PASS' if result.passed else 'FAIL'} score={result.score}")
         if not result.passed:
             # A failed gate needs an operator: emit a needs_input event (this drives
             # the sk-alert push in production).
             if emit_event is not None:
-                emit_event(sid, SessionEvent(
-                    type=EventType.NEEDS_INPUT,
-                    text=f"ratify failed for {sid} (score={result.score})",
-                    data={"sid": sid, "score": result.score, "passed": False,
-                          "notes": result.notes}))
-        return JSONResponse({"sid": sid, "score": result.score,
-                             "passed": result.passed, "notes": result.notes,
-                             "artifact": result.artifact, "mode": result.mode})
+                emit_event(
+                    sid,
+                    SessionEvent(
+                        type=EventType.NEEDS_INPUT,
+                        text=f"ratify failed for {sid} (score={result.score})",
+                        data={
+                            "sid": sid,
+                            "score": result.score,
+                            "passed": False,
+                            "notes": result.notes,
+                        },
+                    ),
+                )
+        return JSONResponse(
+            {
+                "sid": sid,
+                "score": result.score,
+                "passed": result.passed,
+                "notes": result.notes,
+                "artifact": result.artifact,
+                "mode": result.mode,
+            }
+        )
 
     @app.post("/api/v1/sessions/{sid}/inject")
-    async def inject_session(sid: str, request: Request,
-                             authorization: str | None = Header(default=None)):
+    async def inject_session(
+        sid: str, request: Request, authorization: str | None = Header(default=None)
+    ):
         # The P1 session WRITE surface: send operator text into a running session
         # as keystrokes. Gated exactly like the other bearer routes and fails
         # closed BEFORE any actuation: with the P0 deny-all verifier a request
@@ -488,16 +543,18 @@ def build_daemon_app(
         # CR-6.2 C3: enrich the inject audit with the subject + a content HASH
         # (never the raw keystrokes) so the action is attributable to WHO + WHAT
         # without recording secrets typed into a session.
-        _emit_audit({
-            "event": "skcode.inject",
-            "subject": subject,
-            "sid": sid,
-            "decision": "allow",
-            "injected": bool(result.get("injected")),
-            "reason": result.get("reason", ""),
-            "content_sha256": _content_hash(text),
-            "content_len": len(text or ""),
-        })
+        _emit_audit(
+            {
+                "event": "skcode.inject",
+                "subject": subject,
+                "sid": sid,
+                "decision": "allow",
+                "injected": bool(result.get("injected")),
+                "reason": result.get("reason", ""),
+                "content_sha256": _content_hash(text),
+                "content_len": len(text or ""),
+            }
+        )
         return JSONResponse(result)
 
     @app.post("/api/v1/sessions/{sid}/deny")
@@ -526,19 +583,21 @@ def build_daemon_app(
         # ``interrupted`` (was in-flight work really stopped); a 200 alone is
         # never the answer.
         result = await harness.deny(sid)
-        _emit_audit({
-            "event": "skcode.deny",
-            "subject": subject,
-            "sid": sid,
-            # "decision" is the AUTHORIZATION outcome (the PDP let this caller
-            # refuse); "denied" is the REFUSAL outcome (the harness actually
-            # refused something). They are different questions and both belong
-            # in the record.
-            "decision": "allow",
-            "denied": bool(result.get("denied")),
-            "interrupted": bool(result.get("interrupted")),
-            "reason": result.get("reason", ""),
-        })
+        _emit_audit(
+            {
+                "event": "skcode.deny",
+                "subject": subject,
+                "sid": sid,
+                # "decision" is the AUTHORIZATION outcome (the PDP let this caller
+                # refuse); "denied" is the REFUSAL outcome (the harness actually
+                # refused something). They are different questions and both belong
+                # in the record.
+                "decision": "allow",
+                "denied": bool(result.get("denied")),
+                "interrupted": bool(result.get("interrupted")),
+                "reason": result.get("reason", ""),
+            }
+        )
         return JSONResponse(result)
 
     @app.get("/api/v1/dispatch/targets")
@@ -550,15 +609,18 @@ def build_daemon_app(
         # client's target choice. Gated on the dispatch scope, so a view/inject-only
         # device sees nothing to dispatch.
         _auth(authorization, SCOPE_DISPATCH)
-        base = {"harnesses": [harness.name], "hosts": [host_id],
-                "repos": [], "profiles": ["sandbox", "full"]}
+        base = {
+            "harnesses": [harness.name],
+            "hosts": [host_id],
+            "repos": [],
+            "profiles": ["sandbox", "full"],
+        }
         if dispatch_targets is not None:
             base.update(dispatch_targets() or {})
         return JSONResponse({"advisory": True, **base})
 
     @app.post("/api/v1/dispatch")
-    async def dispatch_route(request: Request,
-                             authorization: str | None = Header(default=None)):
+    async def dispatch_route(request: Request, authorization: str | None = Header(default=None)):
         # The RCE surface. Fail-closed gate order (spec 7.4):
         #   0. emergency brake: if dispatch is paused, 503 REGARDLESS of auth, and
         #      nothing downstream (auth, authz, spawn) runs.
@@ -594,36 +656,69 @@ def build_daemon_app(
         decision = authorize_dispatch(subject, resource, {"permission_mode": permission_mode})
         _emit_decision_obligations(decision)
         allow = bool(getattr(decision, "allow", False))
-        _emit_audit({
-            "event": "skcode.dispatch",
-            "subject": subject,
-            "decision": "allow" if allow else "deny",
-            "request": {"harness": str(body.get("harness", "") or ""), "host": host_id,
-                        "repo": repo, "branch": branch, "profile": profile,
-                        "permission_mode": permission_mode, "mode": mode,
-                        "model": str(body.get("model", "") or ""),
-                        "prompt_len": len(prompt)},
-            "reason": getattr(decision, "reason", ""),
-        })
+        _emit_audit(
+            {
+                "event": "skcode.dispatch",
+                "subject": subject,
+                "decision": "allow" if allow else "deny",
+                "request": {
+                    "harness": str(body.get("harness", "") or ""),
+                    "host": host_id,
+                    "repo": repo,
+                    "branch": branch,
+                    "profile": profile,
+                    "permission_mode": permission_mode,
+                    "mode": mode,
+                    "model": str(body.get("model", "") or ""),
+                    "prompt_len": len(prompt),
+                },
+                "reason": getattr(decision, "reason", ""),
+            }
+        )
         if not allow:
             raise HTTPException(403, "dispatch not authorized")
         #   5. spawn. The harness re-runs the RCE input guards (allowlist / branch /
         #      charset) and fails closed with SpawnRejected => 400 (never a 5xx),
         #      so a bad repo/branch/name never reaches a subprocess.
         desc = SessionDescriptor(
-            host=host_id, harness=str(body.get("harness", "") or harness.name),
-            repo=repo, branch=branch, model=str(body.get("model", "") or ""),
-            quality=profile, permission_mode=permission_mode, mode=mode)
+            host=host_id,
+            harness=str(body.get("harness", "") or harness.name),
+            repo=repo,
+            branch=branch,
+            model=str(body.get("model", "") or ""),
+            quality=profile,
+            permission_mode=permission_mode,
+            mode=mode,
+        )
         try:
             session = await harness.spawn(desc, prompt=prompt)
         except SpawnRejected as exc:
-            _emit_audit({"event": "skcode.dispatch.rejected", "subject": subject,
-                         "resource": resource, "reason": str(exc)})
+            _emit_audit(
+                {
+                    "event": "skcode.dispatch.rejected",
+                    "subject": subject,
+                    "resource": resource,
+                    "reason": str(exc),
+                }
+            )
             raise HTTPException(400, f"spawn rejected: {exc}")
-        _emit_audit({"event": "skcode.dispatch.spawned", "subject": subject,
-                     "sid": session.sid, "resource": resource})
-        return JSONResponse({"sid": session.sid, "status": session.status,
-                             "branch": session.branch, "profile": profile, "mode": mode})
+        _emit_audit(
+            {
+                "event": "skcode.dispatch.spawned",
+                "subject": subject,
+                "sid": session.sid,
+                "resource": resource,
+            }
+        )
+        return JSONResponse(
+            {
+                "sid": session.sid,
+                "status": session.status,
+                "branch": session.branch,
+                "profile": profile,
+                "mode": mode,
+            }
+        )
 
     @app.post("/api/v1/sessions/{sid}/cancel")
     async def cancel_session(sid: str, authorization: str | None = Header(default=None)):
@@ -643,13 +738,15 @@ def build_daemon_app(
         decision = authorize_dispatch(subject, resource, {})
         _emit_decision_obligations(decision)
         allow = bool(getattr(decision, "allow", False))
-        _emit_audit({
-            "event": "skcode.cancel",
-            "subject": subject,
-            "sid": sid,
-            "decision": "allow" if allow else "deny",
-            "reason": getattr(decision, "reason", ""),
-        })
+        _emit_audit(
+            {
+                "event": "skcode.cancel",
+                "subject": subject,
+                "sid": sid,
+                "decision": "allow" if allow else "deny",
+                "reason": getattr(decision, "reason", ""),
+            }
+        )
         if not allow:
             raise HTTPException(403, "cancel not authorized")
         # Idempotent + safe by construction: harness.cancel returns a clean

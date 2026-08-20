@@ -4,12 +4,14 @@ Port 9390 is owned by the skcomms broker_server (its honest, documented default)
 skcode-hostd therefore takes 9394 as its ratified default (SKWorld platform spec
 R0.4) so the two never collide on a shared host. Pass --port to override.
 """
+
 from __future__ import annotations
 
 import argparse
 import base64
 import json
 import os
+import platform
 import subprocess
 import sys
 import time
@@ -17,7 +19,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from skharness.arena import ArenaStatusService, ArenaStore, ProbeResult
+from skharness.arena import ArenaJobService, ArenaStatusService, ArenaStore, ProbeResult
+from skharness.arena.collaboration import RefinementJournal
 from skharness.auth import AuthContext, Verifier
 from skharness.autocode.sessions import AutocodeSessionRegistry
 from skharness.daemon import build_daemon_app
@@ -86,6 +89,7 @@ def build_http_probe(env_name: str):
 
 def build_gpu_probe():
     """Observe NVIDIA runtime truth; absence/timeout is not treated as healthy."""
+
     def _check() -> ProbeResult:
         try:
             result = subprocess.run(
@@ -112,14 +116,24 @@ def build_gpu_probe():
 def build_arena_status_service() -> ArenaStatusService:
     """Compose the live arena state root and explicitly required dependencies."""
     enabled = _env_truthy("SKHARNESS_ARENA_ENABLED")
+    arena_root = skcode_state_dir() / "arena"
+    store = ArenaStore(arena_root)
+    jobs = ArenaJobService(arena_root / "job-runs.jsonl", node=platform.node())
+    refinements = RefinementJournal(
+        arena_root / "refinements", approvers=(), evidence_exists=lambda _digest: False
+    )
     return ArenaStatusService(
-        store=ArenaStore(skcode_state_dir() / "arena"),
+        store=store,
+        refinements=refinements.events,
+        scheduled_runs=jobs.status,
         gateway_probe=build_http_probe("SKHARNESS_ARENA_SKGATEWAY_HEALTH_URL"),
         verifier_probe=build_http_probe("SKHARNESS_ARENA_VERIFIER_HEALTH_URL"),
         gpu_probe=build_gpu_probe(),
+        serving_backend_probe=build_http_probe("SKHARNESS_ARENA_SERVING_BACKEND_HEALTH_URL"),
         require_gateway=enabled,
         require_verifier=enabled,
         require_gpu=enabled and _env_truthy("SKHARNESS_ARENA_REQUIRE_GPU"),
+        require_serving_backend=(enabled and _env_truthy("SKHARNESS_ARENA_REQUIRE_GPU")),
     )
 
 
@@ -252,19 +266,23 @@ def build_dispatch_authorizer(home: Path | None = None):
     )
 
     def _authorize(subject: str, resource: dict, context: dict):
-        dec = decide(subject, DISPATCH_CAPABILITY, resource, context,
-                     base_dir=home, rules=rules)
+        dec = decide(subject, DISPATCH_CAPABILITY, resource, context, base_dir=home, rules=rules)
         # HARDENED 2026-08-05: the `full` profile spawns a session with the real
         # operator identity + HOME + MCP (the widest blast radius). Restrict it to
         # an explicit subject allowlist; every other verified operator is
         # sandbox-only. Reuse the decision's audit obligation so the PEP still
         # records exactly one audit entry. Lumina is the default allowed subject.
-        if dec.allow and str(resource.get("profile", "")) == "full" \
-                and not full_profile_allowed(subject):
+        if (
+            dec.allow
+            and str(resource.get("profile", "")) == "full"
+            and not full_profile_allowed(subject)
+        ):
             return Decision(
                 allow=False,
-                reason=(f"full profile denied for {subject!r}: not on "
-                        "SKCODE_FULL_PROFILE_SUBJECTS (sandbox-only operator)"),
+                reason=(
+                    f"full profile denied for {subject!r}: not on "
+                    "SKCODE_FULL_PROFILE_SUBJECTS (sandbox-only operator)"
+                ),
                 obligations=dec.obligations,
             )
         return dec
@@ -290,12 +308,15 @@ def build_inject_authorizer(home: Path | None = None):
         from capauth.authz import DEFAULT_RULES, CapabilityRule, decide
         from capauth.pairing import EnrollmentMode
     except Exception:
+
         def _deny_all(subject: str, resource: dict, context: dict):
             class _D:
                 allow = False
                 reason = "capauth unavailable: inject denied (fail closed)"
                 obligations: list = []
+
             return _D()
+
         return _deny_all
 
     rules = dict(DEFAULT_RULES)
@@ -309,8 +330,7 @@ def build_inject_authorizer(home: Path | None = None):
     )
 
     def _authorize(subject: str, resource: dict, context: dict):
-        return decide(subject, INJECT_CAPABILITY, resource, context,
-                      base_dir=home, rules=rules)
+        return decide(subject, INJECT_CAPABILITY, resource, context, base_dir=home, rules=rules)
 
     return _authorize
 
@@ -338,6 +358,7 @@ def build_dispatch_targets():
     offers repos the daemon would actually accept. Advisory only; /dispatch
     re-enforces the allowlist in the harness spawn guard.
     """
+
     def _targets() -> dict:
         return {"repos": parse_repo_allowlist(os.environ.get("SKCODE_DISPATCH_REPOS", ""))}
 
@@ -356,6 +377,7 @@ def build_jobs_provider():
     partial list, never an exception, so this callable can never make the
     route 500.
     """
+
     def _jobs():
         return read_job_runs()
 
@@ -377,6 +399,7 @@ def build_digest_provider():
     published yet"), never an exception, so this callable can never make
     the route 500.
     """
+
     def _digest():
         return read_latest_digest()
 

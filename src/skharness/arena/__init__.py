@@ -51,6 +51,7 @@ from skharness.arena.models import (
     VerificationState,
     canonical_digest,
 )
+from skharness.arena.operations import ArenaJobService
 from skharness.arena.runner import (
     PiExperimentRunner,
     RunOutcome,
@@ -77,6 +78,7 @@ __all__ = [
     "AgentMessage",
     "AttemptOwnership",
     "ArenaStatusService",
+    "ArenaJobService",
     "BoundedArenaMetrics",
     "CollaborationError",
     "CollaborationAccess",

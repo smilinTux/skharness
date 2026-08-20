@@ -11,6 +11,10 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ### Fixed
 
+- Completed the Arena's locally testable contract, verifier, and observability gates:
+  mandatory card/repository provenance and schema-version/concurrency/lineage tests;
+  warm-cache and capability enforcement with executable verifier controls; and a
+  durable scheduled/on-demand job ledger with authenticated run/job/failure views.
 - Persisted live Arena Experiment/Result records and output artifacts by canonical hash,
   then added an independent frozen exact-output gate whose verified-valid Pi result can
   enter the Pareto frontier. Live qualification now executes a planted false output with

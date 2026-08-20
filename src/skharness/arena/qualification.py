@@ -34,11 +34,15 @@ class FrozenExactOutputBackend:
     artifacts: Mapping[str, bytes]
     expected_model: str
 
+    def _evaluate(self, output: bytes) -> bool:
+        """Apply the frozen byte-exact evaluator used by trials and controls."""
+        return output == self.expected_output
+
     def run_trial(self, submission, private_evaluation, trial_index):
         del private_evaluation, trial_index
         output = self.artifacts[submission.artifact_digest]
         return TrialEvidence(
-            metrics={"exact_output": float(output == self.expected_output)},
+            metrics={"exact_output": float(self._evaluate(output))},
             served_model_digest=self.expected_model,
             artifact_digest=submission.artifact_digest,
             modalities_exercised=frozenset({"text"}),
@@ -46,7 +50,12 @@ class FrozenExactOutputBackend:
 
     def run_control(self, control, private_evaluation):
         del private_evaluation
-        return control is ControlKind.GOLD
+        control_outputs = {
+            ControlKind.GOLD: self.expected_output,
+            ControlKind.NO_OP: b"",
+            ControlKind.ADVERSARIAL: self.expected_output + b"-fabricated",
+        }
+        return self._evaluate(control_outputs[control])
 
 
 def qualify_execution_records(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import fields
+from types import MappingProxyType
 
 import pytest
 
@@ -41,6 +42,7 @@ def evidence(**overrides):
         "served_model_digest": "sha256:model",
         "artifact_digest": "sha256:artifact",
         "modalities_exercised": frozenset({"text", "image"}),
+        "capabilities_exercised": frozenset({"gateway", "image-decoder"}),
     }
     values.update(overrides)
     return TrialEvidence(**values)
@@ -88,6 +90,16 @@ def test_worker_submission_contract_has_no_private_material_field():
     assert "private_evaluation" not in names
     assert "withheld_ref" not in names
     assert "_capability" not in repr(PRIVATE)
+    assert set(vars(SUBMISSION)) == {
+        "experiment_id",
+        "challenge_hash",
+        "artifact_digest",
+        "requested_model_digest",
+        "claimed_metrics",
+    }
+    assert isinstance(SUBMISSION.claimed_metrics, MappingProxyType)
+    with pytest.raises(TypeError):
+        SUBMISSION.claimed_metrics["quality"] = 1.0
 
 
 @pytest.mark.parametrize(
@@ -98,6 +110,7 @@ def test_worker_submission_contract_has_no_private_material_field():
         ({"completed_work": False}, "skipped_work"),
         ({"output_truncated": True}, "output_truncated"),
         ({"cache_disclosed": False}, "cache_undisclosed"),
+        ({"warm_cache_used": True}, "warm_cache_concealed"),
         ({"modalities_exercised": frozenset({"text"})}, "required_modality_missing"),
     ],
 )
@@ -106,6 +119,45 @@ def test_gaming_signals_make_submission_invalid(override, reason):
     verdict = IndependentVerifier(backend).verify(SUBMISSION, POLICY, PRIVATE)
     assert verdict.status is VerificationStatus.INVALID
     assert reason in verdict.reasons
+
+
+def test_disclosed_warm_cache_with_stable_identity_is_allowed():
+    trials = [
+        evidence(
+            warm_cache_used=True,
+            cache_disclosed=True,
+            cache_key_digest="sha256:verifier-observed-cache-key",
+        )
+    ] * 3
+
+    verdict = IndependentVerifier(Backend(trials)).verify(SUBMISSION, POLICY, PRIVATE)
+
+    assert verdict.status is VerificationStatus.VALID
+
+
+def test_multimodal_and_capability_requirements_are_independent_constraints():
+    policy = VerificationPolicy(
+        challenge_hash=POLICY.challenge_hash,
+        expected_model_digest=POLICY.expected_model_digest,
+        repetitions=3,
+        objectives=POLICY.objectives,
+        required_modalities=frozenset({"text", "image"}),
+        required_capabilities=frozenset({"gateway", "image-decoder"}),
+    )
+    missing_capability = [
+        evidence(
+            modalities_exercised={"text", "image"},
+            capabilities_exercised={"gateway"},
+        )
+    ] * 3
+    verdict = IndependentVerifier(Backend(missing_capability)).verify(SUBMISSION, policy, PRIVATE)
+    assert verdict.status is VerificationStatus.INVALID
+    assert verdict.reasons == ("required_capability_missing",)
+
+    assert (
+        IndependentVerifier(Backend([evidence()] * 3)).verify(SUBMISSION, policy, PRIVATE).status
+        is VerificationStatus.VALID
+    )
 
 
 @pytest.mark.parametrize(
@@ -134,28 +186,22 @@ def test_missing_nan_or_infinite_metric_is_invalid():
         {"throughput": float("nan"), "quality": 0.9},
         {"throughput": float("inf"), "quality": 0.9},
     ):
-        verdict = IndependentVerifier(
-            Backend([evidence(metrics=metrics)] * 3)
-        ).verify(SUBMISSION, POLICY, PRIVATE)
+        verdict = IndependentVerifier(Backend([evidence(metrics=metrics)] * 3)).verify(
+            SUBMISSION, POLICY, PRIVATE
+        )
         assert verdict.status is VerificationStatus.INVALID
         assert verdict.reasons == ("invalid_metric_evidence",)
 
 
 def test_challenge_or_requested_model_mismatch_rejects_before_backend_runs():
     backend = Backend()
-    wrong_challenge = ProvisionalSubmission(
-        "exp-1", "wrong", "sha256:artifact", "sha256:model"
-    )
-    wrong_model = ProvisionalSubmission(
-        "exp-1", "sha256:challenge", "sha256:artifact", "wrong"
-    )
+    wrong_challenge = ProvisionalSubmission("exp-1", "wrong", "sha256:artifact", "sha256:model")
+    wrong_model = ProvisionalSubmission("exp-1", "sha256:challenge", "sha256:artifact", "wrong")
     verifier = IndependentVerifier(backend)
     assert verifier.verify(wrong_challenge, POLICY, PRIVATE).reasons == (
         "challenge_hash_mismatch",
     )
-    assert verifier.verify(wrong_model, POLICY, PRIVATE).reasons == (
-        "requested_model_mismatch",
-    )
+    assert verifier.verify(wrong_model, POLICY, PRIVATE).reasons == ("requested_model_mismatch",)
     assert backend.handles == []
 
 

@@ -239,7 +239,14 @@ blocked rather than passed.
 Arena admission CPU and RAM reservations become Docker `--cpus`, `--memory`, and
 no-extra-swap cgroup limits. Both worker and egress proxy use read-only root filesystems,
 dropped capabilities, `no-new-privileges`, PID limits, and bounded resources. Run the
-real confinement proof against the Pi image with:
+real confinement proof against the Pi image using the command below.
+
+When Arena mode is enabled, configure exact SKGateway and verifier health URLs. GPU
+workers additionally require `SKHARNESS_ARENA_SERVING_BACKEND_HEALTH_URL`; missing or
+unknown GPU/backend telemetry fails readiness. Scheduled and on-demand maintenance must
+call `ArenaJobService.run` so both paths write the same durable job ledger. The host
+deployment is responsible for its timer and for injecting incident/alert callbacks;
+the read-scoped `/api/v1/arena/runs`, `/jobs`, and `/failures` routes expose the result.
 
 ```bash
 RUN_SANDBOX_IT=1 SANDBOX_TEST_IMAGE=sandbox-pi:1 \

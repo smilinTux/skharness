@@ -7,6 +7,7 @@ the enable flip. It also asserts the two PDP-decided scopes (skcode.inject,
 skcode.dispatch) each have a capauth DEFAULT_RULES row, so ``decide`` never fails
 closed on "unknown capability" once the surface is enabled.
 """
+
 from __future__ import annotations
 
 from starlette.routing import WebSocketRoute
@@ -22,16 +23,22 @@ from skharness.harness import FakeHarness
 
 
 def _app():
-    return build_daemon_app(harness=FakeHarness(sessions=[], events={}),
-                            verify_caller=lambda t: False)
+    return build_daemon_app(
+        harness=FakeHarness(sessions=[], events={}), verify_caller=lambda t: False
+    )
 
 
 # FastAPI auto-mounts these interactive-docs endpoints; they are framework
 # defaults, not part of skcode-hostd's declared surface, so the coverage gate for
 # OUR routes excludes them (they serve the OpenAPI schema / Swagger UI, no secrets).
-_FRAMEWORK_DOC_PATHS = frozenset({
-    "/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json",
-})
+_FRAMEWORK_DOC_PATHS = frozenset(
+    {
+        "/docs",
+        "/docs/oauth2-redirect",
+        "/redoc",
+        "/openapi.json",
+    }
+)
 
 
 def _served_routes() -> list[tuple[str, str]]:
@@ -137,8 +144,10 @@ def test_deny_route_is_gated_on_the_inject_scope_like_its_approve_twin():
     assert classify_route("POST", "/api/v1/sessions/{sid}/deny") == ("gated", "skcode.inject")
     assert ROUTE_SCOPES[("POST", "/api/v1/sessions/{sid}/deny")] == "skcode.inject"
     # exactly the classification ratify carries (the symmetry the card is about)
-    assert (ROUTE_SCOPES[("POST", "/api/v1/sessions/{sid}/deny")]
-            == ROUTE_SCOPES[("POST", "/api/v1/sessions/{sid}/ratify")])
+    assert (
+        ROUTE_SCOPES[("POST", "/api/v1/sessions/{sid}/deny")]
+        == ROUTE_SCOPES[("POST", "/api/v1/sessions/{sid}/ratify")]
+    )
     # skcode.inject is a PDP-decided scope with an existing rule row; deny needs
     # no NEW capauth rule and is never a scope-only (undecided) route.
     assert "skcode.inject" in PDP_SCOPES
@@ -172,7 +181,11 @@ def test_jobs_route_is_gated_on_stream_scope_and_read_only():
     # exists in this card". Pin it: no declared route path contains "jobs"
     # other than this one GET.
     jobs_routes = [key for key in ROUTE_SCOPES if "jobs" in key[1]]
-    assert jobs_routes == [("GET", "/api/v1/jobs")]
+    assert jobs_routes == [("GET", "/api/v1/jobs"), ("GET", "/api/v1/arena/jobs")]
+    assert all(
+        method == "GET" and ROUTE_SCOPES[(method, path)] == "skcode.stream"
+        for method, path in jobs_routes
+    )
 
 
 def test_digest_route_is_gated_on_stream_scope_and_read_only():

@@ -320,6 +320,13 @@ queue depth, experiment budget, and verifier capacity. Expiry reclaims the lease
 idempotency keys prevent duplicate external effects. Cancellation is propagated to Pi,
 the sandbox, SKGateway requests where supported, and artifact finalization.
 
+Arena operations invoked by a timer or an operator use the same named callable path.
+Every exit is fsync'd to a bounded JSONL run ledger; failures retain a bounded diagnostic
+and invoke injected incident-capture and alert hooks before being re-raised. Authenticated
+read routes expose run, job, and failure state while identities remain out of Prometheus
+labels. Deployments still own the timer, alert/ticket transports, and serving-backend
+probe URL; their absence must remain visible rather than being inferred as healthy.
+
 Liveness answers whether the process can serve; readiness answers whether required
 stores, SKGateway, verifier capacity, and expected GPU telemetry are usable. Unknown
 GPU state makes a GPU worker unready. An unhealthy container does not imply restart;

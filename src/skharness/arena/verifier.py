@@ -73,13 +73,19 @@ class TrialEvidence:
     served_model_digest: str
     artifact_digest: str
     modalities_exercised: frozenset[str] = field(default_factory=frozenset)
+    capabilities_exercised: frozenset[str] = field(default_factory=frozenset)
     completed_work: bool = True
     output_truncated: bool = False
     cache_disclosed: bool = True
+    warm_cache_used: bool = False
+    cache_key_digest: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metrics", MappingProxyType(dict(self.metrics)))
         object.__setattr__(self, "modalities_exercised", frozenset(self.modalities_exercised))
+        object.__setattr__(self, "capabilities_exercised", frozenset(self.capabilities_exercised))
+        if self.cache_key_digest is not None and not self.cache_key_digest.strip():
+            raise ValueError("cache key digest must not be blank")
 
 
 class VerificationBackend(Protocol):
@@ -106,6 +112,7 @@ class VerificationPolicy:
     repetitions: int
     objectives: tuple[MetricObjective, ...]
     required_modalities: frozenset[str] = field(default_factory=frozenset)
+    required_capabilities: frozenset[str] = field(default_factory=frozenset)
     confidence_z: float = 1.96
     require_controls: bool = True
 
@@ -120,6 +127,7 @@ class VerificationPolicy:
         if len(names) != len(set(names)):
             raise ValueError("metric objective names must be unique")
         object.__setattr__(self, "required_modalities", frozenset(self.required_modalities))
+        object.__setattr__(self, "required_capabilities", frozenset(self.required_capabilities))
 
 
 @dataclass(frozen=True)
@@ -158,9 +166,13 @@ class IndependentVerifier:
             "private_evaluation_version": private_evaluation.version,
         }
         if submission.challenge_hash != policy.challenge_hash:
-            return self._verdict(submission, VerificationStatus.INVALID, ("challenge_hash_mismatch",), identity)
+            return self._verdict(
+                submission, VerificationStatus.INVALID, ("challenge_hash_mismatch",), identity
+            )
         if submission.requested_model_digest != policy.expected_model_digest:
-            return self._verdict(submission, VerificationStatus.INVALID, ("requested_model_mismatch",), identity)
+            return self._verdict(
+                submission, VerificationStatus.INVALID, ("requested_model_mismatch",), identity
+            )
 
         if policy.require_controls:
             try:
@@ -169,20 +181,42 @@ class IndependentVerifier:
                     for control in ControlKind
                 }
             except Exception:
-                return self._verdict(submission, VerificationStatus.INCONCLUSIVE, ("control_infrastructure_error",), identity)
+                return self._verdict(
+                    submission,
+                    VerificationStatus.INCONCLUSIVE,
+                    ("control_infrastructure_error",),
+                    identity,
+                )
             if not controls[ControlKind.GOLD]:
-                return self._verdict(submission, VerificationStatus.INCONCLUSIVE, ("gold_control_failed",), identity)
+                return self._verdict(
+                    submission, VerificationStatus.INCONCLUSIVE, ("gold_control_failed",), identity
+                )
             if controls[ControlKind.NO_OP]:
-                return self._verdict(submission, VerificationStatus.INCONCLUSIVE, ("no_op_control_passed",), identity)
+                return self._verdict(
+                    submission,
+                    VerificationStatus.INCONCLUSIVE,
+                    ("no_op_control_passed",),
+                    identity,
+                )
             if controls[ControlKind.ADVERSARIAL]:
-                return self._verdict(submission, VerificationStatus.INCONCLUSIVE, ("adversarial_control_passed",), identity)
+                return self._verdict(
+                    submission,
+                    VerificationStatus.INCONCLUSIVE,
+                    ("adversarial_control_passed",),
+                    identity,
+                )
 
         trials: list[TrialEvidence] = []
         try:
             for index in range(policy.repetitions):
                 trials.append(self._backend.run_trial(submission, private_evaluation, index))
         except Exception:
-            return self._verdict(submission, VerificationStatus.INCONCLUSIVE, ("trial_infrastructure_error",), identity)
+            return self._verdict(
+                submission,
+                VerificationStatus.INCONCLUSIVE,
+                ("trial_infrastructure_error",),
+                identity,
+            )
 
         violations = self._gaming_violations(submission, policy, trials)
         if violations:
@@ -196,7 +230,9 @@ class IndependentVerifier:
                     confidence_z=policy.confidence_z,
                 )
         except (KeyError, ValueError):
-            return self._verdict(submission, VerificationStatus.INVALID, ("invalid_metric_evidence",), identity)
+            return self._verdict(
+                submission, VerificationStatus.INVALID, ("invalid_metric_evidence",), identity
+            )
 
         failed_constraints = tuple(
             f"constraint_failed:{objective.name}"
@@ -231,8 +267,14 @@ class IndependentVerifier:
                 violations.add("output_truncated")
             if not trial.cache_disclosed:
                 violations.add("cache_undisclosed")
+            if trial.warm_cache_used and (
+                not trial.cache_disclosed or trial.cache_key_digest is None
+            ):
+                violations.add("warm_cache_concealed")
             if not policy.required_modalities.issubset(trial.modalities_exercised):
                 violations.add("required_modality_missing")
+            if not policy.required_capabilities.issubset(trial.capabilities_exercised):
+                violations.add("required_capability_missing")
         return tuple(sorted(violations))
 
     def _verdict(
