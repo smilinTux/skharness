@@ -9,6 +9,13 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ## [Unreleased]
 
+### Documentation
+
+- Added the complete T-shirt-sizing dispatch runbook: the stored `work_grade`
+  contract, canonical bucket construction, per-call-versus-static precedence,
+  Pi capability gate, grader pin, fail-closed behavior, GitHub fleet rollout,
+  troubleshooting, and hermetic freshness evidence.
+
 ### Fixed
 - **The test suite is no longer able to append to the operator's live cost
   ledger, and the writer that was doing it was never in this repo's suite**

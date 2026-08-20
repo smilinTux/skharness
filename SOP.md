@@ -107,6 +107,9 @@ flowchart TD
     Eng --> CC
     Orch --> Reg
 
+    Orch -->|"work_grade -> sk-<class>-<sensitivity>"| SKGW["skgateway bucket pool"]
+    SKGW -->|"concrete serving member"| Eng
+
     CC -->|"SKCODE_DISPATCH_REPOS allowlist<br/>empty = DENY ALL"| Worktree["per-card git worktree<br/>+ docker sandbox"]
 ```
 
@@ -119,6 +122,7 @@ flowchart TD
 | `src/skharness/harnesses/claude_code.py` | The one harness the daemon owns. `parse_repo_allowlist()` and the `spawn()` guard are where dispatch is actually permitted or refused. |
 | `src/skharness/autocode/orchestrator.py` | The engine's phase loop, caps, and kill switch. `skos.autopilot` delegates here by object identity. |
 | `src/skharness/autocode/engineering.py` | The merge choke point: worktree, sandbox, grade, twin gate, `finalize()`. Nothing merges without passing through it. |
+| `src/skharness/autocode/buckets.py` | Mechanical, fail-closed mapping from a complete card `work_grade` to the SKGateway bucket id carried as the per-call model override. |
 
 ---
 
@@ -203,7 +207,29 @@ python -m pytest tests/ -q                       # everything installed here
 python -m pytest tests/test_daemon.py -q         # route + auth behaviour
 python -m pytest tests/test_route_coverage.py -q # every live route is classified
 python -m pytest tests/test_systemd_unit.py -q   # the shipped unit keeps its safety defaults
+python -m pytest tests/test_autocode_buckets.py tests/test_adapter_pi.py \
+  tests/test_autopilot_config_harness.py -q      # graded dispatch + precedence
 ```
+
+### Graded model-selection gate
+
+The card's `work_grade` is written in phase 0 as either `None` or one complete mapping
+containing `size`, `risk`, `sensitivity`, and `model_class`. The routing path consumes
+that stored decision; it does not grade again:
+
+1. `bucket_for_payload()` maps `model_class` plus `sensitivity` to the exact lowercase
+   `sk-<class>-<sensitivity>` grammar.
+2. `EngineeringExecutor` attaches that value to every build and grader brief.
+3. Only an adapter declaring `supports_model_override()` may receive it. Today that is
+   the Pi adapter; unsupported adapters refuse instead of silently ignoring the grade.
+4. The per-call bucket wins over the adapter's static model for that invocation. With
+   no grade, no override is sent and the static sovereign model remains unchanged.
+5. The grader is pinned through `grader_bucket()` so it cannot grade its own class; the
+   twin gate and protected-path decision remain independent of the routing field.
+
+A partial/corrupt grade or malformed bucket raises `BucketError`. It never falls back
+to a looser model. This matches SKGateway's 12-address grammar and closes the historical
+near-miss path where an invalid `sk-*` string could resolve through `sk-auto`.
 
 `tests/test_route_coverage.py` is the structural gate on the auth model: it enumerates the
 **live app route table** and asserts every served route is declared either in
@@ -229,6 +255,21 @@ binary, full history, `--exit-code 1`). See [SECURITY.md](./SECURITY.md).
 3. `pypi-publish` uploads the artifact.
 
 **Never push a tag by hand.** Pushing `v*` triggers a publish directly.
+
+For a fleet release, push the reviewed `main` commit and let `publish.yml` create the
+next patch tag. Verify the workflow-created tag before pulling nodes. On each node:
+
+```bash
+git -C ~/clawd/skcapstone-repos/skharness fetch --tags origin
+git -C ~/clawd/skcapstone-repos/skharness status --short
+git -C ~/clawd/skcapstone-repos/skharness pull --ff-only origin main
+~/.skenv/bin/python -m pip install -e ~/clawd/skcapstone-repos/skharness
+systemctl --user restart skcode-hostd
+systemctl --user is-active skcode-hostd
+```
+
+Stop before pull when the checkout is dirty; never overwrite node-local work to make a
+deployment look clean.
 
 ### Service deploy (`skcode-hostd`)
 
@@ -483,6 +524,9 @@ verdict, not an exception.
 | Looking for `/health` or `/healthz` | There is none. Use `GET /api/v1/hosts/self` (bearer-gated) or `systemctl --user is-active`. |
 | CI red on "the cross-repo round trip SKIPPED instead of running" | `skcoord` did not install from git `main`, so the round-trip tests self-skipped. Check the sibling install step, especially that `skcoord` is installed LAST with `--upgrade`. |
 | A build gets escalated at grade 5 with green CI | Expected if the diff touched a carve-out path. Check it against `_ALWAYS_PROTECTED` and `objects/_protected.json`. A missing or malformed manifest protects everything by design. |
+| A graded card uses the adapter's static model | Confirm the card payload carries a complete `work_grade`, the configured adapter returns `supports_model_override() == True`, and `graded_dispatch` appears in health events. Pi supports the override; other adapters intentionally refuse it. |
+| A bucket-shaped model is rejected before dispatch | Inspect `model_class` and `sensitivity`. Only lowercase `sk-(s|m|l|xl)-(public|internal|secret)` leaves `buckets.py`; partial grades and near-miss ids fail closed. |
+| An ungraded card uses a bucket | This is a defect. `bucket_for_payload()` must return `None`, leaving the adapter's static sovereign model unchanged. `sk-s-secret` exists only as an explicit future floor, not the default path. |
 | Daemon OOM-killed or the whole cgroup died | `resource-limits.conf` did its job (`MemoryMax=8G`, `OOMPolicy=kill`). Inspect the build that ran away before raising the limit. |
 | Installed unit does not match the repo | `./systemd/install.sh --diff`. Remember drop-ins are separate files: read `systemctl --user cat skcode-hostd` for the effective unit. |
 
@@ -533,7 +577,7 @@ verdict, not an exception.
   detects staleness per node; it was not run across the fleet as part of this pass.
 
 <!-- docs-evidence
-verified: 2026-08-14
+verified: 2026-08-20
 checks:
   - name: console entry point still points at skharness.serve:main
     run: grep -q 'skcode-hostd = "skharness.serve:main"' pyproject.toml
@@ -555,4 +599,10 @@ checks:
     run: test -z "$(grep -o '@app.get("/health[a-z]*")' src/skharness/daemon.py)"
   - name: CI anti-skip gate is still armed
     run: grep -q 'the cross-repo round trip SKIPPED instead of running' .github/workflows/ci.yml
+  - name: graded dispatch maps only the canonical twelve bucket addresses
+    run: grep -qF 'BUCKET_CLASSES: tuple[str, ...] = ("s", "m", "l", "xl")' src/skharness/autocode/buckets.py && grep -qF 'BUCKET_SENSITIVITIES: tuple[str, ...] = ("public", "internal", "secret")' src/skharness/autocode/buckets.py
+  - name: per-call model override is capability-gated and Pi opts in
+    run: grep -qF 'if not self.supports_model_override()' src/skharness/autocode/adapters/base.py && grep -qF 'def supports_model_override(self) -> bool:' src/skharness/autocode/adapters/pi.py
+  - name: ungraded work does not construct or attach a bucket
+    run: grep -qF 'if grade is None:' src/skharness/autocode/buckets.py && grep -qF 'return None' src/skharness/autocode/buckets.py && grep -qF 'dispatch_model = self._dispatch_model(item)' src/skharness/autocode/engineering.py
 -->
