@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [pi-core, pi-polyglot]
+        target: [pi-core, pi-polyglot, pi-python-test]
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -40,6 +40,16 @@ jobs:
           tags: ${{ steps.image.outputs.name }}:${{ github.ref_name }}
           provenance: mode=max
           sbom: true
+      - name: Qualify Python test capability
+        if: matrix.target == 'pi-python-test'
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: >-
+          docker run --rm --read-only --user 10001:10001
+          --tmpfs /tmp:mode=1777,noexec,nosuid,nodev
+          --entrypoint /usr/local/bin/skharness-pi-python-test-preflight
+          "$IMAGE@$DIGEST"
       - name: Keyless-sign immutable image digest
         env:
           IMAGE: ${{ steps.image.outputs.name }}
@@ -61,7 +71,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [pi-core, pi-polyglot]
+        target: [pi-core, pi-polyglot, pi-python-test]
     steps:
       - uses: actions/checkout@v4
       - uses: docker/login-action@v3

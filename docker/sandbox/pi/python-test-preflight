@@ -1,0 +1,60 @@
+#!/opt/skharness/venv/bin/python
+"""Fail-closed capability probe for the project-qualified Python test image."""
+
+from __future__ import annotations
+
+import importlib
+import importlib.metadata
+import sys
+
+REQUIRED_MODULES = (
+    "capauth.authz",
+    "httpx",
+    "jsonschema",
+    "pytest",
+    "pytest_asyncio",
+    "pytest_mock",
+    "skcapstone.coordination",
+    "skcoord",
+    "skharness",
+    "skmemory",
+)
+REQUIRED_PYTEST_PLUGINS = {"asyncio", "pytest_mock"}
+
+
+def main() -> int:
+    failures: list[str] = []
+    for module in REQUIRED_MODULES:
+        try:
+            importlib.import_module(module)
+        except Exception as exc:  # capability probes report every broken import
+            failures.append(f"import {module}: {type(exc).__name__}: {exc}")
+
+    try:
+        from _pytest.config import get_config
+
+        config = get_config()
+        config.pluginmanager.load_setuptools_entrypoints("pytest11")
+        loaded = {name for name, _ in config.pluginmanager.list_name_plugin()}
+        missing = REQUIRED_PYTEST_PLUGINS - loaded
+        if missing:
+            failures.append(f"pytest plugins missing: {', '.join(sorted(missing))}")
+    except Exception as exc:
+        failures.append(f"pytest plugin discovery: {type(exc).__name__}: {exc}")
+
+    if failures:
+        print("SKHarness Python test image is not project-qualified:", file=sys.stderr)
+        for failure in failures:
+            print(f"- {failure}", file=sys.stderr)
+        return 1
+
+    versions = {
+        name: importlib.metadata.version(name)
+        for name in ("skharness", "pytest", "pytest-asyncio", "pytest-mock", "skcapstone", "skcoord")
+    }
+    print("skharness-pi-python-test qualified", " ".join(f"{k}={v}" for k, v in versions.items()))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -168,6 +168,15 @@ class PiAdapter(BaseCliAdapter):
         # before spending an agent turn trying to bootstrap pytest in /tmp.
         return ["pytest"] if self.capability_profile == "arena-build" else []
 
+    def _required_checks(self) -> list[list[str]]:
+        # Presence of a `pytest` executable is weaker than the arena-build image
+        # contract: the plugins and sovereign sibling schemas can still be absent
+        # or binary-incompatible. Execute the immutable in-image probe before the
+        # model receives a turn; verified runs never install dependencies at runtime.
+        if self.capability_profile == "arena-build":
+            return [["/usr/local/bin/skharness-pi-python-test-preflight"]]
+        return []
+
     def _attribution_headers(self, session_id=None, card_id=None) -> dict:
         """The provider-level `headers` map, or {} when we have nothing to attribute.
 

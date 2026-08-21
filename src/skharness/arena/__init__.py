@@ -63,6 +63,14 @@ from skharness.arena.runner import (
 )
 from skharness.arena.status import ArenaStatusService, BoundedArenaMetrics, ProbeResult
 from skharness.arena.store import ArenaStore, CorruptEventLogError, EventConflictError
+from skharness.arena.trajectory import (
+    CardSize,
+    EvidenceModelRouter,
+    ModelTrial,
+    PhaseBudget,
+    UnqualifiedRouteError,
+    compact_pi_events,
+)
 from skharness.arena.verifier import (
     ControlKind,
     IndependentVerifier,
@@ -86,10 +94,12 @@ __all__ = [
     "CollaborationError",
     "CollaborationAccess",
     "ChallengeSpec",
+    "CardSize",
     "ControlKind",
     "CorruptEventLogError",
     "EventConflictError",
     "Experiment",
+    "EvidenceModelRouter",
     "ExperimentCatalog",
     "ExperimentMatch",
     "ExperimentEvent",
@@ -99,6 +109,7 @@ __all__ = [
     "IsolatedVerifierBoundary",
     "LineageGraph",
     "Measurement",
+    "ModelTrial",
     "MetricDirection",
     "MetricObjective",
     "MetricSummary",
@@ -110,6 +121,7 @@ __all__ = [
     "VerifiedParetoCandidate",
     "PrivateEvaluationHandle",
     "PiExperimentRunner",
+    "PhaseBudget",
     "ProbeResult",
     "ProvisionalSubmission",
     "Result",
@@ -129,10 +141,12 @@ __all__ = [
     "VerificationStatus",
     "VerificationState",
     "VerificationVerdict",
+    "UnqualifiedRouteError",
     "build_production_pi_runner",
     "pareto_frontier",
     "pi_launch_spec",
     "canonical_digest",
+    "compact_pi_events",
     "evidence_id",
     "summarize",
     "verified_pareto_frontier",

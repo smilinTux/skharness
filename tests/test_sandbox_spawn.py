@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 import pytest
 from skharness.autocode.sandbox import Sandbox, LaunchSpec
 from skharness.autocode.claude_code import HarnessUnavailable
@@ -8,6 +9,75 @@ def _spec():
     return LaunchSpec(name="pi", argv=["pi", "-p", "x", "--mode", "json"],
                       image="sandbox-pi:1", worktree="/tmp/wt",
                       egress_hosts=["gw.local"])
+
+
+def _linked_worktree(tmp_path: Path) -> tuple[Path, Path]:
+    common = tmp_path / "repo" / ".git"
+    admin = common / "worktrees" / "ticket"
+    admin.mkdir(parents=True)
+    (admin / "commondir").write_text("../..\n", encoding="utf-8")
+    worktree = tmp_path / "ticket"
+    worktree.mkdir()
+    (worktree / ".git").write_text(f"gitdir: {admin}\n", encoding="utf-8")
+    return worktree, common
+
+
+def test_linked_worktree_common_git_dir_is_mounted_readonly_at_original_path(tmp_path):
+    worktree, common = _linked_worktree(tmp_path)
+    spec = LaunchSpec("pi", ["pi"], "pi-image", str(worktree))
+
+    argv = Sandbox()._docker_run_argv(spec, "net", "proxy")
+
+    mount = f"type=bind,src={common.resolve()},dst={common.resolve()},readonly"
+    assert mount in argv
+    assert f"type=bind,src={worktree.resolve()},dst=/work" in argv
+
+
+def test_normal_checkout_does_not_gain_an_external_git_metadata_mount(tmp_path):
+    worktree = tmp_path / "checkout"
+    (worktree / ".git").mkdir(parents=True)
+    spec = LaunchSpec("pi", ["pi"], "pi-image", str(worktree))
+
+    argv = Sandbox()._docker_run_argv(spec, "net", "proxy")
+
+    assert not any(
+        value.endswith("readonly") and "/.git,dst=" in value for value in argv
+    )
+
+
+def test_malformed_linked_worktree_pointer_fails_before_docker_preflight(
+    tmp_path, monkeypatch
+):
+    worktree = tmp_path / "ticket"
+    worktree.mkdir()
+    (worktree / ".git").write_text("not a gitdir pointer\n", encoding="utf-8")
+    docker_calls = []
+    monkeypatch.setattr("skharness.autocode.sandbox.shutil.which", lambda _: "/usr/bin/docker")
+    monkeypatch.setattr(
+        "skharness.autocode.sandbox.subprocess.run",
+        lambda argv, **kwargs: docker_calls.append(argv),
+    )
+
+    with pytest.raises(HarnessUnavailable, match="malformed linked-worktree"):
+        Sandbox()._ensure_capable(LaunchSpec("pi", ["pi"], "pi-image", str(worktree)))
+
+    assert docker_calls == []
+
+
+def test_linked_worktree_admin_dir_must_be_inside_common_dir(tmp_path):
+    worktree = tmp_path / "ticket"
+    worktree.mkdir()
+    admin = tmp_path / "admin"
+    admin.mkdir()
+    common = tmp_path / "common"
+    common.mkdir()
+    (admin / "commondir").write_text(str(common), encoding="utf-8")
+    (worktree / ".git").write_text(f"gitdir: {admin}\n", encoding="utf-8")
+
+    with pytest.raises(HarnessUnavailable, match="escapes its Git common directory"):
+        Sandbox()._docker_run_argv(
+            LaunchSpec("pi", ["pi"], "pi-image", str(worktree)), "net", "proxy"
+        )
 
 
 def test_spawn_disabled_raises_when_not_live():
@@ -29,6 +99,50 @@ def test_image_preflight_fails_clearly_when_required_test_command_is_absent(monk
     spec = _spec()
     spec.required_commands = ["pytest"]
     with pytest.raises(HarnessUnavailable, match="test-capable image"):
+        Sandbox()._ensure_capable(spec)
+
+
+def test_image_preflight_executes_required_behavior_check_without_network(monkeypatch):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+
+        class Result:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return Result()
+
+    monkeypatch.setattr("skharness.autocode.sandbox.shutil.which", lambda _: "/usr/bin/docker")
+    monkeypatch.setattr("skharness.autocode.sandbox.subprocess.run", fake_run)
+    spec = _spec()
+    spec.required_checks = [["/usr/local/bin/project-preflight", "--quick"]]
+
+    Sandbox()._ensure_capable(spec)
+
+    assert [
+        "docker", "run", "--rm", "--network", "none", "--read-only",
+        "--entrypoint", "/usr/local/bin/project-preflight", spec.image, "--quick",
+    ] in calls
+
+
+def test_image_preflight_fails_closed_when_behavior_check_fails(monkeypatch):
+    def fake_run(argv, **kwargs):
+        class Result:
+            returncode = 7 if "--entrypoint" in argv else 0
+            stdout = ""
+            stderr = "pytest cannot import project"
+
+        return Result()
+
+    monkeypatch.setattr("skharness.autocode.sandbox.shutil.which", lambda _: "/usr/bin/docker")
+    monkeypatch.setattr("skharness.autocode.sandbox.subprocess.run", fake_run)
+    spec = _spec()
+    spec.required_checks = [["/usr/local/bin/project-preflight"]]
+
+    with pytest.raises(HarnessUnavailable, match="pytest cannot import project"):
         Sandbox()._ensure_capable(spec)
 
 

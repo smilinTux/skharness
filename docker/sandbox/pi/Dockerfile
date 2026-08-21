@@ -84,5 +84,7 @@ CMD ["pi", "--version"]
 FROM pi-polyglot AS pi-python-test
 USER root
 COPY --from=pi-python-test-builder /opt/skharness/venv /opt/skharness/venv
+COPY docker/sandbox/pi/python-test-preflight /usr/local/bin/skharness-pi-python-test-preflight
+RUN chmod 0555 /usr/local/bin/skharness-pi-python-test-preflight
 USER 10001:10001
 CMD ["pi", "--version"]

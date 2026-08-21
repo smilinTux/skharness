@@ -192,18 +192,42 @@ docker build --target pi-python-test -t skharness-pi-python-test:dev \
   -f docker/sandbox/pi/Dockerfile .
 ```
 
-Use `pi-core` only for minimal runtime/qualification work. Use `pi-python-test` (or a
-project-qualified derivative) when a coding card requires Python tests. The
-`arena-build` profile declares `pytest` as a required image command; sandbox preflight
-fails before admission if the chosen image lacks it. Do not bootstrap a virtualenv in
+Use `pi-core` only for minimal runtime/qualification work. `pi-python-test` is the
+project-qualified SKHarness coding image: its hash lock includes the declared dev
+extras (`pytest-asyncio`, `pytest-mock`, and `httpx`) plus the released CapAuth,
+SKCapstone, SKCoord, SKMemory, and JSON-schema import surface used by the suite. The
+`arena-build` profile executes `skharness-pi-python-test-preflight` before admission;
+the probe imports that surface and loads the required pytest plugins. A bare `pytest`
+binary is not sufficient. Do not bootstrap a virtualenv in
 `/tmp`: deployments may correctly mount temporary storage `noexec`, and dependency
 installation during a verified run is outside the frozen environment contract.
+
+Image qualification may also declare an executable behavior check. These checks run
+with no network and a read-only root filesystem before admission; a non-zero result
+fails closed with its bounded diagnostic. This is stronger than `command -v`, which
+only proves that a filename exists.
+
+For a linked Git worktree, the sandbox resolves the `.git` pointer and its `commondir`
+before launch. The repository common Git directory is mounted at its original absolute
+path **read-only**, while `/work` remains writable. This permits `git status`, diff, and
+object/ref reads but deliberately denies commits, branch/ref mutation, and other Git
+metadata writes from the worker. Malformed, missing, or escaping worktree metadata is
+rejected before Docker networking or worker startup.
 
 Pi process status is not sufficient completion evidence. SKHarness also reads the
 structured event stream: `message_end.message.stopReason=error` classifies the attempt
 as `pi_terminal_error` even if Pi exits zero. A wall-time expiry remains a timeout with
 partial evidence. Operator-run tests may validate the resulting patch, but must not be
-reported as an autonomous clean finish.
+treated as an autonomous successful finish.
+
+For card-driven Pi runs, declare `CardSize.SMALL`, `MEDIUM`, or `LARGE` and use the corresponding
+bounded assess/inspect/build/test policy. The runner hard-caps wall time at the phase
+sum and persists requested/served model, card size, duration, time-to-first-edit (only
+when present in Pi events), and timeout phase. Durable event artifacts deduplicate
+adjacent canonical envelopes and replace oversized payloads with a digest; raw logs stay
+in the attempt directory. Route models with `EvidenceModelRouter` only from a fixed
+trial set containing S/M/L evidence for each candidate. No successful target-size trial
+means no route; operators must not substitute intuition for missing qualification data.
 
 Passing `capability_profile=` to `PiAdapter` loads only the in-image SK bridge extension
 and emits Pi's explicit `--tools` allowlist. The extension calls
@@ -213,8 +237,11 @@ and set `SKHARNESS_SK_BRIDGE_BACKEND`; no backend credentials or sovereign agent
 are baked into either image.
 
 Direct APK versions are pinned in `apt-packages.lock`; Python runtime and test
-dependencies are transitively pinned with hashes in `requirements.lock` and
-`test-requirements.lock`. `scripts/qualify-arena.py` emits an explicitly unsigned local
+dependencies are transitively pinned with hashes in `requirements.lock` and the
+reviewable `test-requirements.in` -> `test-requirements.lock` pair. A release tag
+publishes, capability-probes, keyless-signs, verifies, and vulnerability-scans all
+three targets, including `pi-python-test`, by immutable digest. `scripts/qualify-arena.py`
+emits an explicitly unsigned local
 evidence bundle, and `scripts/pi-supply-chain.sh` requires Syft and Grype to generate a
 CycloneDX SBOM and vulnerability report (optionally signing provenance with Cosign).
 The script applies the reviewed `docker/sandbox/pi/openvex.json`, retains its reports,

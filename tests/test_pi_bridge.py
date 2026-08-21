@@ -152,6 +152,7 @@ def test_image_manifest_pins_base_pi_and_two_targets():
     python_test = dockerfile.split("FROM pi-polyglot AS pi-python-test", 1)[1]
     assert "pi-python-test-builder" in python_test
     assert "/opt/skharness/venv" in python_test
+    assert "skharness-pi-python-test-preflight" in python_test
     assert '].version")" = "${PI_VERSION}"' in dockerfile
     assert lock["npm"]["integrity"].startswith("sha512-")
 
@@ -177,6 +178,30 @@ def test_core_image_keeps_build_and_package_managers_out_of_runtime():
         == json.loads((root / "docker/sandbox/pi/dependencies.lock.json").read_text())["npm"][
             "integrity"
         ]
+    )
+
+
+def test_python_test_target_is_project_qualified_and_published_like_other_images():
+    root = Path(__file__).parents[1]
+    lock = (root / "docker/sandbox/pi/test-requirements.lock").read_text()
+    for distribution in (
+        "capauth",
+        "httpx",
+        "jsonschema",
+        "pytest-asyncio",
+        "pytest-mock",
+        "skcapstone",
+        "skcoord",
+        "skmemory",
+    ):
+        assert f"{distribution}==" in lock
+    assert "--hash=sha256:" in lock
+
+    workflow = (root / ".github/workflows/pi-image.yml").read_text()
+    assert workflow.count("target: [pi-core, pi-polyglot, pi-python-test]") == 2
+    assert "skharness-pi-python-test-preflight" in workflow
+    assert workflow.index("Qualify Python test capability") < workflow.index(
+        "Keyless-sign immutable image digest"
     )
 
 

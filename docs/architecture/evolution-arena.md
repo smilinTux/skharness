@@ -285,19 +285,52 @@ worker startup.
 
 ### `skharness-pi-python-test`
 
-Extends `pi-polyglot` with the repository's hash-locked pytest/coverage environment.
-Use this target, or a project-qualified derivative, for coding tickets whose acceptance
-criteria require Python tests. `pi-core` is not a coding-test image: an agent must not
+Extends `pi-polyglot` with the repository's hash-locked pytest/coverage environment,
+including the declared async/mock/http client plugins and released SKCapstone, SKCoord,
+SKMemory, CapAuth, and schema dependencies exercised by SKHarness tests. Its immutable
+preflight imports those packages and asks pytest to load its entry-point plugins; merely
+finding a `pytest` executable does not qualify an image. Use this target, or a separately
+qualified derivative, for coding tickets whose acceptance criteria require Python tests.
+`pi-core` is not a coding-test image: an agent must not
 spend its task budget installing dev dependencies into an ephemeral directory. Runtime
 temp mounts may be `noexec`; preserving that confinement is preferable to making an
 improvised virtualenv executable. Select a qualified image before admission and fail
-preflight clearly when the declared test command is unavailable.
+preflight clearly when the full project test capability is unavailable. Release tags
+publish this target alongside core/polyglot, then capability-probe, keyless-sign and
+identity-verify its digest; the same High/Critical vulnerability gate applies to it.
+
+Preflight has two levels: command-presence probes and trusted image-local executable
+checks. Executable checks run without network access against a read-only root and must
+complete successfully before admission, allowing a project-qualified image to prove
+imports or a focused test contract rather than merely placing `pytest` on `PATH`.
+
+Workers launched from linked Git worktrees receive one additional least-authority bind:
+the resolved repository common Git directory at its original absolute path, read-only.
+The writable `/work/.git` pointer can therefore resolve, while repository refs, objects,
+configuration, and worktree administration remain immutable to the worker. Resolution
+is strict and happens before launch; invalid pointers, absent common directories, or an
+administrative directory outside its declared common directory fail closed.
 
 Live run classification consumes Pi's structured terminal events as well as the process
 status. An assistant `message_end` with `stopReason=error` fails the run even when Pi
 exits zero. A wall-time expiry remains `timeout`, and partial stdout/stderr are retained.
 Independent host-side tests may validate a patch after a timeout, but that evidence does
 not rewrite the autonomous attempt into a successful finish.
+
+Pi card attempts use explicit `assess`, `inspect`, `build`, and `test` budgets selected
+from the declared S/M/L card size. The sum is a hard supervisor timeout; the prompt also
+directs Pi to advance when an individual phase expires. Run evidence records duration,
+time-to-first-edit when Pi supplies relative event timing, timeout phase, requested and
+provider-served model, card size, and the phase budget. Missing measurements remain
+`null` rather than being inferred. Durable stdout evidence canonicalizes JSON envelopes,
+collapses adjacent duplicates, and replaces oversized events with byte count plus SHA-256;
+the raw local attempt log remains available for diagnosis.
+
+Model routing is evidence-driven and fail-closed. A candidate model is eligible only
+after fixed trials at all three S/M/L sizes, and a target-size route requires a successful
+trial. Successful candidates are ordered by completion duration and then time-to-first-edit.
+This deliberately small policy captures the observed Ornith/Qwen differences without
+turning one anecdotal run into a production default; trial sets are versioned evidence.
 
 Implementation truth (repository audit, 2026-08-20): the Dockerfile now pins a Wolfi
 base digest, exact direct APKs, the Pi/npm graph, and hashed Python wheels. Core omits

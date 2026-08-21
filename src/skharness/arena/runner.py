@@ -17,6 +17,7 @@ import signal
 import subprocess
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -26,6 +27,7 @@ from skharness.autocode.sandbox import AuthMount, LaunchSpec, Sandbox
 from .controller import ArenaController
 from .models import ExperimentState
 from .scheduler import Admission, AttemptRequest
+from .trajectory import DEFAULT_PHASE_BUDGETS, CardSize, PhaseBudget, compact_pi_events
 
 if TYPE_CHECKING:
     from skharness.autocode.adapters.pi import PiAdapter
@@ -39,6 +41,7 @@ class RunOutcome:
     stdout_digest: str
     stderr_digest: str
     partial: bool = False
+    metrics: dict[str, object] | None = None
 
 
 class AttemptSupervisor(Protocol):
@@ -191,8 +194,15 @@ def pi_launch_spec(
     prompt: str,
     worktree: str,
     model: str | None = None,
+    card_size: CardSize | None = None,
+    phase_budget: PhaseBudget | None = None,
 ) -> LaunchSpec:
     """Build the same pinned Pi argv/config/profile contract used by PiAdapter."""
+    if phase_budget is not None and card_size is None:
+        raise ValueError("an explicit phase budget requires card_size")
+    if card_size is not None:
+        budget = phase_budget or DEFAULT_PHASE_BUDGETS[card_size]
+        prompt = f"{budget.prompt_contract()}\n\n{prompt}"
     return LaunchSpec(
         name="pi",
         argv=adapter._argv(prompt, model=model),
@@ -204,6 +214,7 @@ def pi_launch_spec(
         config_files=adapter._config_files(model=model),
         stdin=adapter._stdin_for(prompt),
         required_commands=adapter._required_commands(),
+        required_checks=adapter._required_checks(),
     )
 
 
@@ -228,6 +239,9 @@ class PiExperimentRunner:
         *,
         attempt: int = 1,
         timeout_s: float = 1800,
+        card_size: CardSize = CardSize.MEDIUM,
+        requested_model: str | None = None,
+        phase_budget: PhaseBudget | None = None,
     ) -> RunOutcome | Admission:
         admission = self.controller.admit(request, attempt_number=attempt)
         if not admission.admitted or admission.duplicate:
@@ -286,6 +300,9 @@ class PiExperimentRunner:
                 payload={"reason": "preparation_failed"},
             )
             raise
+        budget = phase_budget or DEFAULT_PHASE_BUDGETS[card_size]
+        timeout_s = min(timeout_s, budget.total_s)
+        started_at = time.monotonic()
         try:
             exit_code, classification = self.supervisor.run(spec, directory, timeout_s)
         except Exception as exc:
@@ -297,9 +314,31 @@ class PiExperimentRunner:
             heartbeat.join(timeout=1)
         if lease_lost.is_set():
             classification = "lease_lost"
-        stdout_digest = self._capture(directory / "stdout.log")
+        duration_s = max(0.0, time.monotonic() - started_at)
+        stdout_path = directory / "stdout.log"
+        stdout_digest = self._capture(stdout_path, compact_events=True)
         stderr_digest = self._capture(directory / "stderr.log")
-        terminal_error = self._pi_terminal_error(directory / "stdout.log")
+        terminal_error = self._pi_terminal_error(stdout_path)
+        served_model = self._served_model(stdout_path)
+        time_to_first_edit_s = self._time_to_first_edit(stdout_path)
+        requested_model = requested_model or self._requested_model(spec)
+        timeout_phase = None
+        if classification == "timeout":
+            timeout_phase = "inspect" if time_to_first_edit_s is None else "test"
+        metrics: dict[str, object] = {
+            "duration_s": round(duration_s, 3),
+            "time_to_first_edit_s": time_to_first_edit_s,
+            "timeout_phase": timeout_phase,
+            "requested_model": requested_model,
+            "served_model": served_model,
+            "card_size": card_size.value,
+            "phase_budget_s": {
+                "assess": budget.assess_s,
+                "inspect": budget.inspect_s,
+                "build": budget.build_s,
+                "test": budget.test_s,
+            },
+        }
         if exit_code == 0 and classification == "exit" and terminal_error is not None:
             # Pi can report a provider/parser failure in its structured event
             # stream and still exit zero. A zero shell status alone is not success.
@@ -333,6 +372,7 @@ class PiExperimentRunner:
             "stdout_digest": stdout_digest,
             "stderr_digest": stderr_digest,
             "partial": not successful,
+            "metrics": metrics,
         }
         if terminal_error is not None:
             payload["terminal_error"] = terminal_error
@@ -350,7 +390,65 @@ class PiExperimentRunner:
             stdout_digest,
             stderr_digest,
             partial=not successful,
+            metrics=metrics,
         )
+
+    @staticmethod
+    def _events(path: Path):
+        if not path.exists():
+            return
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                event = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(event, dict):
+                yield event
+
+    @classmethod
+    def _served_model(cls, path: Path) -> str | None:
+        served = None
+        for event in cls._events(path):
+            candidate = event.get("responseModel")
+            message = event.get("message")
+            if isinstance(message, dict):
+                candidate = message.get("responseModel", candidate)
+            if isinstance(candidate, str) and candidate.strip():
+                served = candidate.strip()
+        return served
+
+    @staticmethod
+    def _requested_model(spec: LaunchSpec) -> str | None:
+        """Read the generated provider config, never model-authored output."""
+        raw = spec.config_files.get("/agent/models.json")
+        if not raw:
+            return None
+        try:
+            providers = json.loads(raw).get("providers", {})
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            return None
+        for provider in providers.values() if isinstance(providers, dict) else ():
+            models = provider.get("models") if isinstance(provider, dict) else None
+            if isinstance(models, list) and models and isinstance(models[0], dict):
+                model = models[0].get("id")
+                if isinstance(model, str) and model.strip():
+                    return model.strip()
+        return None
+
+    @classmethod
+    def _time_to_first_edit(cls, path: Path) -> float | None:
+        """Read Pi's relative event time for its first mutating tool call, if supplied."""
+        mutators = ("edit", "write", "apply_patch", "create_file")
+        for event in cls._events(path):
+            encoded = json.dumps(event, sort_keys=True).lower()
+            if not any(f'"{name}"' in encoded for name in mutators):
+                continue
+            for key in ("elapsed_s", "elapsed", "time_s"):
+                value = event.get(key)
+                if isinstance(value, (int, float)) and value >= 0:
+                    return round(float(value), 3)
+            return None
+        return None
 
     @staticmethod
     def _pi_terminal_error(path: Path) -> str | None:
@@ -405,8 +503,10 @@ class PiExperimentRunner:
             recovered.append(experiment_id)
         return recovered
 
-    def _capture(self, path: Path) -> str:
+    def _capture(self, path: Path, *, compact_events: bool = False) -> str:
         content = path.read_bytes() if path.exists() else b""
+        if compact_events:
+            content = compact_pi_events(content)
         return self.controller.store.put_artifact(content)
 
 

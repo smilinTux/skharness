@@ -19,6 +19,7 @@ from skharness.arena.runner import (
 )
 from skharness.arena.scheduler import AttemptRequest, LeaseScheduler, ResourceRequest
 from skharness.arena.store import ArenaStore, CorruptEventLogError
+from skharness.arena.trajectory import CardSize, PhaseBudget
 from skharness.autocode.adapters.pi import PiAdapter
 from skharness.autocode.sandbox import LaunchSpec, Sandbox
 from skharness.spawner import FakeSpawner
@@ -300,6 +301,44 @@ def test_pi_launch_spec_reuses_adapter_routing_profile_and_model_config(tmp_path
     assert "skgw/build" in spec.argv
     assert "http://skgateway:18780/v1" in spec.config_files["/agent/models.json"]
     assert spec.required_commands == ["pytest"]
+    assert spec.required_checks == [["/usr/local/bin/skharness-pi-python-test-preflight"]]
+
+
+def test_pi_launch_spec_injects_explicit_phase_contract(tmp_path):
+    adapter = PiAdapter(Sandbox(), model="build", base_url="http://gateway/v1")
+    spec = pi_launch_spec(
+        adapter,
+        prompt="fix the card",
+        worktree=str(tmp_path),
+        card_size=CardSize.SMALL,
+        phase_budget=PhaseBudget(1, 2, 3, 4),
+    )
+    assert "assess 1s, inspect 2s, build 3s, test 4s" in spec.argv[2]
+    assert spec.argv[2].endswith("fix the card")
+
+
+def test_run_persists_bounded_routing_and_phase_metrics(tmp_path):
+    controller = _controller(tmp_path)
+    controller.propose("experiment")
+    stream = (
+        b'{"type":"tool_call","name":"edit","elapsed_s":12.5}\n'
+        b'{"type":"message_end","message":{"role":"assistant",'
+        b'"stopReason":"stop","responseModel":"served-qwen"}}\n'
+    )
+    outcome = PiExperimentRunner(
+        controller, ScriptedSupervisor(stdout=stream), tmp_path / "runs"
+    ).execute(
+        _request(),
+        _spec(tmp_path),
+        card_size=CardSize.SMALL,
+        requested_model="requested-qwen",
+        phase_budget=PhaseBudget(1, 2, 3, 4),
+    )
+    assert outcome.metrics["time_to_first_edit_s"] == 12.5
+    assert outcome.metrics["requested_model"] == "requested-qwen"
+    assert outcome.metrics["served_model"] == "served-qwen"
+    assert outcome.metrics["card_size"] == "S"
+    assert controller.store.read_all_events()[-1].payload["metrics"] == outcome.metrics
 
 
 def test_production_factory_can_only_construct_real_sandbox_supervisor(tmp_path):

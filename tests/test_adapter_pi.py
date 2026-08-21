@@ -120,7 +120,11 @@ def test_pi_declares_the_per_call_override_seam():
 
 def test_arena_build_declares_pytest_as_an_image_preflight_requirement():
     assert _a(capability_profile="arena-build")._required_commands() == ["pytest"]
+    assert _a(capability_profile="arena-build")._required_checks() == [
+        ["/usr/local/bin/skharness-pi-python-test-preflight"]
+    ]
     assert _a(capability_profile="arena-verify")._required_commands() == []
+    assert _a(capability_profile="arena-verify")._required_checks() == []
 
 
 def test_config_files_budget_overridable():

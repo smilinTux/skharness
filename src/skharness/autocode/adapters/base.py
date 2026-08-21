@@ -202,6 +202,7 @@ class BaseCliAdapter(Harness):
     def _auth_env(self) -> dict: raise NotImplementedError
     def _config_files(self, model: str | None = None) -> dict: return {}
     def _required_commands(self) -> list[str]: return []
+    def _required_checks(self) -> list[list[str]]: return []
 
     def supports_model_override(self) -> bool:
         """True only when this adapter honours a per-call model id in BOTH _argv and
@@ -264,7 +265,8 @@ class BaseCliAdapter(Harness):
                           auth_env=self._auth_env(), egress_hosts=self.egress_hosts,
                           config_files=self._config_files(**mkw),
                           stdin=self._stdin_for(prompt),
-                          required_commands=self._required_commands())
+                          required_commands=self._required_commands(),
+                          required_checks=self._required_checks())
         return self.sandbox.spawn(spec, repo_remote_host=self._remote_host(repo),
                                   ci_host=self._ci_host(repo))
 

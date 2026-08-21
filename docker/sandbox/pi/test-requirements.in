@@ -1,0 +1,10 @@
+# Project-qualified Python test surface for SKHarness Pi coding workers.
+# Regenerate the lock with the command recorded at its top; runtime installs are forbidden.
+coverage
+httpx>=0.27
+pytest>=7
+pytest-asyncio>=0.23
+pytest-mock>=3.10
+capauth>=0.3.1,<0.4
+skcapstone
+skcoord

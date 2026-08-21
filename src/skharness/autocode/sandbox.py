@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .claude_code import HarnessUnavailable
 
@@ -45,6 +46,9 @@ class LaunchSpec:
     cpu_limit: float | None = None
     memory_gb_limit: float | None = None
     required_commands: list[str] = field(default_factory=list)
+    # Trusted, image-local executable probes. Unlike required_commands these
+    # validate behavior, not mere PATH presence. Each inner list is argv.
+    required_checks: list[list[str]] = field(default_factory=list)
 
 
 class Sandbox:
@@ -54,11 +58,70 @@ class Sandbox:
         self.docker = docker
         self.run_timeout = run_timeout
 
+    @staticmethod
+    def _linked_worktree_git_mount(worktree: str) -> AuthMount | None:
+        """Resolve the minimum Git metadata mount needed by a linked worktree.
+
+        Git stores a linked worktree's ``.git`` as a pointer to an administrative
+        directory below the repository's common Git directory.  Mounting only the
+        worktree leaves that absolute pointer dangling in the container.  Expose
+        the common directory read-only at the same absolute path so Git can read
+        HEAD, refs, objects, and config without granting the worker authority to
+        mutate repository metadata.
+
+        A normal checkout has a ``.git`` directory and needs no extra mount.  A
+        malformed or non-standard linked-worktree relationship fails closed.
+        """
+        dotgit = Path(os.path.realpath(worktree)) / ".git"
+        if dotgit.is_dir() or not dotgit.exists():
+            return None
+        if not dotgit.is_file():
+            raise HarnessUnavailable("worktree .git metadata is not a file or directory")
+        try:
+            marker = dotgit.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise HarnessUnavailable(f"cannot read worktree .git metadata: {exc}") from exc
+        prefix = "gitdir: "
+        if not marker.startswith(prefix) or "\n" in marker:
+            raise HarnessUnavailable("malformed linked-worktree .git pointer (fail closed)")
+        raw_gitdir = marker[len(prefix):].strip()
+        if not raw_gitdir:
+            raise HarnessUnavailable("empty linked-worktree .git pointer (fail closed)")
+        gitdir = Path(raw_gitdir)
+        if not gitdir.is_absolute():
+            gitdir = dotgit.parent / gitdir
+        gitdir = gitdir.resolve(strict=False)
+        if not gitdir.is_dir():
+            raise HarnessUnavailable("linked-worktree Git administrative directory is missing")
+        commondir_file = gitdir / "commondir"
+        try:
+            raw_common = commondir_file.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise HarnessUnavailable(
+                f"linked-worktree Git common-dir metadata is unavailable: {exc}"
+            ) from exc
+        if not raw_common or "\n" in raw_common:
+            raise HarnessUnavailable("malformed linked-worktree Git common-dir (fail closed)")
+        common = Path(raw_common)
+        if not common.is_absolute():
+            common = gitdir / common
+        common = common.resolve(strict=False)
+        if not common.is_dir():
+            raise HarnessUnavailable("linked-worktree Git common directory is missing")
+        try:
+            gitdir.relative_to(common)
+        except ValueError as exc:
+            raise HarnessUnavailable(
+                "linked-worktree administrative directory escapes its Git common directory"
+            ) from exc
+        return AuthMount(str(common), str(common), ro=True)
+
     def _docker_run_argv(self, spec: LaunchSpec, network: str, proxy_alias: str,
                          container_name: str | None = None,
                          extra_mounts: list[AuthMount] | None = None) -> list[str]:
         wt = os.path.realpath(spec.worktree)
         all_mounts = list(spec.auth_mounts) + list(extra_mounts or [])
+        git_mount = self._linked_worktree_git_mount(wt)
         argv = [self.docker, "run"]
         if container_name:
             argv += ["--name", container_name]
@@ -79,6 +142,11 @@ class Sandbox:
             "--env", f"HTTPS_PROXY=http://{proxy_alias}:{PROXY_PORT}",
             "--env", f"HTTP_PROXY=http://{proxy_alias}:{PROXY_PORT}",
         ]
+        if git_mount is not None:
+            argv += [
+                "--mount",
+                f"type=bind,src={git_mount.src},dst={git_mount.dst},readonly",
+            ]
         if spec.cpu_limit is not None:
             if spec.cpu_limit <= 0:
                 raise ValueError("cpu_limit must be positive when set")
@@ -123,6 +191,10 @@ class Sandbox:
         ]
 
     def _ensure_capable(self, spec: LaunchSpec) -> None:
+        # Resolve linked-worktree metadata before image/network/container setup.
+        # This both validates the relationship and guarantees a dangling .git
+        # pointer cannot be admitted into a live run.
+        self._linked_worktree_git_mount(spec.worktree)
         if not shutil.which(self.docker):
             raise HarnessUnavailable("docker not found on this node (fail closed)")
         r = subprocess.run([self.docker, "image", "inspect", spec.image],
@@ -141,6 +213,21 @@ class Sandbox:
                 raise HarnessUnavailable(
                     f"sandbox image {spec.image!r} lacks required command {command!r}; "
                     "select a project-qualified/test-capable image before admission"
+                )
+        for check in spec.required_checks:
+            if not check or not all(isinstance(part, str) and part for part in check):
+                raise HarnessUnavailable("sandbox image required check has invalid argv")
+            probe = subprocess.run(
+                [self.docker, "run", "--rm", "--network", "none", "--read-only",
+                 "--entrypoint", check[0], spec.image, *check[1:]],
+                capture_output=True,
+                text=True,
+            )
+            if probe.returncode != 0:
+                detail = (probe.stderr or probe.stdout or "no diagnostic output").strip()
+                raise HarnessUnavailable(
+                    f"sandbox image {spec.image!r} failed required executable check "
+                    f"{check[0]!r}: {detail[:240]}"
                 )
 
     def _wait_for_proxy(self, name: str, attempts: int = 50) -> None:
