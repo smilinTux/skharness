@@ -38,6 +38,12 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   single-builder; M cards use scout/build/test; L cards may parallelize read-only scouts
   but retain one writer until a trusted integration stage exists.
 
+### Operations
+
+- Published `pi-python-test` with the `v0.3.36` image matrix, SBOM/provenance
+  attestations, keyless Cosign signing and identity verification, an immutable Grype
+  gate, and a successful digest-pinned confined preflight on `.41`.
+
 ## [0.3.28] - 2026-08-20
 
 ### Fixed

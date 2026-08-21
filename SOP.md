@@ -354,11 +354,19 @@ CUDA 13 Docker `nvidia-smi` probe (16,311 MiB VRAM, driver 580.173.02). Each rel
 must still regenerate and verify its immutable registry digest, SBOM/provenance,
 signature, vulnerability report, and full Arena evidence bundle.
 
-Tag pushes run `.github/workflows/pi-image.yml`: both targets are published to GHCR by
+Tag pushes run `.github/workflows/pi-image.yml`: all three targets are published to GHCR by
 immutable digest with BuildKit SBOM/provenance, keyless-signed using GitHub OIDC, and
 immediately signature-verified. A separate Anchore job consumes the reviewed OpenVEX
 document and fails on any remaining High or Critical;
 publication or signing success cannot turn a failed vulnerability gate green.
+
+Release `v0.3.36` exercised that path for all three targets, including
+`pi-python-test`. Registry digest
+`sha256:f8fbc2f8733aae10ebaf3c8f268c9d4e004ccf34db2e5f0458452548b3f3acd3`
+was built with SBOM/provenance attestations, capability-probed, keyless-signed,
+identity/issuer-verified, and passed the Grype High/Critical gate. `.41` then pulled
+that exact digest and passed the same preflight under the confined runtime contract.
+See `docs/evidence/7fe0fb6b-pi-python-test-v0.3.36.md`.
 
 Arena admission CPU and RAM reservations become Docker `--cpus`, `--memory`, and
 no-extra-swap cgroup limits. Both worker and egress proxy use read-only root filesystems,
