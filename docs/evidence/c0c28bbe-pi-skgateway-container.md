@@ -52,6 +52,12 @@ network, accumulates any cleanup errors, and reports them only after every
 removal was attempted. Post-run inspection found no `skh-pi-gateway-*`,
 `skh-pi-worker-*`, or `skh-pi-gw-*` resources.
 
+After the test landed through GitHub, `.41` fast-forwarded to commit `7e8c09d`
+and ran the container module against the same immutable image. Both tests
+passed in 8.47 seconds, the checkout stayed clean, and the same post-run
+container/network leak checks passed. `.41` is an Intel/iGPU node; this gate
+does not claim NVIDIA or model-service qualification.
+
 This evidence satisfies `c0c28bbe`. It does not claim a live role route or
 production served-model persistence; card `d3c6377a` owns those separate
 runtime and RunRecord gates.

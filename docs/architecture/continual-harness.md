@@ -78,6 +78,45 @@ flowchart LR
 - Gateway replicas are cheap workers over shared model weights. Admission, queueing,
   context limits, and cancellation—not replica count—bound GPU load.
 
+#### Durable execution record boundary
+
+`skharness.autocode.run_record.RunRecord` is the canonical, immutable schema for one
+execution outcome. It retains the required scalar identity, route, effort, task-shape,
+cost, gate, run, and timestamp fields while also storing an ordered typed record for
+every gateway request in a multi-turn Pi run. Each request independently records request
+ID, requested role/model, served model, backend, HTTP status, input/output/cache/total
+tokens, cost, energy/timing, and sampling provenance. Evidence is explicitly
+`observed`, `absent`, or `conflict`; requested sampling and observed effective sampling
+are separate values with `matched`, `substituted`, `requested_only`, `observed_only`,
+`absent`, and `conflict` dispositions.
+
+Live identity is all-or-nothing: agent, session, and node plus each field's source must
+all be observed. Top-level token, USD-cost, and energy-joule totals declare
+`ordered_gateway_requests` scope and are reconciled against the request tuple. All
+observations must sum exactly; a mix of observed and missing evidence is `partial`, and
+any conflicting request evidence leaves the total null with a `conflict` disposition.
+The schema cannot silently retain a plausible aggregate that the ordered requests do
+not prove.
+
+The planned persistence seam is the existing atomic run journal at
+`~/.skcapstone/coordination/autopilot/runs/<run_id>.json`, under
+`items.<card_id>.run_records[]`. That durable record is the source of truth. It is never
+reconstructed from a coordination projection, because those projections are currently
+known to be lossy or wrong. Card `8967bf22` intentionally ships only the schema and
+validator: no production writer depends on it yet.
+
+Historical records are explicitly unattributable. A historical record may preserve a
+fact already present in an old ledger only while citing the exact legacy row in
+`record_sources` with its SHA-256 digest. Each retained usage, cost, energy, or
+task-shape value uses an exact JSON Pointer beneath that digest-bound record; inferred,
+defaulted, wildcard, parent, and projection sources are invalid. Historical
+`started_at` and `finished_at` are explicitly null rather than copied from the legacy
+ledger timestamp; only `recorded_at` preserves that known instant. Even with a legacy
+source, the validator rejects any backfilled agent, session, node, adapter,
+requested/served/grader model, effort tier, or joined gateway request. No backfill may
+infer attribution from names, timing, host conventions, requested routes, or agreement
+between stores.
+
 ### Trajectory and recovery invariants
 
 - Events are typed, schema-versioned, append-only, and hash-linked to card, prompt,

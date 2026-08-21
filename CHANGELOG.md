@@ -14,6 +14,21 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   Explicit operator-home self-verification remains mandatory even when an
   unrelated agent profile is active.
 
+### Added
+
+- Added a digest-only, containerized Pi-to-SKGateway integration gate that joins the
+  canonical provider config, requested model, card/session headers, provider-owned
+  response model, assistant output, and blocked direct Internet egress in one confined
+  run, with independently attempted cleanup for every Docker resource.
+- Added the immutable, writer-free `RunRecord` v1 schema and validator. It preserves
+  required top-level execution fields plus ordered per-request gateway provenance,
+  distinguishes missing evidence from conflict or substitution, and rejects invented
+  attribution on historical records. Token, cost, and energy aggregates are explicitly
+  scoped and reconciled to ordered requests; retained legacy facts require digest-bound
+  exact field pointers and historical execution times remain null. A later writer will
+  use the existing atomic run journal; this change deliberately adds no producer or
+  projection-derived backfill.
+
 ### Fixed
 
 - Closed the Pi image package-provenance gap exposed by `v0.3.36`: release builds now

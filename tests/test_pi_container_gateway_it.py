@@ -5,6 +5,7 @@ already-pulled, immutable Pi image reference.  The gateway and worker use that
 same image on a unique ``--internal`` network; no auxiliary mutable image is
 introduced.
 """
+
 from __future__ import annotations
 
 import json
@@ -30,7 +31,7 @@ pytestmark = pytest.mark.skipif(
 
 _IMMUTABLE_IMAGE = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
 
-_GATEWAY = r'''
+_GATEWAY = r"""
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -88,9 +89,9 @@ class Gateway(BaseHTTPRequestHandler):
 server = ThreadingHTTPServer(("0.0.0.0", 8080), Gateway)
 ready.write_text("ready\n")
 server.serve_forever()
-'''
+"""
 
-_DIRECT_EGRESS_PROBE = r'''
+_DIRECT_EGRESS_PROBE = r"""
 import json
 import socket
 import sys
@@ -107,7 +108,7 @@ else:
 Path("/qualification/egress.json").write_text(json.dumps(result))
 if result["direct_public_egress"] != "blocked":
     sys.exit(23)
-'''
+"""
 
 
 def _run(argv: list[str], *, timeout: int = 30) -> subprocess.CompletedProcess[str]:
@@ -261,7 +262,7 @@ def test_pi_container_routes_to_mock_gateway_without_direct_egress(tmp_path: Pat
                 "-c",
                 (
                     "python3 /qualification/egress_probe.py && "
-                    "exec pi -p \"$1\" --mode json --no-session --no-tools "
+                    'exec pi -p "$1" --mode json --no-session --no-tools '
                     "--model skgw/reference --api-key sk-local"
                 ),
                 "c0c28bbe-container-it",
