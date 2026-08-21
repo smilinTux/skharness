@@ -385,7 +385,12 @@ package-to-tag provenance join and invalidated the image for reuse despite the v
 digest, signature, and scan. See
 `docs/evidence/7fe0fb6b-pi-python-test-v0.3.36.md`. A replacement tag must pass the
 version-aware workflow and be digest-pulled and requalified on `.41` before this
-incident can close.
+incident can close. Release `v0.3.37` completed that replacement gate. Its qualified
+`pi-python-test` digest is
+`sha256:e7268563898230b39ca512d3614a9263c19bde79d9e1193d1c595d971aec1dfa`;
+the package metadata, baked record, OCI labels, tag and full commit agree, and a
+mismatched expected version fails closed. See
+`docs/evidence/cd4bf7fb-pi-image-provenance-v0.3.37.md`.
 
 Arena admission CPU and RAM reservations become Docker `--cpus`, `--memory`, and
 no-extra-swap cgroup limits. Both worker and egress proxy use read-only root filesystems,

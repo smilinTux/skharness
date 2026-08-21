@@ -21,7 +21,9 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   `setuptools-scm`, bake it into an image provenance record and OCI labels, and make
   the Python-test preflight compare the caller's expected version with both the record
   and installed distribution metadata. Local builds retain the explicit
-  `0.0.0+local` / `local` / `unknown` non-release identity.
+  `0.0.0+local` / `local` / `unknown` non-release identity. Replacement release
+  `v0.3.37` passed publication, signature verification, vulnerability scanning, and
+  digest-pinned confined qualification on `.41` with `skharness==0.3.37`.
 - Closed the fail-open phase boundary found by the first live L-card Pi swarm trial.
   Timed-out or missing scout results can no longer vacuously admit a builder; terminal
   overage/late usage is retained, cancellation remains restart-safe, and failures
