@@ -32,6 +32,20 @@ class AuthMount:
     ro: bool = True
 
 
+@dataclass(frozen=True)
+class InspectionScope:
+    """Limits discovery performed by an untrusted coding worker."""
+
+    root: str = "/work"
+    max_calls: int = 24
+
+    def __post_init__(self) -> None:
+        if not self.root.startswith("/") or self.root == "/":
+            raise ValueError("inspection root must be an absolute non-root path")
+        if self.max_calls <= 0:
+            raise ValueError("inspection max_calls must be positive")
+
+
 @dataclass
 class LaunchSpec:
     name: str
@@ -49,6 +63,7 @@ class LaunchSpec:
     # Trusted, image-local executable probes. Unlike required_commands these
     # validate behavior, not mere PATH presence. Each inner list is argv.
     required_checks: list[list[str]] = field(default_factory=list)
+    inspection_scope: InspectionScope | None = None
 
 
 class Sandbox:

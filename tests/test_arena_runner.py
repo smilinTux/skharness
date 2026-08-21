@@ -15,13 +15,14 @@ from skharness.arena.runner import (
     RunOutcome,
     SandboxProcessSupervisor,
     build_production_pi_runner,
+    inspect_pi_tool_event,
     pi_launch_spec,
 )
 from skharness.arena.scheduler import AttemptRequest, LeaseScheduler, ResourceRequest
 from skharness.arena.store import ArenaStore, CorruptEventLogError
 from skharness.arena.trajectory import CardSize, PhaseBudget
 from skharness.autocode.adapters.pi import PiAdapter
-from skharness.autocode.sandbox import LaunchSpec, Sandbox
+from skharness.autocode.sandbox import InspectionScope, LaunchSpec, Sandbox
 from skharness.spawner import FakeSpawner
 
 
@@ -315,6 +316,73 @@ def test_pi_launch_spec_injects_explicit_phase_contract(tmp_path):
     )
     assert "assess 1s, inspect 2s, build 3s, test 4s" in spec.argv[2]
     assert spec.argv[2].endswith("fix the card")
+
+
+def _tool_start(tool, args):
+    import json
+
+    return json.dumps({"type": "tool_execution_start", "toolName": tool, "args": args}).encode()
+
+
+@pytest.mark.parametrize(
+    ("tool", "args", "reason"),
+    [
+        ("bash", {"command": "find / -name '*.py'"}, "inspection_path_outside_worktree"),
+        ("bash", {"command": "grep -R token /home/cbrd21"}, "inspection_path_outside_worktree"),
+        ("bash", {"command": "/usr/bin/find / -type f"}, "inspection_path_outside_worktree"),
+        ("bash", {"command": "cd /work && find ../secret -type f"}, "inspection_parent_escape"),
+        ("find", {"path": "/etc", "pattern": "*"}, "inspection_path_outside_worktree"),
+        ("grep", {"path": "../", "pattern": "key"}, "inspection_parent_escape"),
+    ],
+)
+def test_inspection_scope_denies_adversarial_filesystem_discovery(tool, args, reason):
+    assert inspect_pi_tool_event(_tool_start(tool, args), InspectionScope()) == (reason, 1)
+
+
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        ("bash", {"command": "cd /work && find . -name '*.py' | head -50"}),
+        ("grep", {"path": "/work/src", "pattern": "Arena"}),
+        ("find", {"path": ".", "pattern": "*.py"}),
+    ],
+)
+def test_inspection_scope_allows_bounded_worktree_discovery(tool, args):
+    assert inspect_pi_tool_event(_tool_start(tool, args), InspectionScope()) == (None, 1)
+
+
+def test_arena_build_launch_enables_executable_inspection_scope(tmp_path):
+    adapter = PiAdapter(
+        Sandbox(), model="build", base_url="http://gateway/v1", capability_profile="arena-build"
+    )
+    spec = pi_launch_spec(adapter, prompt="fix", worktree=str(tmp_path))
+    assert spec.inspection_scope == InspectionScope(root="/work", max_calls=24)
+
+
+def test_inspection_monitor_emits_structured_denial_and_cancels(tmp_path):
+    path = tmp_path / "stdout.log"
+    path.write_bytes(_tool_start("bash", {"command": "find / -type f"}) + b"\n")
+
+    class Exited:
+        @staticmethod
+        def poll():
+            return 0
+
+    supervisor = SandboxProcessSupervisor(Sandbox(live_execution=True))
+    cancelled = []
+    supervisor.cancel = lambda: cancelled.append(True)
+    denied = threading.Event()
+    detail = {}
+    supervisor._monitor_inspection(path, InspectionScope(), Exited(), denied, detail)
+    assert cancelled == [True]
+    assert denied.is_set()
+    assert detail == {
+        "type": "inspection_denial",
+        "reason": "inspection_path_outside_worktree",
+        "root": "/work",
+        "observed_calls": 1,
+        "max_calls": 24,
+    }
 
 
 def test_run_persists_bounded_routing_and_phase_metrics(tmp_path):

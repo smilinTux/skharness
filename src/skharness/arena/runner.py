@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -22,7 +23,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
-from skharness.autocode.sandbox import AuthMount, LaunchSpec, Sandbox
+from skharness.autocode.sandbox import AuthMount, InspectionScope, LaunchSpec, Sandbox
 
 from .controller import ArenaController
 from .models import ExperimentState
@@ -129,6 +130,18 @@ class SandboxProcessSupervisor:
                 with self._lock:
                     self._process = process
                     self._container_name = container_name
+                inspection_denial = threading.Event()
+                inspection_detail: dict[str, object] = {}
+                monitor = None
+                if spec.inspection_scope is not None:
+                    monitor = threading.Thread(
+                        target=self._monitor_inspection,
+                        args=(attempt_dir / "stdout.log", spec.inspection_scope,
+                              process, inspection_denial, inspection_detail),
+                        daemon=True,
+                        name="arena-inspection-scope",
+                    )
+                    monitor.start()
                 if spec.stdin is not None and process.stdin is not None:
                     process.stdin.write(spec.stdin.encode())
                     process.stdin.close()
@@ -139,6 +152,13 @@ class SandboxProcessSupervisor:
                     classification = "timeout"
                     self.cancel()
                     exit_code = process.wait(timeout=10)
+                if monitor is not None:
+                    monitor.join(timeout=1)
+                if inspection_denial.is_set():
+                    classification = "inspection_denied"
+                    (attempt_dir / "inspection-denial.json").write_text(
+                        json.dumps(inspection_detail, sort_keys=True) + "\n", encoding="utf-8"
+                    )
             if classification != "timeout" and self._oom_killed(container_name):
                 classification = "oom"
             return exit_code, classification
@@ -157,6 +177,46 @@ class SandboxProcessSupervisor:
             )
             if config_dir:
                 shutil.rmtree(config_dir, ignore_errors=True)
+
+    def _monitor_inspection(
+        self,
+        path: Path,
+        scope: InspectionScope,
+        process: subprocess.Popen,
+        denied: threading.Event,
+        detail: dict[str, object],
+    ) -> None:
+        """Tail Pi tool-start envelopes and terminate out-of-scope discovery."""
+        offset = 0
+        calls = 0
+        while process.poll() is None or (path.exists() and path.stat().st_size > offset):
+            if not path.exists():
+                time.sleep(0.02)
+                continue
+            with path.open("rb") as stream:
+                stream.seek(offset)
+                lines = stream.readlines()
+                offset = stream.tell()
+            for raw in lines:
+                violation, inspected = inspect_pi_tool_event(raw, scope)
+                calls += inspected
+                if violation is None and calls <= scope.max_calls:
+                    continue
+                reason = violation or "inspection_call_budget_exceeded"
+                detail.update(
+                    {
+                        "type": "inspection_denial",
+                        "reason": reason,
+                        "root": scope.root,
+                        "observed_calls": calls,
+                        "max_calls": scope.max_calls,
+                    }
+                )
+                denied.set()
+                self.cancel()
+                return
+            time.sleep(0.02)
+
 
     def _oom_killed(self, container_name: str) -> bool:
         result = subprocess.run(
@@ -188,6 +248,57 @@ class SandboxProcessSupervisor:
                     pass
 
 
+def inspect_pi_tool_event(raw: bytes, scope: InspectionScope) -> tuple[str | None, int]:
+    """Return a stable denial reason and discovery-call count for one Pi envelope."""
+    try:
+        event = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None, 0
+    if not isinstance(event, dict) or event.get("type") != "tool_execution_start":
+        return None, 0
+    tool = event.get("toolName")
+    args = event.get("args")
+    if not isinstance(args, dict):
+        return (
+            ("malformed_inspection_arguments", 1)
+            if tool in {"find", "grep", "ls"}
+            else (None, 0)
+        )
+    direct_discovery = tool in {"find", "grep", "ls"}
+    if direct_discovery:
+        command = " ".join(str(value) for value in args.values())
+    elif tool == "bash" and isinstance(args.get("command"), str):
+        command = args["command"]
+    else:
+        return None, 0
+    try:
+        tokens = shlex.split(command, comments=False, posix=True)
+    except ValueError:
+        return "malformed_inspection_command", 1
+    discovery = (
+        1
+        if direct_discovery
+        else sum(
+            os.path.basename(token) in {"find", "grep", "rg", "ls"} for token in tokens
+        )
+    )
+    if not discovery:
+        return None, 0
+    root = scope.root.rstrip("/")
+    for token in tokens:
+        if token == ".." or token.startswith("../"):
+            return "inspection_parent_escape", discovery
+        if token.startswith("/") and token != root and not token.startswith(root + "/"):
+            return "inspection_path_outside_worktree", discovery
+    # Relative discovery is scoped only when the shell explicitly enters /work;
+    # native Pi tools are already rooted by their path argument.
+    if tool == "bash" and root not in tokens and not any(
+        token == "." or token.startswith("./") for token in tokens
+    ):
+        return "inspection_root_not_explicit", discovery
+    return None, discovery
+
+
 def pi_launch_spec(
     adapter: PiAdapter,
     *,
@@ -215,6 +326,9 @@ def pi_launch_spec(
         stdin=adapter._stdin_for(prompt),
         required_commands=adapter._required_commands(),
         required_checks=adapter._required_checks(),
+        inspection_scope=(
+            InspectionScope() if adapter.capability_profile == "arena-build" else None
+        ),
     )
 
 
@@ -319,6 +433,7 @@ class PiExperimentRunner:
         stdout_digest = self._capture(stdout_path, compact_events=True)
         stderr_digest = self._capture(directory / "stderr.log")
         terminal_error = self._pi_terminal_error(stdout_path)
+        inspection_denial = self._inspection_denial(directory / "inspection-denial.json")
         served_model = self._served_model(stdout_path)
         time_to_first_edit_s = self._time_to_first_edit(stdout_path)
         requested_model = requested_model or self._requested_model(spec)
@@ -376,6 +491,8 @@ class PiExperimentRunner:
         }
         if terminal_error is not None:
             payload["terminal_error"] = terminal_error
+        if inspection_denial is not None:
+            payload["inspection_denial"] = inspection_denial
         if not cancelled:
             self.controller.finish_run(
                 request.experiment_id, attempt, successful=successful, payload=payload
@@ -434,6 +551,16 @@ class PiExperimentRunner:
                 if isinstance(model, str) and model.strip():
                     return model.strip()
         return None
+
+    @staticmethod
+    def _inspection_denial(path: Path) -> dict[str, object] | None:
+        if not path.exists():
+            return None
+        try:
+            value = json.loads(path.read_text(encoding="utf-8")[:4096])
+        except (json.JSONDecodeError, OSError):
+            return {"type": "inspection_denial", "reason": "invalid_denial_evidence"}
+        return value if isinstance(value, dict) else None
 
     @classmethod
     def _time_to_first_edit(cls, path: Path) -> float | None:

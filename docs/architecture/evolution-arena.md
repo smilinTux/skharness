@@ -332,6 +332,15 @@ trial. Successful candidates are ordered by completion duration and then time-to
 This deliberately small policy captures the observed Ornith/Qwen differences without
 turning one anecdotal run into a production default; trial sets are versioned evidence.
 
+`arena-build` also enables an executable inspection scope. The supervisor tails Pi's
+structured tool-start envelopes while the container runs. `find`, `grep`, `rg`, and
+`ls` discovery must remain below `/work`, may not traverse `..`, and is capped at 24
+calls per attempt. An escape or excess terminates the worker and classifies the run as
+`inspection_denied`; `inspection-denial.json` and the terminal arena event retain a
+bounded reason, permitted root, call count, and limit. The policy covers direct Pi
+discovery tools and discovery invoked through `bash`, including the adversarial
+filesystem-wide commands observed in the `.41` trace.
+
 Implementation truth (repository audit, 2026-08-20): the Dockerfile now pins a Wolfi
 base digest, exact direct APKs, the Pi/npm graph, and hashed Python wheels. Core omits
 package/build managers; polyglot supplies verified Node/npm, Python/uv, Go, Rust/Cargo,
