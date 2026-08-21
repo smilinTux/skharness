@@ -264,7 +264,7 @@ def inspect_pi_tool_event(raw: bytes, scope: InspectionScope) -> tuple[str | Non
             if tool in {"find", "grep", "ls"}
             else (None, 0)
         )
-    direct_discovery = tool in {"find", "grep", "ls"}
+    direct_discovery = tool in {"find", "grep", "rg", "ls"}
     if direct_discovery:
         command = " ".join(str(value) for value in args.values())
     elif tool == "bash" and isinstance(args.get("command"), str):
@@ -272,34 +272,48 @@ def inspect_pi_tool_event(raw: bytes, scope: InspectionScope) -> tuple[str | Non
     else:
         return None, 0
     try:
-        tokens = shlex.split(command, comments=False, posix=True)
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
     except ValueError:
         return "malformed_inspection_command", 1
-    discovery = (
-        1
-        if direct_discovery
-        else sum(
-            os.path.basename(token) in {"find", "grep", "rg", "ls"} for token in tokens
-        )
-    )
+    separators = {";", "&&", "||", "|", "&"}
+    commands: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token in separators:
+            if current:
+                commands.append(current)
+                current = []
+        else:
+            current.append(token)
+    if current:
+        commands.append(current)
+    if direct_discovery:
+        commands = [[str(tool), *tokens]]
+    discovery_commands = [
+        argv for argv in commands if argv and os.path.basename(argv[0]) in {"find", "grep", "rg", "ls"}
+    ]
+    discovery = len(discovery_commands)
     if not discovery:
         return None, 0
     root = scope.root.rstrip("/")
-    for token in tokens:
-        if token == ".." or token.startswith("../"):
-            return "inspection_parent_escape", discovery
-        if token.startswith("/") and token != root and not token.startswith(root + "/"):
-            return "inspection_path_outside_worktree", discovery
-    # Relative discovery is scoped only when the shell explicitly enters /work;
-    # native Pi tools are already rooted by their path argument.
-    if tool == "bash" and not any(
-        token == root
-        or token.startswith(root + "/")
-        or token == "."
-        or token.startswith("./")
-        for token in tokens
-    ):
-        return "inspection_root_not_explicit", discovery
+    relevant_commands = discovery_commands + [
+        argv for argv in commands if argv and os.path.basename(argv[0]) == "cd"
+    ]
+    for argv in relevant_commands:
+        for token in argv[1:]:
+            if token == ".." or token.startswith("../"):
+                return "inspection_parent_escape", discovery
+            if token.startswith("/") and token != root and not token.startswith(root + "/"):
+                return "inspection_path_outside_worktree", discovery
+    # Bash starts in /work. Relative discovery remains scoped unless an explicit
+    # cd escapes it; those cd arguments are validated above. Inspecting only the
+    # discovery command's argv prevents sed/awk regexes elsewhere in a compound
+    # command from being mistaken for filesystem paths.
+    if tool == "bash" and not discovery_commands:
+        return None, 0
     return None, discovery
 
 
@@ -331,7 +345,10 @@ def pi_launch_spec(
         required_commands=adapter._required_commands(),
         required_checks=adapter._required_checks(),
         inspection_scope=(
-            InspectionScope() if adapter.capability_profile == "arena-build" else None
+            InspectionScope(max_calls={CardSize.SMALL: 24, CardSize.MEDIUM: 48,
+                                       CardSize.LARGE: 80}.get(card_size, 24))
+            if adapter.capability_profile == "arena-build"
+            else None
         ),
     )
 

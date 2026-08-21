@@ -344,6 +344,10 @@ def test_inspection_scope_denies_adversarial_filesystem_discovery(tool, args, re
     [
         ("bash", {"command": "cd /work && find . -name '*.py' | head -50"}),
         ("bash", {"command": "find /work/src/skharness -type f | head -100"}),
+        (
+            "bash",
+            {"command": "cd /work && grep -n token src/a.py; sed -n '/^def /p' src/b.py"},
+        ),
         ("grep", {"path": "/work/src", "pattern": "Arena"}),
         ("find", {"path": ".", "pattern": "*.py"}),
     ],
@@ -358,6 +362,18 @@ def test_arena_build_launch_enables_executable_inspection_scope(tmp_path):
     )
     spec = pi_launch_spec(adapter, prompt="fix", worktree=str(tmp_path))
     assert spec.inspection_scope == InspectionScope(root="/work", max_calls=24)
+
+
+@pytest.mark.parametrize(
+    ("size", "max_calls"),
+    [(CardSize.SMALL, 24), (CardSize.MEDIUM, 48), (CardSize.LARGE, 80)],
+)
+def test_arena_build_inspection_budget_scales_with_card_size(tmp_path, size, max_calls):
+    adapter = PiAdapter(
+        Sandbox(), model="build", base_url="http://gateway/v1", capability_profile="arena-build"
+    )
+    spec = pi_launch_spec(adapter, prompt="fix", worktree=str(tmp_path), card_size=size)
+    assert spec.inspection_scope == InspectionScope(root="/work", max_calls=max_calls)
 
 
 def test_inspection_monitor_emits_structured_denial_and_cancels(tmp_path):

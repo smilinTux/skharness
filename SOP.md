@@ -229,13 +229,15 @@ in the attempt directory. Route models with `EvidenceModelRouter` only from a fi
 trial set containing S/M/L evidence for each candidate. No successful target-size trial
 means no route; operators must not substitute intuition for missing qualification data.
 
-The `arena-build` launch spec applies `InspectionScope(root="/work", max_calls=24)`.
+The `arena-build` launch spec applies `InspectionScope(root="/work")` with measured
+discovery ceilings of 24/48/80 calls for S/M/L cards.
 Filesystem discovery through Pi's `find`/`grep`/`ls` tools or through bash (`find`,
 `grep`, `rg`, `ls`) is monitored from structured tool-start events. Absolute paths
 outside `/work`, parent traversal, malformed discovery commands, and attempts exceeding
 the call budget terminate the container and produce `inspection_denied` evidence. Do
-not loosen this to accommodate a broad search; narrow the card prompt or raise a
-reviewed, explicit profile instead.
+not loosen this to accommodate a broad search. Shell inspection is command-aware:
+only discovery-command arguments and `cd` destinations are path checked, so regex
+syntax in neighboring `sed`/`awk` commands is not treated as a path.
 
 Passing `capability_profile=` to `PiAdapter` loads only the in-image SK bridge extension
 and emits Pi's explicit `--tools` allowlist. The extension calls

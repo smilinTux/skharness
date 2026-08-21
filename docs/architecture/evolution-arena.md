@@ -334,8 +334,10 @@ turning one anecdotal run into a production default; trial sets are versioned ev
 
 `arena-build` also enables an executable inspection scope. The supervisor tails Pi's
 structured tool-start envelopes while the container runs. `find`, `grep`, `rg`, and
-`ls` discovery must remain below `/work`, may not traverse `..`, and is capped at 24
-calls per attempt. An escape or excess terminates the worker and classifies the run as
+`ls` discovery must remain below `/work`, may not traverse `..`, and is capped at
+24/48/80 calls for S/M/L attempts. Shell commands are split structurally so only the
+discovery argv and `cd` destinations are path checked; regex operands belonging to
+other commands cannot create false path escapes. An escape or excess terminates the worker and classifies the run as
 `inspection_denied`; `inspection-denial.json` and the terminal arena event retain a
 bounded reason, permitted root, call count, and limit. The policy covers direct Pi
 discovery tools and discovery invoked through `bash`, including the adversarial
