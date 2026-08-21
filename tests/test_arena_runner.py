@@ -343,6 +343,7 @@ def test_inspection_scope_denies_adversarial_filesystem_discovery(tool, args, re
     ("tool", "args"),
     [
         ("bash", {"command": "cd /work && find . -name '*.py' | head -50"}),
+        ("bash", {"command": "find /work/src/skharness -type f | head -100"}),
         ("grep", {"path": "/work/src", "pattern": "Arena"}),
         ("find", {"path": ".", "pattern": "*.py"}),
     ],

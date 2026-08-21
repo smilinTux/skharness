@@ -292,8 +292,12 @@ def inspect_pi_tool_event(raw: bytes, scope: InspectionScope) -> tuple[str | Non
             return "inspection_path_outside_worktree", discovery
     # Relative discovery is scoped only when the shell explicitly enters /work;
     # native Pi tools are already rooted by their path argument.
-    if tool == "bash" and root not in tokens and not any(
-        token == "." or token.startswith("./") for token in tokens
+    if tool == "bash" and not any(
+        token == root
+        or token.startswith(root + "/")
+        or token == "."
+        or token.startswith("./")
+        for token in tokens
     ):
         return "inspection_root_not_explicit", discovery
     return None, discovery
