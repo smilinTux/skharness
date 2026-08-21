@@ -263,6 +263,23 @@ RUN_SANDBOX_IT=1 SANDBOX_TEST_IMAGE=sandbox-pi:1 \
   python -m pytest -q tests/test_sandbox_confinement_it.py
 ```
 
+Continual-loop comparisons use `skharness.arena.evaluation`. A report is valid only
+when every baseline, memory-only, skills-only, subagents-only, and full-loop cell is
+present for the declared fixed seeds and repetition count. The report always includes
+quality, cost, tokens, latency, recovery rate, reward-hack count, and verifier
+disagreement count; duplicate or missing cells fail closed.
+
+RL exports preserve exact token IDs, logprobs, sampling parameters, model identity,
+and action/observation boundaries. Only assistant/action steps are labeled for RL;
+tool responses and observations are labeled for world-model SFT. Slow parametric
+promotion requires distinct train/eval/prod dataset IDs and credential IDs, a passing
+held-out regression, a passing canary, zero observed reward hacks, and an explicit
+approval identifier. Validate these invariants with:
+
+```bash
+python -m pytest -q tests/test_arena_evaluation.py
+```
+
 ---
 
 ## 4. Test
