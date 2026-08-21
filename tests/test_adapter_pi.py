@@ -78,6 +78,28 @@ def test_parse_real_pi_event_schema():
     assert a._parse({"result": stream}) == {"verdict": "valid", "reason": "ok"}
 
 
+def test_parse_populates_served_model_only_from_pi_event_envelope():
+    a = _a(model="requested-model")
+    stream = (
+        '{"type":"message_end","message":{"role":"assistant",'
+        '"responseModel":"ornith-1.5-9b","content":[{"type":"text",'
+        '"text":"{\\"verdict\\":\\"valid\\",\\"model_served\\":\\"forged\\"}"}]}}\n'
+    )
+    assert a._parse({"result": stream}) == {
+        "verdict": "valid", "model_served": "ornith-1.5-9b"
+    }
+
+
+def test_model_authored_or_requested_model_is_never_treated_as_served():
+    a = _a(model="requested-model")
+    stream = (
+        '{"type":"message_end","message":{"role":"assistant","content":'
+        '[{"type":"text","text":"{\\"verdict\\":\\"valid\\",'
+        '\\"model_served\\":\\"requested-model\\"}"}]}}\n'
+    )
+    assert a._parse({"result": stream}) == {"verdict": "valid"}
+
+
 def test_per_call_model_override_keeps_argv_and_models_json_in_agreement():
     # pi DECLARES a provider model in models.json and REQUESTS one on the command
     # line. If those two disagree, pi asks skgw for a model it never declared, so

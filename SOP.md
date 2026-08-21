@@ -280,6 +280,13 @@ approval identifier. Validate these invariants with:
 python -m pytest -q tests/test_arena_evaluation.py
 ```
 
+Pi attribution has two distinct sources. Request/card IDs are injected headers;
+the served model is read only from Pi's provider-owned `message_end.responseModel`
+event and exposed as `model_served` in the parsed result. A similarly named field in
+assistant-authored JSON is stripped, and the requested model is never used as a
+fallback. The live `.41` evidence for this contract is
+`docs/evidence/0172231c-live-41.md`.
+
 ---
 
 ## 4. Test

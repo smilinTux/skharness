@@ -50,6 +50,25 @@ def _attribution_value(name: str, value):
     return value
 
 
+def _observed_served_model(body: str) -> str | None:
+    """Read Pi's provider-owned responseModel; never infer it from the request."""
+    for line in (body or "").splitlines():
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        message = event.get("message")
+        candidates = [event.get("responseModel")]
+        if isinstance(message, dict):
+            candidates.insert(0, message.get("responseModel"))
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+    return None
+
+
 class PiAdapter(BaseCliAdapter):
     name = "pi"
 
@@ -204,6 +223,11 @@ class PiAdapter(BaseCliAdapter):
             # Sandbox.spawn hands it over as result=<stream> when not a lone object.
             obj = parse_event_stream(body)
             if obj:
+                # A model-authored JSON field is not provenance. Replace it only
+                # when Pi's provider-owned event envelope reports responseModel.
+                obj.pop("model_served", None)
+                if observed := _observed_served_model(body):
+                    obj["model_served"] = observed
                 return obj
             try:                                   # single-object fallback
                 single = json.loads(body)
