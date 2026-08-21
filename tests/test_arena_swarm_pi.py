@@ -59,9 +59,11 @@ class Runner:
         self.outcome = outcome
         self.supervisor = Supervisor()
         self.kwargs = None
+        self.spec = None
 
     def execute(self, request, spec, **kwargs):
         self.kwargs = kwargs
+        self.spec = spec
         return self.outcome
 
 
@@ -92,6 +94,8 @@ def test_pi_runtime_maps_success_to_evidence_not_completion_authority():
     assert execution.result.observed_commit == COMMIT
     assert execution.usage.wall_seconds == 2
     assert runner.kwargs["timeout_s"] == 60
+    assert runner.spec.scoped_readable_paths == ["src"]
+    assert runner.spec.scoped_writable_paths == ["src"]
 
 
 def test_pi_runtime_preserves_blocked_disposition_and_can_cancel_active_runner():

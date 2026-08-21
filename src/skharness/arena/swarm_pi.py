@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 from skharness.autocode.sandbox import LaunchSpec
@@ -50,6 +50,14 @@ class PiSwarmWorkerRuntime:
     def execute(self, contract: SubagentContract) -> WorkerExecution:
         runner = self.runner_factory(contract)
         launch = self.launch_factory(contract)
+        launch = replace(
+            launch,
+            spec=replace(
+                launch.spec,
+                scoped_readable_paths=list(contract.readable_paths),
+                scoped_writable_paths=list(contract.writable_paths),
+            ),
+        )
         started = datetime.now(timezone.utc)
         with self._lock:
             self._active[contract.lease_id] = runner

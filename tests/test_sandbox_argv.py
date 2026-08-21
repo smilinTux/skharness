@@ -26,6 +26,22 @@ def test_docker_argv_is_hardened_and_confined():
     assert argv[-3:] == ["claude", "-p", "hi"]           # harness argv is the tail
 
 
+def test_swarm_scoped_mounts_enforce_read_only_and_declared_write_paths(tmp_path):
+    worktree = tmp_path / "wt"
+    (worktree / "src").mkdir(parents=True)
+    (worktree / "tests").mkdir()
+    spec = _spec(
+        worktree=str(worktree),
+        scoped_readable_paths=["src", "tests"],
+        scoped_writable_paths=["src"],
+    )
+    joined = " ".join(Sandbox()._docker_run_argv(spec, "n", "p"))
+    assert f"src={worktree}/src,dst=/work/src" in joined
+    assert f"src={worktree}/src,dst=/work/src,readonly" not in joined
+    assert f"src={worktree}/tests,dst=/work/tests,readonly" in joined
+    assert f"src={worktree},dst=/work" not in joined
+
+
 def test_no_secret_paths_mounted():
     j = " ".join(Sandbox()._docker_run_argv(_spec(), "n", "p"))
     for secret in (".skcapstone", ".hermes", ".ssh", "skvault"):

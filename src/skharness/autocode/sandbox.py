@@ -64,6 +64,10 @@ class LaunchSpec:
     # validate behavior, not mere PATH presence. Each inner list is argv.
     required_checks: list[list[str]] = field(default_factory=list)
     inspection_scope: InspectionScope | None = None
+    # Empty preserves the legacy whole-worktree mount. Swarm launches populate
+    # these with validated repository-relative paths from SubagentContract.
+    scoped_readable_paths: list[str] = field(default_factory=list)
+    scoped_writable_paths: list[str] = field(default_factory=list)
 
 
 class Sandbox:
@@ -153,11 +157,21 @@ class Sandbox:
             "--security-opt", "no-new-privileges", "--cap-drop", "ALL",
             "--pids-limit", "512",
             "--env", "HOME=/home/sbx",
-            "--mount", f"type=bind,src={wt},dst=/work",
             "--env", f"HTTPS_PROXY=http://{proxy_alias}:{PROXY_PORT}",
             "--env", f"HTTP_PROXY=http://{proxy_alias}:{PROXY_PORT}",
         ]
-        if git_mount is not None:
+        if spec.scoped_readable_paths:
+            for mount in self._scoped_worktree_mounts(spec, wt):
+                suffix = ",readonly" if mount.ro else ""
+                argv += [
+                    "--mount",
+                    f"type=bind,src={mount.src},dst={mount.dst}{suffix}",
+                ]
+        else:
+            argv += ["--mount", f"type=bind,src={wt},dst=/work"]
+        if git_mount is not None and (
+            not spec.scoped_readable_paths or ".git" in spec.scoped_readable_paths
+        ):
             argv += [
                 "--mount",
                 f"type=bind,src={git_mount.src},dst={git_mount.dst},readonly",
@@ -189,6 +203,31 @@ class Sandbox:
             argv += ["--env", f"{k}={v}"]
         argv += [spec.image, *spec.argv]
         return argv
+
+    @staticmethod
+    def _scoped_worktree_mounts(spec: LaunchSpec, worktree: str) -> list[AuthMount]:
+        readable = tuple(dict.fromkeys(spec.scoped_readable_paths))
+        writable = tuple(dict.fromkeys(spec.scoped_writable_paths))
+        if any(path not in readable for path in writable):
+            raise HarnessUnavailable("scoped writable paths must also be readable")
+        mounts: list[AuthMount] = []
+        root = Path(worktree)
+        for relative in readable:
+            candidate = (root / relative).resolve(strict=False)
+            try:
+                candidate.relative_to(root)
+            except ValueError as exc:
+                raise HarnessUnavailable("scoped worktree path escapes the worktree") from exc
+            if not candidate.exists():
+                raise HarnessUnavailable(f"scoped worktree path is missing: {relative}")
+            mounts.append(
+                AuthMount(
+                    str(candidate),
+                    f"/work/{relative}",
+                    ro=relative not in writable,
+                )
+            )
+        return mounts
 
     def _proxy_run_argv(
         self, *, name: str, network: str, alias: str, allow: list[str]
