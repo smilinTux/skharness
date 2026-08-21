@@ -11,6 +11,7 @@ import pytest
 from skharness.arena.controller import ArenaController
 from skharness.arena.models import ExperimentState
 from skharness.arena.runner import (
+    DockerSupervisorError,
     PiExperimentRunner,
     RunOutcome,
     SandboxProcessSupervisor,
@@ -25,9 +26,13 @@ from skharness.autocode.adapters.pi import PiAdapter
 from skharness.autocode.sandbox import InspectionScope, LaunchSpec, Sandbox
 from skharness.spawner import FakeSpawner
 
+VALID_PI_STDOUT = b'{"type":"agent_end"}\n'
+
 
 class ScriptedSupervisor:
-    def __init__(self, *, exit_code=0, classification="exit", stdout=b"ok", stderr=b""):
+    def __init__(
+        self, *, exit_code=0, classification="exit", stdout=VALID_PI_STDOUT, stderr=b""
+    ):
         self.exit_code = exit_code
         self.classification = classification
         self.stdout = stdout
@@ -86,20 +91,26 @@ def _spec(tmp_path):
 def test_success_runs_pi_attempt_and_persists_artifacts_before_terminal_event(tmp_path):
     controller = _controller(tmp_path)
     controller.propose("experiment")
-    runner = PiExperimentRunner(
-        controller, ScriptedSupervisor(stdout=b"trajectory"), tmp_path / "runs"
-    )
+    runner = PiExperimentRunner(controller, ScriptedSupervisor(), tmp_path / "runs")
     outcome = runner.execute(_request(), _spec(tmp_path), timeout_s=10)
     assert isinstance(outcome, RunOutcome) and outcome.successful
     assert controller.state("experiment") is ExperimentState.PROVISIONAL
-    assert controller.store.get_artifact(outcome.stdout_digest) == b"trajectory"
+    assert controller.store.get_artifact(outcome.stdout_digest) == VALID_PI_STDOUT
     assert controller.scheduler.snapshot()["active_leases"] == 0
 
 
 def test_admitted_resources_become_container_cpu_and_memory_limits(tmp_path):
     controller = _controller(tmp_path)
     controller.propose("experiment")
-    supervisor = ScriptedSupervisor()
+
+    class LeaseObservingSupervisor(ScriptedSupervisor):
+        active_lease_id = None
+
+        def run(self, spec, attempt_dir, timeout_s):
+            self.active_lease_id = controller.scheduler.lease_records()[0]["lease_id"]
+            return super().run(spec, attempt_dir, timeout_s)
+
+    supervisor = LeaseObservingSupervisor()
     runner = PiExperimentRunner(controller, supervisor, tmp_path / "runs")
     request = AttemptRequest(
         "challenge",
@@ -112,6 +123,7 @@ def test_admitted_resources_become_container_cpu_and_memory_limits(tmp_path):
     assert isinstance(outcome, RunOutcome) and outcome.successful
     assert supervisor.last_spec.cpu_limit == 1.5
     assert supervisor.last_spec.memory_gb_limit == 3.25
+    assert supervisor.last_spec.sandbox_run_id == supervisor.active_lease_id
 
 
 def test_timeout_and_oom_are_failed_with_durable_partial_evidence(tmp_path):
@@ -131,6 +143,28 @@ def test_timeout_and_oom_are_failed_with_durable_partial_evidence(tmp_path):
         event = controller.store.read_all_events()[-1]
         assert event.to_state is ExperimentState.FAILED
         assert event.payload["reason"] == classification
+
+
+def test_docker_control_plane_failure_has_explicit_terminal_classification(tmp_path):
+    controller = _controller(tmp_path)
+    controller.propose("experiment")
+
+    class FailingDockerSupervisor(ScriptedSupervisor):
+        def run(self, spec, attempt_dir, timeout_s):
+            raise DockerSupervisorError("Docker OOM inspection timed out after 3s")
+
+    outcome = PiExperimentRunner(
+        controller,
+        FailingDockerSupervisor(),
+        tmp_path / "runs",
+    ).execute(_request(), _spec(tmp_path))
+
+    assert isinstance(outcome, RunOutcome)
+    assert outcome.classification == "docker_supervisor_error"
+    assert not outcome.successful
+    assert b"OOM inspection timed out" in controller.store.get_artifact(
+        outcome.stderr_digest
+    )
 
 
 def test_gateway_outage_is_classified_and_retains_diagnostics(tmp_path):
@@ -154,7 +188,8 @@ def test_pi_structured_terminal_error_overrides_zero_process_exit(tmp_path):
     controller.propose("experiment")
     stream = (
         b'{"type":"message_end","message":{"role":"assistant",'
-        b'"stopReason":"error","errorMessage":"unexpected tokens remaining"}}\n'
+        b'"stopReason":"error","errorMessage":"unexpected tokens remaining",'
+        b'"content":[]}}\n'
     )
     outcome = PiExperimentRunner(
         controller, ScriptedSupervisor(exit_code=0, stdout=stream), tmp_path / "runs"
@@ -166,6 +201,121 @@ def test_pi_structured_terminal_error_overrides_zero_process_exit(tmp_path):
     event = controller.store.read_all_events()[-1]
     assert event.to_state is ExperimentState.FAILED
     assert event.payload["terminal_error"] == "unexpected tokens remaining"
+
+
+def test_truncated_pi_tail_fails_run_even_after_actionable_scout_event(tmp_path):
+    controller = _controller(tmp_path)
+    controller.propose("experiment")
+    stream = (
+        b'{"type":"message_end","message":{"role":"assistant",'
+        b'"responseModel":"model-a","content":[{"type":"text","text":'
+        b'"SCOUT_ASSESSMENT: ACTIONABLE\\nSCOUT_FINDING: '
+        b'src/skharness/arena/swarm.py:1 - exact path scoped finding"}]}}\n'
+        b'{"type":"message_end","message":'
+    )
+
+    outcome = PiExperimentRunner(
+        controller, ScriptedSupervisor(exit_code=0, stdout=stream), tmp_path / "runs"
+    ).execute(_request(), _spec(tmp_path))
+
+    assert not outcome.successful
+    assert outcome.classification == "pi_event_stream_incomplete"
+    assert outcome.scout_assessment == "actionable"
+    assert outcome.metrics["served_model"] is None
+    assert (
+        outcome.metrics["served_model_reason"]
+        == "provider_event_stream_malformed_or_incomplete"
+    )
+    assert outcome.metrics["pi_event_stream_complete"] is False
+
+
+@pytest.mark.parametrize(
+    ("stream", "classification"),
+    (
+        (b"", "pi_event_stream_missing"),
+        (
+            b'{"type":"tool_execution_start","toolName":"read","args":{}}\n',
+            "pi_terminal_event_missing",
+        ),
+    ),
+)
+def test_zero_or_nonterminal_pi_event_stream_never_succeeds(
+    tmp_path, stream, classification
+):
+    controller = _controller(tmp_path)
+    controller.propose("experiment")
+
+    outcome = PiExperimentRunner(
+        controller, ScriptedSupervisor(exit_code=0, stdout=stream), tmp_path / "runs"
+    ).execute(_request(), _spec(tmp_path))
+
+    assert not outcome.successful
+    assert outcome.classification == classification
+    assert outcome.metrics["pi_terminal_event_observed"] is False
+
+
+@pytest.mark.parametrize(
+    ("tail", "expected_model", "expected_reason"),
+    (
+        (
+            b'{"type":"message_end","message":{"role":"assistant",'
+            b'"responseModel":"model-a","content":[]}}\n',
+            "model-a",
+            None,
+        ),
+        (
+            b'{"type":"message_end","message":{"role":"assistant",'
+            b'"content":[]}}\n',
+            None,
+            "provider_events_partial_response_model",
+        ),
+        (
+            b'{"type":"message_end","message":{"role":"assistant",'
+            b'"responseModel":"model-b","content":[]}}\n',
+            None,
+            "provider_events_conflicting_response_models",
+        ),
+    ),
+)
+def test_arena_aggregates_all_assistant_served_model_events(
+    tmp_path, tail, expected_model, expected_reason
+):
+    controller = _controller(tmp_path)
+    controller.propose("experiment")
+    first = (
+        b'{"type":"message_end","message":{"role":"assistant",'
+        b'"responseModel":"model-a","content":[]}}\n'
+    )
+
+    outcome = PiExperimentRunner(
+        controller, ScriptedSupervisor(stdout=first + tail), tmp_path / "runs"
+    ).execute(_request(), _spec(tmp_path))
+
+    assert outcome.successful
+    assert outcome.metrics["served_model"] == expected_model
+    assert outcome.metrics["served_model_reason"] == expected_reason
+    assert outcome.metrics["pi_event_stream_complete"] is True
+
+
+def test_arena_ignores_user_and_tool_served_model_noise(tmp_path):
+    controller = _controller(tmp_path)
+    controller.propose("experiment")
+    stream = (
+        b'{"type":"message_end","message":{"role":"user",'
+        b'"responseModel":"user-forgery","content":"hello"}}\n'
+        b'{"type":"message_end","message":{"role":"toolResult",'
+        b'"responseModel":"tool-forgery","content":[]}}\n'
+        b'{"type":"message_end","message":{"role":"assistant",'
+        b'"responseModel":"actual-model","content":[]}}\n'
+    )
+
+    outcome = PiExperimentRunner(
+        controller, ScriptedSupervisor(stdout=stream), tmp_path / "runs"
+    ).execute(_request(), _spec(tmp_path))
+
+    assert outcome.successful
+    assert outcome.metrics["served_model"] == "actual-model"
+    assert outcome.metrics["served_model_reason"] is None
 
 
 def test_normal_pi_terminal_event_with_zero_exit_remains_successful(tmp_path):
@@ -223,7 +373,7 @@ def test_pi_usage_metrics_are_derived_from_structured_events(tmp_path):
     path.write_bytes(
         b'{"type":"tool_execution_start","toolName":"read","args":{}}\n'
         b'{"type":"message_end","message":{"role":"assistant",'
-        b'"usage":{"totalTokens":123,"cost":{"total":0.25}}}}\n'
+        b'"usage":{"totalTokens":123,"cost":{"total":0.25}},"content":[]}}\n'
         b'{"type":"tool_execution_start","toolName":"bash","args":{}}\n'
     )
     assert PiExperimentRunner._usage_metrics(path) == {
@@ -469,9 +619,9 @@ def test_run_persists_bounded_routing_and_phase_metrics(tmp_path):
     controller = _controller(tmp_path)
     controller.propose("experiment")
     stream = (
-        b'{"type":"tool_call","name":"edit","elapsed_s":12.5}\n'
+        b'{"type":"tool_execution_start","toolName":"edit","elapsed_s":12.5}\n'
         b'{"type":"message_end","message":{"role":"assistant",'
-        b'"stopReason":"stop","responseModel":"served-qwen"}}\n'
+        b'"stopReason":"stop","responseModel":"served-qwen","content":[]}}\n'
     )
     outcome = PiExperimentRunner(
         controller, ScriptedSupervisor(stdout=stream), tmp_path / "runs"
@@ -497,6 +647,138 @@ def test_production_factory_can_only_construct_real_sandbox_supervisor(tmp_path)
     assert runner.supervisor.sandbox.live_execution is True
 
 
+def test_production_supervisor_preserves_every_active_scheduler_lease(tmp_path):
+    controller = _controller(tmp_path)
+    controller.propose("experiment")
+    admission = controller.admit(_request())
+    runner = build_production_pi_runner(controller, artifact_root=tmp_path / "runs")
+
+    assert admission.lease is not None
+    assert tuple(runner.supervisor.active_run_ids()) == (admission.lease.lease_id,)
+
+
+def test_real_supervisor_cleanup_attempts_every_resource_before_raising(monkeypatch):
+    supervisor = SandboxProcessSupervisor(Sandbox(live_execution=True))
+    calls = []
+
+    def remove(argv, **_kwargs):
+        calls.append(argv)
+        if argv[1:3] == ["rm", "-f"] and argv[-1] == "worker":
+            return subprocess.CompletedProcess(argv, 1, stderr="worker removal failed")
+        if argv[1:3] == ["rm", "-f"] and argv[-1] == "proxy":
+            raise OSError("daemon disconnected")
+        return subprocess.CompletedProcess(argv, 2, stderr="network removal failed")
+
+    monkeypatch.setattr("skharness.arena.runner.subprocess.run", remove)
+
+    with pytest.raises(RuntimeError, match="worker removal failed") as raised:
+        supervisor._cleanup_resources(
+            docker="docker", worker="worker", proxy="proxy", network="network"
+        )
+
+    assert calls == [
+        ["docker", "rm", "-f", "worker"],
+        ["docker", "rm", "-f", "proxy"],
+        ["docker", "network", "rm", "network"],
+    ]
+    assert "daemon disconnected" in str(raised.value)
+    assert "network removal failed" in str(raised.value)
+
+
+def test_real_supervisor_cleanup_is_idempotent_for_already_absent_resources(monkeypatch):
+    supervisor = SandboxProcessSupervisor(Sandbox(live_execution=True))
+    def absent(argv, **_kwargs):
+        resource = "network" if argv[1:3] == ["network", "rm"] else "container"
+        return subprocess.CompletedProcess(argv, 1, stderr=f"No such {resource}: {argv[-1]}")
+
+    monkeypatch.setattr("skharness.arena.runner.subprocess.run", absent)
+
+    supervisor._cleanup_resources(
+        docker="docker", worker="worker", proxy="proxy", network="network"
+    )
+
+
+def test_real_supervisor_cleanup_timeouts_are_bounded_and_all_attempted(monkeypatch):
+    supervisor = SandboxProcessSupervisor(
+        Sandbox(live_execution=True), docker_timeout_s=2.5
+    )
+    calls = []
+
+    def hangs(argv, **kwargs):
+        calls.append((argv, kwargs["timeout"]))
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    monkeypatch.setattr("skharness.arena.runner.subprocess.run", hangs)
+
+    with pytest.raises(DockerSupervisorError, match="worker: Docker removal timed out") as error:
+        supervisor._cleanup_resources(
+            docker="docker", worker="worker", proxy="proxy", network="network"
+        )
+
+    assert [item[0][-1] for item in calls] == ["worker", "proxy", "network"]
+    assert [item[1] for item in calls] == [2.5, 2.5, 2.5]
+    assert "proxy: Docker removal timed out" in str(error.value)
+    assert "network: Docker removal timed out" in str(error.value)
+
+
+def test_real_supervisor_startup_and_oom_inspection_time_out_fail_closed(monkeypatch):
+    supervisor = SandboxProcessSupervisor(
+        Sandbox(live_execution=True), docker_timeout_s=3, monotonic=lambda: 10
+    )
+    observed = []
+
+    def hangs(argv, **kwargs):
+        observed.append((argv, kwargs["timeout"]))
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    monkeypatch.setattr("skharness.arena.runner.subprocess.run", hangs)
+
+    with pytest.raises(DockerSupervisorError, match="Docker startup timed out"):
+        supervisor._run_checked(["docker", "network", "create", "net"], deadline=13)
+    with pytest.raises(DockerSupervisorError, match="OOM inspection timed out"):
+        supervisor._oom_killed("worker")
+
+    assert [timeout for _argv, timeout in observed] == [3, 3]
+
+
+def test_real_supervisor_cancel_timeout_still_signals_and_reports_within_bound(monkeypatch):
+    supervisor = SandboxProcessSupervisor(
+        Sandbox(live_execution=True), docker_timeout_s=3, shutdown_grace_s=5
+    )
+
+    class Process:
+        pid = 4242
+
+        @staticmethod
+        def poll():
+            return None
+
+        @staticmethod
+        def wait(*, timeout):
+            assert timeout == 5
+            return 143
+
+    supervisor._process = Process()
+    supervisor._container_name = "arena-pi-live"
+    signals = []
+
+    def hangs(argv, **kwargs):
+        assert kwargs["timeout"] == 3
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    monkeypatch.setattr("skharness.arena.runner.subprocess.run", hangs)
+    monkeypatch.setattr(
+        "skharness.arena.runner.os.killpg",
+        lambda pid, sig: signals.append((pid, sig)),
+    )
+
+    with pytest.raises(DockerSupervisorError, match="cancellation timed out"):
+        supervisor.cancel()
+
+    assert supervisor.cancel_bound_s == 8
+    assert signals == [(4242, signal.SIGTERM)]
+
+
 def test_real_supervisor_cancel_kills_container_and_process_group(monkeypatch):
     supervisor = SandboxProcessSupervisor(Sandbox(live_execution=True))
 
@@ -509,7 +791,7 @@ def test_real_supervisor_cancel_kills_container_and_process_group(monkeypatch):
 
         @staticmethod
         def wait(*, timeout):
-            assert timeout == 10.0
+            assert timeout == 5.0
             return 143
 
     supervisor._process = Process()
@@ -518,14 +800,23 @@ def test_real_supervisor_cancel_kills_container_and_process_group(monkeypatch):
     signals = []
     monkeypatch.setattr(
         "skharness.arena.runner.subprocess.run",
-        lambda argv, **kwargs: docker_calls.append(argv),
+        lambda argv, **kwargs: (
+            docker_calls.append((argv, kwargs))
+            or subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        ),
     )
     monkeypatch.setattr(
         "skharness.arena.runner.os.killpg",
         lambda pid, sig: signals.append((pid, sig)),
     )
     supervisor.cancel()
-    assert docker_calls == [["docker", "rm", "-f", "arena-pi-live"]]
+    assert docker_calls == [
+        (["docker", "rm", "-f", "arena-pi-live"], {
+            "capture_output": True,
+            "text": True,
+            "timeout": 3.0,
+        })
+    ]
     assert signals == [(4242, signal.SIGTERM)]
 
 
@@ -547,7 +838,10 @@ def test_real_supervisor_shutdown_is_bounded_and_escalates_to_kill(monkeypatch):
     supervisor._process = Process()
     supervisor._container_name = "arena-pi-live"
     signals = []
-    monkeypatch.setattr("skharness.arena.runner.subprocess.run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "skharness.arena.runner.subprocess.run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="", stderr=""),
+    )
     monkeypatch.setattr(
         "skharness.arena.runner.os.killpg",
         lambda pid, sig: signals.append((pid, sig)),

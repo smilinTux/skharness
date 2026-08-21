@@ -421,6 +421,52 @@ runs lacked a provider-owned served-model field, so the evidence binds the reque
 model only; canonical SKGateway request/backend/served-model joins remain owned by card
 `d3c6377a`.
 
+#### Frozen v0.3.38 S/M/L qualification
+
+`scripts/qualify-pi-swarm.py` turns the next comparison into a reproducible controller
+operation instead of another host-local one-off. It binds the canonical CardStore
+`core.json` content for one S card, one M card, and one L card to source commit
+`2e8e4d89aac1967fb297c0558b311998a9bc1e9a`, the immutable `pi-python-test` v0.3.38
+digest, `ornith-1.5-9b`, and one SKGateway route. The folded kanban view is not a content
+source because it omits acceptance criteria.
+
+The topology tests policy as well as task performance. S gets one builder. M gets a
+prerequisite scout, then one builder and one independent tester only through
+scheduler-owned receipts and one-use authorization. L gets two concurrent read-only
+scouts and no builder: its three-repository plus fresh-token transport acceptance cannot
+be satisfied from a single SKHarness mount. A fail-closed L block is therefore an
+expected valid measurement, not permission to relax the card or inspect the host.
+
+Worker Git administration stays read-only. After an in-scope worker edit, the trusted
+host controller verifies the exact changed-path allowlist, runs predefined tests and
+Ruff from the same digest with `--network none` and a read-only container root, and only
+then creates a detached provisional commit. It does not merge, push, mutate a card, or
+attest completion. Every run uses a new evidence root and retains exact contracts,
+budgets, phase lineage, A2A records, scheduler state, bounded attempt evidence, final
+worktree state, and an explicit review-required or failed disposition.
+
+The current trusted controller is independently pinned to a reviewed commit containing
+the driver, its critical imported modules, and the v0.3.38 release-evidence record. It is
+not interchangeable with the older frozen worker-base commit. Before and after every
+card, the controller inventories all lifecycle-labeled Docker resources and admits the
+next card only after proving zero remain. Its image-based pytest and Ruff checks are
+themselves named, lifecycle-labeled, networkless, resource- and time-bounded workers
+with cancellation-aware exact-name cleanup. A builder's Pi sub-budget excludes a frozen
+180-second controller reserve inside the same hard lease: 90 seconds pytest, 10 cleanup,
+30 Ruff, 10 cleanup, six 5-second Git commands with hooks and signing disabled, and 10
+seconds overhead. Its phase budget equals the remaining Pi time. Stop acknowledgement,
+candidate evidence sealing, and next-card admission all require synchronous runtime
+quiescence; a failed or unprovable cleanup is terminal for the sequence.
+
+Telemetry is fail-closed too. Provider/controller artifacts can establish a measured
+value only when their events are complete and mutually consistent. Missing or conflicting
+model, token, tool, duration, or cost evidence stays typed as unknown with a reason;
+the budget ledger conservatively charges the corresponding reservation but comparisons
+must never treat that charge as observed usage. The v0.3.38 driver evaluates swarm
+execution and phase authorization only. Without a matched single-agent baseline,
+independent quality result, complete TTFE, and policy-denial attribution, it cannot
+complete comparison card `322f2d80`.
+
 Implementation truth (repository audit, 2026-08-20): the Dockerfile now pins a Wolfi
 base digest, exact direct APKs, the Pi/npm graph, and hashed Python wheels. Core omits
 package/build managers; polyglot supplies verified Node/npm, Python/uv, Go, Rust/Cargo,

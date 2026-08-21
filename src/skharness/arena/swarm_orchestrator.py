@@ -94,7 +94,7 @@ class WorkerExecution:
 
 
 WorkerExecutor = Callable[[SubagentContract], WorkerExecution]
-WorkerStopper = Callable[[str], None]
+WorkerStopper = Callable[[str], bool]
 AttestationProvider = Callable[
     [tuple[SubagentResult, ...], tuple[PhaseReceipt, ...]],
     VerifierAttestation | None,
@@ -287,7 +287,7 @@ class TrustedSwarmOrchestrator:
         if failures or not decision.authorized:
             reason = "phase_execution_failed" if failures else "completion_gate_denied"
             cancelled.update(self.scheduler.cancel_team(reason=reason))
-            self._stop_pending(stop)
+            failures.extend(self._stop_pending(stop))
         return SwarmRunReport(
             results=ordered,
             completion=decision,
@@ -368,8 +368,15 @@ class TrustedSwarmOrchestrator:
                                 else lease_id
                             )
                         )
-                        stop(lease_id)
-                        self.scheduler.acknowledge_stopped(lease_id)
+                        if not self._stop_and_acknowledge(lease_id, stop):
+                            failures.append(
+                                "worker_stop_not_quiescent:"
+                                + (
+                                    expired_contract.contract_id
+                                    if expired_contract is not None
+                                    else lease_id
+                                )
+                            )
                     expired_futures = {
                         future: futures[future]
                         for future in pending
@@ -441,11 +448,6 @@ class TrustedSwarmOrchestrator:
         for future in hung:
             contract = futures[future]
             failures.append(f"worker_shutdown_grace_exceeded:{contract.contract_id}")
-            future.add_done_callback(
-                lambda item, bound_contract=contract: self._observe_late_future(
-                    bound_contract, item
-                )
-            )
 
     def _observe_late_future(
         self,
@@ -517,10 +519,22 @@ class TrustedSwarmOrchestrator:
             finished_at=worker_result.finished_at,
         )
 
-    def _stop_pending(self, stop: WorkerStopper) -> None:
+    def _stop_pending(self, stop: WorkerStopper) -> tuple[str, ...]:
+        failures: list[str] = []
         for lease_id in self.scheduler.stop_requests():
-            stop(lease_id)
-            self.scheduler.acknowledge_stopped(lease_id)
+            if not self._stop_and_acknowledge(lease_id, stop):
+                failures.append(f"worker_stop_not_quiescent:{lease_id}")
+        return tuple(failures)
+
+    def _stop_and_acknowledge(self, lease_id: str, stop: WorkerStopper) -> bool:
+        """Acknowledge controller stop only after the runtime proves quiescence."""
+        try:
+            quiescent = stop(lease_id)
+        except Exception:  # noqa: BLE001 - scheduler retains the durable stop request
+            return False
+        if quiescent is not True:
+            return False
+        return self.scheduler.acknowledge_stopped(lease_id)
 
     @staticmethod
     def _assignment_event(

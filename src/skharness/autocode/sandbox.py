@@ -19,8 +19,14 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from .claude_code import HarnessUnavailable
+from .sandbox_lifecycle import (
+    ReconciliationStatus,
+    SandboxOwnership,
+    reconcile_sandbox_orphans,
+)
 
 PROXY_PORT = 8080
 
@@ -68,14 +74,93 @@ class LaunchSpec:
     # these with validated repository-relative paths from SubagentContract.
     scoped_readable_paths: list[str] = field(default_factory=list)
     scoped_writable_paths: list[str] = field(default_factory=list)
+    # Arena binds this to its active lease. Direct callers may omit it and receive
+    # a fresh non-secret identity generated at admission.
+    sandbox_run_id: str | None = None
 
 
 class Sandbox:
     def __init__(self, live_execution: bool = False, docker: str = "docker",
-                 run_timeout: int = 1800) -> None:
+                 run_timeout: int = 1800, *, orphan_grace_s: float = 900,
+                 reconcile_interval_s: float = 300,
+                 docker_command_timeout_s: float = 3,
+                 reconcile_timeout_s: float = 3,
+                 clock: Callable[[], float] = time.time,
+                 monotonic: Callable[[], float] = time.monotonic) -> None:
+        if orphan_grace_s < 0:
+            raise ValueError("orphan_grace_s must be non-negative")
+        if reconcile_interval_s <= 0:
+            raise ValueError("reconcile_interval_s must be positive")
+        if docker_command_timeout_s <= 0:
+            raise ValueError("docker_command_timeout_s must be positive")
+        if reconcile_timeout_s <= 0:
+            raise ValueError("reconcile_timeout_s must be positive")
         self.live_execution = live_execution
         self.docker = docker
         self.run_timeout = run_timeout
+        self.orphan_grace_s = float(orphan_grace_s)
+        self.reconcile_interval_s = float(reconcile_interval_s)
+        self.docker_command_timeout_s = float(docker_command_timeout_s)
+        self.reconcile_timeout_s = float(reconcile_timeout_s)
+        self._clock = clock
+        self._monotonic = monotonic
+        self._last_reconciliation_monotonic: float | None = None
+        self._reconciliation_status = ReconciliationStatus.never()
+
+    def reconciliation_status(self) -> dict[str, object]:
+        """Return the bounded outcome of the most recent orphan pass."""
+        return self._reconciliation_status.as_dict()
+
+    def reconcile_orphans(
+        self, *, active_run_ids=(), active_lease_ids_authoritative: bool = False
+    ) -> dict[str, object]:
+        """Run a callable, fail-closed reconciliation against labeled resources."""
+        deadline = self._monotonic() + self.reconcile_timeout_s
+
+        def bounded_run(argv, **kwargs):
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(argv, self.reconcile_timeout_s)
+            kwargs["timeout"] = min(self.docker_command_timeout_s, remaining)
+            return subprocess.run(argv, **kwargs)
+
+        self._reconciliation_status = reconcile_sandbox_orphans(
+            docker=self.docker,
+            run=bounded_run,
+            now=self._clock(),
+            orphan_grace_s=self.orphan_grace_s,
+            active_run_ids=active_run_ids,
+            active_lease_ids_authoritative=active_lease_ids_authoritative,
+        )
+        return self.reconciliation_status()
+
+    def maybe_reconcile_orphans(
+        self, *, active_run_ids=(), active_lease_ids_authoritative: bool = False
+    ) -> dict[str, object]:
+        """Reconcile on first admission and periodically thereafter."""
+        now = self._monotonic()
+        last = self._last_reconciliation_monotonic
+        if last is None or now - last >= self.reconcile_interval_s:
+            status = self.reconcile_orphans(
+                active_run_ids=active_run_ids,
+                active_lease_ids_authoritative=active_lease_ids_authoritative,
+            )
+            self._last_reconciliation_monotonic = now
+            return status
+        return self.reconciliation_status()
+
+    def _network_create_argv(
+        self, name: str, ownership: SandboxOwnership
+    ) -> list[str]:
+        """Build a labeled internal-network creation command."""
+        return [
+            self.docker,
+            "network",
+            "create",
+            "--internal",
+            *ownership.docker_args("network"),
+            name,
+        ]
 
     @staticmethod
     def _linked_worktree_git_mount(worktree: str) -> AuthMount | None:
@@ -137,13 +222,16 @@ class Sandbox:
 
     def _docker_run_argv(self, spec: LaunchSpec, network: str, proxy_alias: str,
                          container_name: str | None = None,
-                         extra_mounts: list[AuthMount] | None = None) -> list[str]:
+                         extra_mounts: list[AuthMount] | None = None,
+                         ownership: SandboxOwnership | None = None) -> list[str]:
         wt = os.path.realpath(spec.worktree)
         all_mounts = list(spec.auth_mounts) + list(extra_mounts or [])
         git_mount = self._linked_worktree_git_mount(wt)
         argv = [self.docker, "run"]
         if container_name:
             argv += ["--name", container_name]
+        if ownership is not None:
+            argv += ownership.docker_args("worker")
         if spec.stdin is not None:
             argv += ["-i"]                      # keep stdin open so the harness can read it
         argv += [
@@ -230,11 +318,16 @@ class Sandbox:
         return mounts
 
     def _proxy_run_argv(
-        self, *, name: str, network: str, alias: str, allow: list[str]
+        self, *, name: str, network: str, alias: str, allow: list[str],
+        ownership: SandboxOwnership | None = None,
     ) -> list[str]:
         """Build the equally confined egress-proxy sidecar command."""
-        return [
+        argv = [
             self.docker, "run", "-d", "--name", name,
+        ]
+        if ownership is not None:
+            argv += ownership.docker_args("proxy")
+        argv += [
             "--network", network, "--network-alias", alias,
             "--user", "65534:65534", "--read-only", "--tmpfs", "/tmp:mode=1777",
             "--security-opt", "no-new-privileges", "--cap-drop", "ALL",
@@ -243,25 +336,55 @@ class Sandbox:
             "sandbox-proxy:1", "python", "-m", "skharness.autocode.sandbox_proxy",
             str(PROXY_PORT), *allow,
         ]
+        return argv
 
-    def _ensure_capable(self, spec: LaunchSpec) -> None:
+    def _ensure_capable(
+        self,
+        spec: LaunchSpec,
+        *,
+        deadline: float | None = None,
+        cancelled: Callable[[], bool] | None = None,
+        ownership: SandboxOwnership | None = None,
+        container_name: str | None = None,
+    ) -> None:
         # Resolve linked-worktree metadata before image/network/container setup.
         # This both validates the relationship and guarantees a dangling .git
         # pointer cannot be admitted into a live run.
         self._linked_worktree_git_mount(spec.worktree)
         if not shutil.which(self.docker):
             raise HarnessUnavailable("docker not found on this node (fail closed)")
-        r = subprocess.run([self.docker, "image", "inspect", spec.image],
-                           capture_output=True, text=True)
+        def run_bounded(argv):
+            if cancelled is not None and cancelled():
+                raise HarnessUnavailable("sandbox Docker preflight cancelled (fail closed)")
+            kwargs = {"capture_output": True, "text": True}
+            if deadline is not None:
+                remaining = deadline - self._monotonic()
+                if remaining <= 0:
+                    raise HarnessUnavailable("sandbox Docker preflight timed out (fail closed)")
+                kwargs["timeout"] = min(self.docker_command_timeout_s, remaining)
+            try:
+                result = subprocess.run(argv, **kwargs)
+            except subprocess.TimeoutExpired as exc:
+                raise HarnessUnavailable(
+                    "sandbox Docker preflight timed out (fail closed)"
+                ) from exc
+            if cancelled is not None and cancelled():
+                raise HarnessUnavailable("sandbox Docker preflight cancelled (fail closed)")
+            return result
+
+        r = run_bounded([self.docker, "image", "inspect", spec.image])
         if r.returncode != 0:
             raise HarnessUnavailable(
                 f"sandbox image {spec.image!r} not present; build it before live run (fail closed)")
         for command in spec.required_commands:
-            probe = subprocess.run(
-                [self.docker, "run", "--rm", "--network", "none", "--read-only",
+            run_argv = [self.docker, "run", "--rm"]
+            if container_name is not None:
+                run_argv.extend(("--name", container_name))
+            if ownership is not None:
+                run_argv.extend(ownership.docker_args("worker"))
+            probe = run_bounded(
+                [*run_argv, "--network", "none", "--read-only",
                  "--entrypoint", "sh", spec.image, "-c", f"command -v {command}"],
-                capture_output=True,
-                text=True,
             )
             if probe.returncode != 0:
                 raise HarnessUnavailable(
@@ -271,11 +394,14 @@ class Sandbox:
         for check in spec.required_checks:
             if not check or not all(isinstance(part, str) and part for part in check):
                 raise HarnessUnavailable("sandbox image required check has invalid argv")
-            probe = subprocess.run(
-                [self.docker, "run", "--rm", "--network", "none", "--read-only",
+            run_argv = [self.docker, "run", "--rm"]
+            if container_name is not None:
+                run_argv.extend(("--name", container_name))
+            if ownership is not None:
+                run_argv.extend(ownership.docker_args("worker"))
+            probe = run_bounded(
+                [*run_argv, "--network", "none", "--read-only",
                  "--entrypoint", check[0], spec.image, *check[1:]],
-                capture_output=True,
-                text=True,
             )
             if probe.returncode != 0:
                 detail = (probe.stderr or probe.stdout or "no diagnostic output").strip()
@@ -310,9 +436,15 @@ class Sandbox:
             raise HarnessUnavailable(
                 "live harness execution is disabled (posture C / config): set "
                 "harness.live_execution=true only after the confinement proof passes.")
+        self.maybe_reconcile_orphans()
         self._ensure_capable(spec)
         allow = [h for h in ([repo_remote_host, ci_host] + list(spec.egress_hosts)) if h]
         token = secrets.token_hex(4)
+        ownership = (
+            SandboxOwnership(spec.sandbox_run_id)
+            if spec.sandbox_run_id is not None
+            else SandboxOwnership.create()
+        )
         net = f"sbxnet-{token}"
         proxy_alias = "sbxproxy"
         proxy_name = f"sbxproxy-{token}"
@@ -327,13 +459,14 @@ class Sandbox:
                     with open(host_path, "w") as fh:
                         fh.write(content)
                     cfg_mounts.append(AuthMount(src=host_path, dst=dst, ro=True))
-            subprocess.run([self.docker, "network", "create", "--internal", net],
+            subprocess.run(self._network_create_argv(net, ownership),
                            capture_output=True, text=True, check=True)
             # proxy sidecar: dual-homed (internal net + default bridge) so it is the
             # ONLY route out; started with the pinned allowlist; reached by alias.
             subprocess.run(
                 self._proxy_run_argv(
-                    name=proxy_name, network=net, alias=proxy_alias, allow=allow
+                    name=proxy_name, network=net, alias=proxy_alias, allow=allow,
+                    ownership=ownership,
                 ),
                 capture_output=True, text=True, check=True)
             subprocess.run([self.docker, "network", "connect", "bridge", proxy_name],
@@ -346,7 +479,7 @@ class Sandbox:
             try:
                 proc = subprocess.run(
                     self._docker_run_argv(spec, net, proxy_alias, container_name=harness_name,
-                                          extra_mounts=cfg_mounts),
+                                          extra_mounts=cfg_mounts, ownership=ownership),
                     **run_kwargs)
             except subprocess.TimeoutExpired as e:
                 # Preserve whatever the harness streamed before the kill. An agentic

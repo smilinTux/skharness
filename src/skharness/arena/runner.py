@@ -23,9 +23,16 @@ import time
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Callable, Iterable, Protocol
 
+from skharness.autocode.pi_events import (
+    PiEventScan,
+    assistant_message_events,
+    scan_pi_events,
+    served_model_evidence,
+)
 from skharness.autocode.sandbox import AuthMount, InspectionScope, LaunchSpec, Sandbox
+from skharness.autocode.sandbox_lifecycle import SandboxOwnership
 
 from .controller import ArenaController
 from .models import ExperimentState, canonical_digest
@@ -64,6 +71,10 @@ class AttemptSupervisor(Protocol):
     def cancel(self) -> None: ...
 
 
+class DockerSupervisorError(RuntimeError):
+    """A bounded Docker control-plane operation failed closed."""
+
+
 class SandboxProcessSupervisor:
     """Cancellable real Docker supervisor; never a FakeSpawner adaptation."""
 
@@ -73,7 +84,12 @@ class SandboxProcessSupervisor:
         *,
         repo_remote_host: str | None = None,
         ci_host: str | None = None,
-        shutdown_grace_s: float = 10.0,
+        shutdown_grace_s: float = 5.0,
+        docker_timeout_s: float = 3.0,
+        preflight_timeout_s: float = 30.0,
+        startup_timeout_s: float = 9.0,
+        active_run_ids: Callable[[], Iterable[str]] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if not sandbox.live_execution:
             raise ValueError("production arena supervisor requires Sandbox(live_execution=True)")
@@ -82,18 +98,110 @@ class SandboxProcessSupervisor:
         self.ci_host = ci_host
         if shutdown_grace_s <= 0:
             raise ValueError("shutdown_grace_s must be positive")
+        if docker_timeout_s <= 0:
+            raise ValueError("docker_timeout_s must be positive")
+        if preflight_timeout_s <= 0:
+            raise ValueError("preflight_timeout_s must be positive")
+        if startup_timeout_s <= 0:
+            raise ValueError("startup_timeout_s must be positive")
         self.shutdown_grace_s = shutdown_grace_s
+        self.docker_timeout_s = docker_timeout_s
+        self.preflight_timeout_s = preflight_timeout_s
+        self.startup_timeout_s = startup_timeout_s
+        self.active_run_ids = active_run_ids or (lambda: ())
+        self.monotonic = monotonic
         self._lock = threading.RLock()
         self._process: subprocess.Popen | None = None
         self._container_name: str | None = None
+        self._cancel_requested = threading.Event()
 
-    @staticmethod
-    def _run_checked(argv: list[str]) -> None:
-        subprocess.run(argv, capture_output=True, text=True, check=True)
+    @property
+    def cancel_bound_s(self) -> float:
+        """Maximum blocking wait inside :meth:`cancel`, excluding scheduler drain."""
+        return self.docker_timeout_s + self.shutdown_grace_s
+
+    def _raise_if_cancelled(self) -> None:
+        if self._cancel_requested.is_set():
+            raise DockerSupervisorError("sandbox launch cancelled by controller")
+
+    def _run_checked(self, argv: list[str], *, deadline: float) -> None:
+        remaining = deadline - self.monotonic()
+        if remaining <= 0:
+            raise DockerSupervisorError("Docker startup deadline expired (fail closed)")
+        try:
+            subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=min(self.docker_timeout_s, remaining),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise DockerSupervisorError(
+                f"Docker startup timed out after at most {self.docker_timeout_s:g}s"
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or "Docker command failed").strip()
+            raise DockerSupervisorError(f"Docker startup failed: {detail[:240]}") from exc
+        self._raise_if_cancelled()
+
+    def _cleanup_resources(
+        self, *, docker: str, worker: str, proxy: str, network: str
+    ) -> None:
+        """Attempt every exact resource removal before reporting bounded errors."""
+        errors: list[str] = []
+        commands = (
+            ("worker", [docker, "rm", "-f", worker]),
+            ("proxy", [docker, "rm", "-f", proxy]),
+            ("network", [docker, "network", "rm", network]),
+        )
+        for role, argv in commands:
+            try:
+                result = subprocess.run(
+                    argv,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.docker_timeout_s,
+                )
+            except subprocess.TimeoutExpired:
+                errors.append(
+                    f"{role}: Docker removal timed out after {self.docker_timeout_s:g}s"
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001 - attempt all cleanup paths first
+                errors.append(f"{role}: {type(exc).__name__}: {exc}"[:240])
+                continue
+            if result.returncode == 0:
+                continue
+            detail = (result.stderr or result.stdout or "docker removal failed").strip()
+            normalized = detail.casefold()
+            absent_marker = "no such network" if role == "network" else "no such container"
+            if absent_marker in normalized:
+                continue
+            errors.append(f"{role}: exit {result.returncode}: {detail}"[:240])
+        if errors:
+            raise DockerSupervisorError(
+                "sandbox cleanup failed after all attempts:\n- " + "\n- ".join(errors)
+            )
 
     def run(self, spec: LaunchSpec, attempt_dir: Path, timeout_s: float) -> tuple[int, str]:
-        self.sandbox._ensure_capable(spec)
+        self._raise_if_cancelled()
+        reconciliation = self.sandbox.maybe_reconcile_orphans(
+            active_run_ids=self.active_run_ids(),
+            active_lease_ids_authoritative=True,
+        )
+        if reconciliation.get("outcome") != "ok":
+            raise DockerSupervisorError(
+                "sandbox orphan reconciliation did not prove a clean admission: "
+                f"{reconciliation.get('outcome', 'unknown')}"
+            )
+        self._raise_if_cancelled()
         token = secrets.token_hex(6)
+        ownership = (
+            SandboxOwnership(spec.sandbox_run_id, authority="lease")
+            if spec.sandbox_run_id is not None
+            else SandboxOwnership.create()
+        )
         network = f"arena-net-{token}"
         proxy_alias = "sbxproxy"
         proxy_name = f"arena-proxy-{token}"
@@ -104,26 +212,51 @@ class SandboxProcessSupervisor:
         config_dir: str | None = None
         config_mounts: list[AuthMount] = []
         attempt_dir.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            self._container_name = container_name
         try:
+            preflight_deadline = self.monotonic() + self.preflight_timeout_s
+            self.sandbox._ensure_capable(
+                spec,
+                deadline=preflight_deadline,
+                cancelled=self._cancel_requested.is_set,
+                ownership=ownership,
+                container_name=container_name,
+            )
+            self._raise_if_cancelled()
+            startup_deadline = self.monotonic() + self.startup_timeout_s
             if spec.config_files:
                 config_dir = tempfile.mkdtemp(prefix="arena-pi-config-")
                 for index, (destination, content) in enumerate(spec.config_files.items()):
                     source = Path(config_dir) / f"config-{index}"
                     source.write_text(content, encoding="utf-8")
                     config_mounts.append(AuthMount(str(source), destination, ro=True))
-            self._run_checked([self.sandbox.docker, "network", "create", "--internal", network])
+            self._run_checked(
+                self.sandbox._network_create_argv(network, ownership),
+                deadline=startup_deadline,
+            )
             self._run_checked(
                 self.sandbox._proxy_run_argv(
-                    name=proxy_name, network=network, alias=proxy_alias, allow=allow
-                )
+                    name=proxy_name,
+                    network=network,
+                    alias=proxy_alias,
+                    allow=allow,
+                    ownership=ownership,
+                ),
+                deadline=startup_deadline,
             )
-            self._run_checked([self.sandbox.docker, "network", "connect", "bridge", proxy_name])
+            self._run_checked(
+                [self.sandbox.docker, "network", "connect", "bridge", proxy_name],
+                deadline=startup_deadline,
+            )
+            self._raise_if_cancelled()
             argv = self.sandbox._docker_run_argv(
                 spec,
                 network,
                 proxy_alias,
                 container_name=container_name,
                 extra_mounts=config_mounts,
+                ownership=ownership,
             )
             # Sandbox.spawn normally uses --rm because it needs no post-exit
             # classification. The arena must inspect State.OOMKilled after exit,
@@ -164,8 +297,13 @@ class SandboxProcessSupervisor:
                     exit_code = process.wait(timeout=timeout_s)
                 except subprocess.TimeoutExpired:
                     classification = "timeout"
-                    self.cancel()
-                    exit_code = process.wait(timeout=10)
+                    try:
+                        self.cancel()
+                    except DockerSupervisorError as exc:
+                        raise DockerSupervisorError(
+                            f"worker timeout cancellation failed: {exc}"
+                        ) from exc
+                    exit_code = process.wait(timeout=self.shutdown_grace_s)
                 if monitor is not None:
                     monitor.join(timeout=1)
                 if inspection_denial.is_set():
@@ -173,24 +311,25 @@ class SandboxProcessSupervisor:
                     (attempt_dir / "inspection-denial.json").write_text(
                         json.dumps(inspection_detail, sort_keys=True) + "\n", encoding="utf-8"
                     )
-            if classification != "timeout" and self._oom_killed(container_name):
+            if classification not in {"timeout", "inspection_denied"}:
+                self._raise_if_cancelled()
+            if classification == "exit" and self._oom_killed(container_name):
                 classification = "oom"
             return exit_code, classification
         finally:
             with self._lock:
                 self._process = None
                 self._container_name = None
-            subprocess.run(
-                [self.sandbox.docker, "rm", "-f", container_name], capture_output=True, text=True
-            )
-            subprocess.run(
-                [self.sandbox.docker, "rm", "-f", proxy_name], capture_output=True, text=True
-            )
-            subprocess.run(
-                [self.sandbox.docker, "network", "rm", network], capture_output=True, text=True
-            )
-            if config_dir:
-                shutil.rmtree(config_dir, ignore_errors=True)
+            try:
+                self._cleanup_resources(
+                    docker=self.sandbox.docker,
+                    worker=container_name,
+                    proxy=proxy_name,
+                    network=network,
+                )
+            finally:
+                if config_dir:
+                    shutil.rmtree(config_dir, ignore_errors=True)
 
     def _monitor_inspection(
         self,
@@ -227,39 +366,90 @@ class SandboxProcessSupervisor:
                     }
                 )
                 denied.set()
-                self.cancel()
+                try:
+                    self.cancel()
+                except DockerSupervisorError as exc:
+                    detail["cancellation_error"] = str(exc)[:240]
                 return
             time.sleep(0.02)
 
 
     def _oom_killed(self, container_name: str) -> bool:
-        result = subprocess.run(
-            [self.sandbox.docker, "inspect", "--format", "{{.State.OOMKilled}}", container_name],
-            capture_output=True,
-            text=True,
-        )
-        return result.returncode == 0 and result.stdout.strip().lower() == "true"
+        argv = [
+            self.sandbox.docker,
+            "inspect",
+            "--format",
+            "{{.State.OOMKilled}}",
+            container_name,
+        ]
+        try:
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=self.docker_timeout_s,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise DockerSupervisorError(
+                f"Docker OOM inspection timed out after {self.docker_timeout_s:g}s"
+            ) from exc
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "Docker inspect failed").strip()
+            raise DockerSupervisorError(f"Docker OOM inspection failed: {detail[:240]}")
+        observed = result.stdout.strip().lower()
+        if observed not in {"true", "false"}:
+            raise DockerSupervisorError("Docker OOM inspection returned an invalid state")
+        return observed == "true"
 
     def cancel(self) -> None:
+        """Stop the worker within ``docker_timeout_s + shutdown_grace_s`` seconds."""
+        self._cancel_requested.set()
         with self._lock:
             process = self._process
             container = self._container_name
+        errors: list[str] = []
         if container:
-            subprocess.run(
-                [self.sandbox.docker, "rm", "-f", container], capture_output=True, text=True
-            )
+            try:
+                result = subprocess.run(
+                    [self.sandbox.docker, "rm", "-f", container],
+                    capture_output=True,
+                    text=True,
+                    timeout=self.docker_timeout_s,
+                )
+                if result.returncode != 0:
+                    detail = (result.stderr or result.stdout or "Docker removal failed").strip()
+                    if "no such container" not in detail.casefold():
+                        errors.append(f"worker: exit {result.returncode}: {detail}"[:240])
+            except subprocess.TimeoutExpired:
+                errors.append(
+                    f"worker: Docker cancellation timed out after {self.docker_timeout_s:g}s"
+                )
+            except Exception as exc:  # noqa: BLE001 - process signalling must still run
+                errors.append(f"worker: {type(exc).__name__}: {exc}"[:240])
         if process is not None and process.poll() is None:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
-                return
-            try:
-                process.wait(timeout=self.shutdown_grace_s)
-            except subprocess.TimeoutExpired:
+                pass
+            except Exception as exc:  # noqa: BLE001 - report after bounded fallback
+                errors.append(f"worker signal: {type(exc).__name__}: {exc}"[:240])
+            else:
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                    process.wait(timeout=self.shutdown_grace_s)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    except Exception as exc:  # noqa: BLE001 - bounded reporting
+                        errors.append(f"worker kill: {type(exc).__name__}: {exc}"[:240])
+                except Exception as exc:  # noqa: BLE001 - bounded reporting
+                    errors.append(f"worker wait: {type(exc).__name__}: {exc}"[:240])
+        if errors:
+            raise DockerSupervisorError(
+                "sandbox cancellation failed after bounded attempts:\n- "
+                + "\n- ".join(errors)
+            )
 
 
 def inspect_pi_tool_event(raw: bytes, scope: InspectionScope) -> tuple[str | None, int]:
@@ -422,6 +612,7 @@ class PiExperimentRunner:
                 spec,
                 cpu_limit=resources.cpu if resources.cpu > 0 else None,
                 memory_gb_limit=resources.ram_gb if resources.ram_gb > 0 else None,
+                sandbox_run_id=admission.lease.lease_id,
             )
             directory = self._attempt_dir(request.experiment_id, attempt)
             directory.mkdir(parents=True, exist_ok=True)
@@ -454,6 +645,10 @@ class PiExperimentRunner:
         started_at = time.monotonic()
         try:
             exit_code, classification = self.supervisor.run(spec, directory, timeout_s)
+        except DockerSupervisorError as exc:
+            classification, exit_code = "docker_supervisor_error", None
+            with (directory / "stderr.log").open("ab") as stream:
+                stream.write(f"\n{type(exc).__name__}: {exc}\n".encode())
         except Exception as exc:
             classification, exit_code = "supervisor_error", None
             with (directory / "stderr.log").open("ab") as stream:
@@ -465,16 +660,21 @@ class PiExperimentRunner:
             classification = "lease_lost"
         duration_s = max(0.0, time.monotonic() - started_at)
         stdout_path = directory / "stdout.log"
+        event_scan = self._event_scan(stdout_path)
         stdout_digest = self._capture(stdout_path, compact_events=True)
         stderr_digest = self._capture(directory / "stderr.log")
         terminal_error = self._pi_terminal_error(stdout_path)
         negative_disposition = self._pi_negative_disposition(stdout_path)
         scout_assessment, scout_findings = self._pi_scout_terminal(stdout_path)
         inspection_denial = self._inspection_denial(directory / "inspection-denial.json")
-        served_model = self._served_model(stdout_path)
+        served_model, served_model_reason = served_model_evidence(event_scan)
         time_to_first_edit_s = self._time_to_first_edit(stdout_path)
         event_usage = self._usage_metrics(stdout_path)
         requested_model = requested_model or self._requested_model(spec)
+        terminal_event_observed = bool(assistant_message_events(event_scan)) or any(
+            event.get("type") in {"agent_end", "agent_settled"}
+            for event in event_scan.events
+        )
         timeout_phase = None
         if classification == "timeout":
             timeout_phase = "inspect" if time_to_first_edit_s is None else "test"
@@ -484,6 +684,11 @@ class PiExperimentRunner:
             "timeout_phase": timeout_phase,
             "requested_model": requested_model,
             "served_model": served_model,
+            "served_model_reason": (
+                served_model_reason.value if served_model_reason is not None else None
+            ),
+            "pi_event_stream_complete": not event_scan.incomplete,
+            "pi_terminal_event_observed": terminal_event_observed,
             "card_size": card_size.value,
             "phase_budget_s": {
                 "assess": budget.assess_s,
@@ -493,7 +698,16 @@ class PiExperimentRunner:
             },
             **event_usage,
         }
-        if exit_code == 0 and classification == "exit" and terminal_error is not None:
+        if exit_code == 0 and classification == "exit" and event_scan.incomplete:
+            # Best-effort reply parsing must never make a malformed, truncated,
+            # unknown, or plain-text Pi stream trustworthy. In particular, an
+            # earlier actionable scout message cannot authorize a downstream phase.
+            classification = "pi_event_stream_incomplete"
+        elif exit_code == 0 and classification == "exit" and not event_scan.events:
+            classification = "pi_event_stream_missing"
+        elif exit_code == 0 and classification == "exit" and not terminal_event_observed:
+            classification = "pi_terminal_event_missing"
+        elif exit_code == 0 and classification == "exit" and terminal_error is not None:
             # Pi can report a provider/parser failure in its structured event
             # stream and still exit zero. A zero shell status alone is not success.
             classification = "pi_terminal_error"
@@ -560,28 +774,20 @@ class PiExperimentRunner:
         )
 
     @staticmethod
-    def _events(path: Path):
+    def _event_scan(path: Path) -> PiEventScan:
         if not path.exists():
-            return
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            try:
-                event = json.loads(line)
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if isinstance(event, dict):
-                yield event
+            return PiEventScan((), False)
+        return scan_pi_events(path.read_bytes())
+
+    @classmethod
+    def _events(cls, path: Path):
+        yield from cls._event_scan(path).events
 
     @classmethod
     def _served_model(cls, path: Path) -> str | None:
-        served = None
-        for event in cls._events(path):
-            candidate = event.get("responseModel")
-            message = event.get("message")
-            if isinstance(message, dict):
-                candidate = message.get("responseModel", candidate)
-            if isinstance(candidate, str) and candidate.strip():
-                served = candidate.strip()
-        return served
+        """Compatibility view returning only complete, agreeing model evidence."""
+
+        return served_model_evidence(cls._event_scan(path))[0]
 
     @staticmethod
     def _requested_model(spec: LaunchSpec) -> str | None:
@@ -822,4 +1028,12 @@ def build_production_pi_runner(
 ) -> PiExperimentRunner:
     """Production composition is always real Sandbox+Docker, never FakeSpawner."""
     sandbox = Sandbox(live_execution=True, docker=docker)
-    return PiExperimentRunner(controller, SandboxProcessSupervisor(sandbox), artifact_root)
+
+    def active_run_ids() -> Iterable[str]:
+        return (
+            str(record["lease_id"])
+            for record in controller.scheduler.lease_records()
+        )
+
+    supervisor = SandboxProcessSupervisor(sandbox, active_run_ids=active_run_ids)
+    return PiExperimentRunner(controller, supervisor, artifact_root)

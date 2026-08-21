@@ -1,0 +1,12 @@
+{
+  "image": "ghcr.io/smilintux/skharness-pi-python-test@sha256:8e991c893e7553522369a35d10b78ae2e831eb62b9f127ba53a7dabd045e2c7d",
+  "package_version": "0.3.38",
+  "publish_job": "https://github.com/smilinTux/skharness/actions/runs/32532127259/job/96926059810",
+  "publish_run": "https://github.com/smilinTux/skharness/actions/runs/32532127259",
+  "schema": "skharness.pi-image-release.v1",
+  "signature_identity": "https://github.com/smilinTux/skharness/.github/workflows/pi-image.yml@refs/tags/v0.3.38",
+  "signature_issuer": "https://token.actions.githubusercontent.com",
+  "source_commit": "2e8e4d89aac1967fb297c0558b311998a9bc1e9a",
+  "tag": "v0.3.38",
+  "vulnerability_job": "https://github.com/smilinTux/skharness/actions/runs/32532127259/job/96926773625"
+}

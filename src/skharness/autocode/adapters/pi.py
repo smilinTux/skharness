@@ -26,6 +26,13 @@ import re
 
 from .base import BaseCliAdapter, extract_json, parse_event_stream
 from ...arena.pi_bridge import PI_PROFILES, BridgeDeniedError
+from ..pi_events import (
+    assistant_message_events,
+    event_response_models,
+    scan_pi_events,
+    served_model_evidence,
+    valid_pi_event_envelope,
+)
 from ..types import HarnessProvenanceReason
 
 # Attribution header values must be plain, inert tokens. pi treats a LEADING `!`
@@ -37,50 +44,6 @@ from ..types import HarnessProvenanceReason
 # an assertion, not a filter -- a value that fails is a bug upstream, and dropping
 # it silently would leave the run unattributable with nothing to show for it.
 _ATTRIBUTION_TOKEN = re.compile(r"\A[A-Za-z0-9._:@/=+-]{1,200}\Z")
-
-# Exact stdout event vocabulary from pi-coding-agent 0.84.2's
-# JsonAgentSessionEvent (core/agent-session.d.ts + pi-agent-core/types.d.ts).
-# An upgrade that emits a new event must update this pin deliberately; silently
-# accepting a future envelope would make provenance semantics version-dependent.
-_PI_0842_EVENT_TYPES = frozenset(
-    {
-        "agent_start",
-        "agent_end",
-        "agent_settled",
-        "turn_start",
-        "turn_end",
-        "message_start",
-        "message_update",
-        "message_end",
-        "tool_execution_start",
-        "tool_execution_update",
-        "tool_execution_end",
-        "queue_update",
-        "compaction_start",
-        "compaction_end",
-        "entry_appended",
-        "session_info_changed",
-        "thinking_level_changed",
-        "auto_retry_start",
-        "auto_retry_end",
-        "summarization_retry_scheduled",
-        "summarization_retry_attempt_start",
-        "summarization_retry_finished",
-        "bash_execution_update",
-    }
-)
-_PI_0842_MESSAGE_ROLES = frozenset(
-    {
-        "user",
-        "assistant",
-        "toolResult",
-        "bashExecution",
-        "custom",
-        "branchSummary",
-        "compactionSummary",
-    }
-)
-
 
 def _attribution_value(name: str, value):
     """Validate one attribution header value. None -> None (header is omitted)."""
@@ -109,52 +72,16 @@ def _model_id(value: str | None) -> str | None:
 
 
 def _valid_pi_event_envelope(event) -> bool:
-    """Minimum trusted envelope contract for pinned Pi 0.84.2 JSON events."""
-    if not isinstance(event, dict) or event.get("type") not in _PI_0842_EVENT_TYPES:
-        return False
-    if event["type"] == "message_end":
-        message = event.get("message")
-        if not isinstance(message, dict) or message.get("role") not in _PI_0842_MESSAGE_ROLES:
-            return False
-        # Assistant content is required by Pi's AssistantMessage. Validate the
-        # portion needed by parsing/provenance rather than pretending a role-only
-        # object is a complete provider event.
-        if message["role"] == "assistant" and not isinstance(message.get("content"), list):
-            return False
-    return True
+    """Compatibility wrapper around the shared pinned event contract."""
+
+    return valid_pi_event_envelope(event)
 
 
 def _pi_event_scan(raw) -> tuple[list[dict], bool]:
-    """Return Pi envelopes plus whether nonblank output was not an event.
+    """Compatibility tuple view of the shared complete-stream scanner."""
 
-    Normal Pi output is NDJSON under ``raw["result"]``.  A one-event stream is
-    valid JSON, though, so Sandbox may return that event directly. Malformed,
-    truncated, scalar, and non-event JSON lines are retained as an incomplete
-    signal rather than silently discarded. Neither a model reply dict nor
-    arbitrary nested JSON is promoted to an event.
-    """
-    candidate = raw.get("result") if isinstance(raw, dict) and "result" in raw else raw
-    if isinstance(candidate, dict):
-        if _valid_pi_event_envelope(candidate):
-            return [candidate], False
-        return [], bool(candidate)
-    if not isinstance(candidate, str):
-        return [], False
-    events = []
-    incomplete = False
-    for line in candidate.splitlines():
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except (json.JSONDecodeError, TypeError):
-            incomplete = True
-            continue
-        if _valid_pi_event_envelope(event):
-            events.append(event)
-        else:
-            incomplete = True
-    return events, incomplete
+    scan = scan_pi_events(raw)
+    return list(scan.events), scan.incomplete
 
 
 def _pi_events(raw) -> list[dict]:
@@ -164,61 +91,20 @@ def _pi_events(raw) -> list[dict]:
 
 def _assistant_message_events(raw) -> list[tuple[dict, dict]]:
     """Only provider-owned assistant ``message_end`` events count as calls."""
-    result = []
-    for event in _pi_events(raw):
-        message = event.get("message")
-        if (
-            event.get("type") == "message_end"
-            and isinstance(message, dict)
-            and message.get("role") == "assistant"
-        ):
-            result.append((event, message))
-    return result
+
+    return list(assistant_message_events(raw))
 
 
 def _event_response_models(event: dict, message: dict) -> tuple[str, ...]:
     """Distinct non-blank responseModel values in one trusted event."""
-    values = []
-    for candidate in (message.get("responseModel"), event.get("responseModel")):
-        if isinstance(candidate, str) and candidate.strip():
-            value = candidate.strip()
-            if value not in values:
-                values.append(value)
-    return tuple(values)
+
+    return event_response_models(event, message)
 
 
 def _model_served_evidence(raw) -> tuple[str | None, HarnessProvenanceReason | None]:
     """Aggregate every assistant call without collapsing gaps or conflicts."""
-    events, incomplete = _pi_event_scan(raw)
-    messages = []
-    for event in events:
-        message = event.get("message")
-        if (
-            event.get("type") == "message_end"
-            and isinstance(message, dict)
-            and message.get("role") == "assistant"
-        ):
-            messages.append((event, message))
-    observed = []
-    missing = False
-    for event, message in messages:
-        values = _event_response_models(event, message)
-        if len(values) > 1:
-            return None, HarnessProvenanceReason.MODEL_SERVED_CONFLICT
-        if not values:
-            missing = True
-        else:
-            observed.append(values[0])
 
-    if len(set(observed)) > 1:
-        return None, HarnessProvenanceReason.MODEL_SERVED_CONFLICT
-    if incomplete:
-        return None, HarnessProvenanceReason.MODEL_SERVED_INCOMPLETE_STREAM
-    if observed and missing:
-        return None, HarnessProvenanceReason.MODEL_SERVED_PARTIAL
-    if observed:
-        return observed[0], None
-    return None, HarnessProvenanceReason.MODEL_SERVED_NOT_OBSERVED
+    return served_model_evidence(raw)
 
 
 def _observed_served_model(raw) -> str | None:

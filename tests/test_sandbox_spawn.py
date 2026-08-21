@@ -1,8 +1,14 @@
 import json
+import subprocess
 from pathlib import Path
 import pytest
 from skharness.autocode.sandbox import Sandbox, LaunchSpec
 from skharness.autocode.claude_code import HarnessUnavailable
+from skharness.autocode.sandbox_lifecycle import (
+    RESOURCE_ROLE_LABEL,
+    RUN_ID_LABEL,
+    SandboxOwnership,
+)
 
 
 def _spec():
@@ -146,6 +152,64 @@ def test_image_preflight_fails_closed_when_behavior_check_fails(monkeypatch):
         Sandbox()._ensure_capable(spec)
 
 
+def test_supervisor_scoped_image_preflight_timeout_fails_closed(monkeypatch):
+    observed = []
+
+    def hangs(argv, **kwargs):
+        observed.append(kwargs["timeout"])
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    sandbox = Sandbox(docker_command_timeout_s=3, monotonic=lambda: 10)
+    monkeypatch.setattr("skharness.autocode.sandbox.shutil.which", lambda _: "/usr/bin/docker")
+    monkeypatch.setattr("skharness.autocode.sandbox.subprocess.run", hangs)
+
+    with pytest.raises(HarnessUnavailable, match="Docker preflight timed out"):
+        sandbox._ensure_capable(_spec(), deadline=13)
+
+    assert observed == [3]
+
+
+def test_supervisor_preflight_uses_aggregate_deadline_and_checks_cancel_between_probes(
+    monkeypatch,
+):
+    calls = []
+    ticks = iter((0.0, 2.0, 4.0, 6.0, 8.0))
+    sandbox = Sandbox(docker_command_timeout_s=3, monotonic=lambda: next(ticks))
+    spec = _spec()
+    spec.required_commands = ["python", "pytest"]
+    spec.required_checks = [["preflight"], ["preflight", "--deep"]]
+
+    def succeeds(argv, **kwargs):
+        calls.append((argv, kwargs["timeout"]))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("skharness.autocode.sandbox.shutil.which", lambda _: "/usr/bin/docker")
+    monkeypatch.setattr("skharness.autocode.sandbox.subprocess.run", succeeds)
+
+    sandbox._ensure_capable(
+        spec,
+        deadline=30,
+        cancelled=lambda: False,
+        ownership=SandboxOwnership("lease-preflight", authority="lease"),
+        container_name="arena-pi-preflight",
+    )
+
+    assert len(calls) == 5
+    assert [timeout for _argv, timeout in calls] == [3, 3, 3, 3, 3]
+    for argv, _timeout in calls[1:]:
+        assert argv[argv.index("--name") + 1] == "arena-pi-preflight"
+        assert f"{RUN_ID_LABEL}=lease-preflight" in argv
+        assert f"{RESOURCE_ROLE_LABEL}=worker" in argv
+
+    calls.clear()
+    cancelled = iter((False, False, True))
+    sandbox = Sandbox(docker_command_timeout_s=3, monotonic=lambda: 0)
+    with pytest.raises(HarnessUnavailable, match="preflight cancelled"):
+        sandbox._ensure_capable(spec, deadline=30, cancelled=lambda: next(cancelled))
+
+    assert len(calls) == 1
+
+
 def test_proxy_readiness_retries_until_listening(monkeypatch):
     results = iter([1, 1, 0])
 
@@ -185,7 +249,9 @@ def test_spawn_runs_container_and_tears_down(monkeypatch):
     sb = Sandbox(live_execution=True)
     monkeypatch.setattr(sb, "_ensure_capable", lambda spec: None)
     monkeypatch.setattr("skharness.autocode.sandbox.subprocess.run", fake_run)
-    out = sb.spawn(_spec(), repo_remote_host="github.com", ci_host="ci.local")
+    spec = _spec()
+    spec.sandbox_run_id = "lease-from-controller"
+    out = sb.spawn(spec, repo_remote_host="github.com", ci_host="ci.local")
     assert out == {"result": {"ok": True}}
     kinds = [c[1] for c in calls if c and c[0] == "docker"]
     assert "network" in kinds and "run" in kinds          # created a network and ran
@@ -197,12 +263,26 @@ def test_spawn_runs_container_and_tears_down(monkeypatch):
     proxy_start = next(c for c in calls if c[0] == "docker" and "run" in c and "-d" in c)
     for host in ("github.com", "ci.local", "gw.local"):
         assert host in proxy_start
+    network_create = next(c for c in calls if c[1:3] == ["network", "create"])
+    worker_start = next(c for c in calls if c[:2] == ["docker", "run"] and "-d" not in c)
+    for command, role in (
+        (network_create, "network"),
+        (proxy_start, "proxy"),
+        (worker_start, "worker"),
+    ):
+        labels = {
+            value.split("=", 1)[0]: value.split("=", 1)[1]
+            for index, value in enumerate(command)
+            if index and command[index - 1] == "--label"
+        }
+        assert labels[RUN_ID_LABEL] == "lease-from-controller"
+        assert labels[RESOURCE_ROLE_LABEL] == role
 
 
 def test_spawn_passes_stdin_to_container_subprocess(monkeypatch):
     seen_kwargs = []
     def fake_run(argv, **kw):
-        if "timeout" in kw:                     # only the harness container run sets this
+        if "cwd" in kw:                         # only the harness container run sets this
             seen_kwargs.append(kw)
         class P:
             returncode = 0
@@ -223,7 +303,7 @@ def test_spawn_passes_stdin_to_container_subprocess(monkeypatch):
 def test_spawn_omits_input_when_stdin_is_none(monkeypatch):
     seen_kwargs = []
     def fake_run(argv, **kw):
-        if "timeout" in kw:                     # only the harness container run sets this
+        if "cwd" in kw:                         # only the harness container run sets this
             seen_kwargs.append(kw)
         class P:
             returncode = 0

@@ -260,6 +260,7 @@ def test_hard_deadline_stops_worker_and_gate_fails_closed(tmp_path):
     def stop(lease_id):
         assert lease_id == builder.lease_id
         stopped.set()
+        return True
 
     control = _scheduler(tmp_path, clock=lambda: current[0])
     report = TrustedSwarmOrchestrator(
@@ -273,6 +274,33 @@ def test_hard_deadline_stops_worker_and_gate_fails_closed(tmp_path):
     assert not report.completion.authorized
     assert report.results[0].disposition is SubagentDisposition.FAILED
     assert "hard_deadline_exceeded" in report.results[0].reason_codes
+
+
+def test_nonquiescent_stop_is_not_acknowledged(tmp_path):
+    current = [0.0]
+    released = threading.Event()
+    plan = _plan(SwarmRole.BUILDER)
+    builder = _contract(SwarmRole.BUILDER, plan)
+
+    def execute(contract):
+        current[0] = 61.0
+        released.wait(1)
+        return WorkerExecution(_result(contract), BudgetUsage(wall_seconds=60))
+
+    def stop(_lease_id):
+        released.set()
+        return False
+
+    control = _scheduler(tmp_path, clock=lambda: current[0])
+    report = TrustedSwarmOrchestrator(
+        control,
+        _gate(plan),
+        A2AJournal(tmp_path / "a2a.jsonl"),
+        plan,
+    ).run((builder,), execute=execute, stop=stop, attest=lambda _results, _receipts: None)
+
+    assert f"worker_stop_not_quiescent:{builder.contract_id}" in report.failure_reasons
+    assert control.stop_requests() == (builder.lease_id,)
 
 
 def test_missing_timed_out_scout_results_never_admit_builder(tmp_path):
@@ -301,6 +329,7 @@ def test_missing_timed_out_scout_results_never_admit_builder(tmp_path):
         stopped.append(lease_id)
         if len(stopped) == 2:
             released.set()
+        return True
 
     control = _scheduler(tmp_path, clock=lambda: current[0])
     report = TrustedSwarmOrchestrator(

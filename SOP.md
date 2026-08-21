@@ -222,6 +222,51 @@ object/ref reads but deliberately denies commits, branch/ref mutation, and other
 metadata writes from the worker. Malformed, missing, or escaping worktree metadata is
 rejected before Docker networking or worker startup.
 
+### Sandbox resource ownership and crash reconciliation
+
+Each managed worker, egress proxy, and internal network carries the same immutable
+`io.skharness.run-id` plus `io.skharness.managed=true`, lifecycle-schema, and exact
+resource-role and ownership-authority labels. Arena uses its active scheduler lease ID
+as the run ID and marks that authority as `lease`; direct sandbox launches mint a
+non-secret random ID with `ephemeral` authority. This identity is the only authority
+for crash reconciliation. Names such as `sbxrun-*` and `arena-proxy-*` are diagnostic
+and must not be used to infer ownership.
+
+The first live admission performs reconciliation, and later admissions repeat it at a
+bounded interval (300 seconds by default). Operators/controllers may call
+`Sandbox.reconcile_orphans(active_run_ids=...)` explicitly and read the bounded result
+from `Sandbox.reconciliation_status()`. The production Arena composition supplies all
+active scheduler lease IDs automatically.
+
+Reconciliation inventories only resources with the managed label and removes them by
+their exact Docker IDs only when the complete run group is older than the default
+900-second bootstrap grace. A running ephemeral worker or declared active lease
+preserves the entire group. Arena reconciliation treats its supplied lease inventory
+as authoritative, so a running worker whose old lease disappeared is reclaimed after
+the grace period; other callers without that authoritative view fail closed on
+lease-owned resources. Young groups, unparseable creation evidence, malformed
+ownership, an oversized inventory, and networks with foreign attachments fail closed
+and remain for inspection. Errors and counters are bounded; `partial`, `error`, or
+`inventory_truncated` is not successful cleanup evidence. Normal `finally` teardown
+remains the fast path: it independently attempts worker, proxy, and network removal,
+accepts already-absent resources idempotently, and reports failure only after all three
+attempts. Reconciliation exists for controller kill, host restart, and other cases
+where that teardown never ran.
+
+The live Arena supervisor bounds every Docker control call to three seconds. Orphan
+reconciliation has a three-second aggregate deadline; project-image preflight allows
+30 seconds aggregate and checks cancellation between its individually bounded probes;
+network/proxy startup allows nine seconds aggregate. Preflight containers reuse the
+worker's exact name and immutable ownership labels, so a timed-out probe is covered by
+the same exact cleanup. OOM inspection timeout, non-zero inspect, or malformed state is
+`docker_supervisor_error`, never an inferred `OOMKilled=false`. Exact worker/proxy/network
+cleanup is at most nine seconds. `cancel()` is bounded by one three-second Docker removal
+plus five seconds of process grace, and the qualification runtime's 20-second drain is
+one monotonic deadline spanning both `cancel()` and the remaining quiescence wait.
+End-to-end worker usage is likewise charged from monotonic elapsed time; UTC
+`started_at`/`finished_at` remain audit fields and a backwards wall-clock step is clamped
+without reducing the charge.
+
 Pi process status is not sufficient completion evidence. SKHarness also reads the
 structured event stream: `message_end.message.stopReason=error` classifies the attempt
 as `pi_terminal_error` even if Pi exits zero. A wall-time expiry remains a timeout with
@@ -428,6 +473,66 @@ assistant output, and makes a raw public-IP connection from that same worker fai
 removes both containers and the network even after a failed assertion. No gateway or
 registry credential is needed after the digest has been pulled.
 
+The trusted S/M/L Pi swarm qualification is a separate, operator-started gate. Its
+driver freezes canonical CardStore content hashes, source commit, image digest, route,
+model, prompts, paths, tools, topology, and per-worker budgets. Preflight is the default;
+only `--execute` starts workers, and execution is pinned to `.41`. The driver never
+updates the coordination board or grants completion authority.
+
+```bash
+skharness_qual_image='ghcr.io/smilintux/skharness-pi-python-test@sha256:8e991c893e7553522369a35d10b78ae2e831eb62b9f127ba53a7dabd045e2c7d'
+skharness_qual_controller="$(git rev-parse HEAD)"
+test -z "$(git status --porcelain --untracked-files=all)"
+# Review both immutable inputs before continuing. The controller commit is the
+# current trusted driver/runtime source, not the older frozen worker-base commit.
+git show --no-patch --format='%H %s' "$skharness_qual_controller"
+python scripts/qualify-pi-swarm.py \
+  --image "$skharness_qual_image" \
+  --controller-commit "$skharness_qual_controller" \
+  --output /tmp/pi-swarm-v038-preflight.json
+
+# Run on .41 only after explicit operator authorization. Use a new evidence root.
+skharness_qual_stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+python scripts/qualify-pi-swarm.py \
+  --execute \
+  --image "$skharness_qual_image" \
+  --controller-commit "$skharness_qual_controller" \
+  --evidence-root "/home/cbrd21/.skcapstone/qualification/pi-swarm-v038-${skharness_qual_stamp}"
+```
+
+Do not substitute `coord kanban --json` for the canonical
+`~/.skcapstone/cards/<id>/core.json` snapshots: the folded kanban view deliberately
+omits acceptance criteria. Any content mismatch, mutable image reference, wrong host,
+dirty source/worktree, existing evidence root, out-of-scope edit, failed controller
+test, or missing phase result fails closed. The L card remains two read-only scouts;
+there is no cross-repository builder until all repositories and fresh transport evidence
+can be bound immutably. Retain the detached worktrees for review. Do not equate their
+provisional commits, Pi exit zero, or worker-authored tests with card completion.
+
+The preflight verifies that the driver, its critical imported modules, and the release
+evidence record are tracked bytes from the exact reviewed controller commit; that commit
+must descend from the frozen worker source. Before execution it also verifies the local
+image RepoDigest and v0.3.38 OCI labels. Every card is separated by an all-managed-label
+Docker inventory gate. Controller pytest and Ruff containers have unique lifecycle
+labels, no network, fixed resource and wall-clock limits, cancellation-aware bounded
+exact-name cleanup, and a post-cleanup zero-resource assertion. Builder leases reserve
+180 seconds inside the immutable contract wall: 90 pytest + 10 cleanup + 30 Ruff + 10
+cleanup + six 5-second hookless/signing-disabled Git commands + 10 seconds overhead.
+Pi receives only the serialized remainder, and its phase budget sums exactly to that
+remainder. Cancellation sets the lease token, cancels Pi, drains validation and host Git,
+and must prove runtime quiescence before stop acknowledgement or the next card. Any
+launch, timeout, cleanup, inventory, quiescence, or source-drift uncertainty prevents
+admission of the next card. The final evidence bundle is sealed only after quiescence
+and contains a detached SHA-256 inventory of its files.
+
+Measured model, token, tool, duration, and cost fields remain `null` with a reason when
+provider/controller artifacts cannot prove them. The scheduler is still charged the
+full reservation for every unknown dimension (`accounting_basis: reservation`), but
+reserved charges are never reported as observed performance. This driver measures
+swarm execution and phase gating only. It has no matched single-agent baseline,
+independent quality verdict, or complete TTFE/denial attribution, so its output cannot
+close comparison card `322f2d80`.
+
 Continual-loop comparisons use `skharness.arena.evaluation`. A report is valid only
 when every baseline, memory-only, skills-only, subagents-only, and full-loop cell is
 present for the declared fixed seeds and repetition count. The report always includes
@@ -581,6 +686,57 @@ systemctl --user is-active skcode-hostd
 
 Stop before pull when the checkout is dirty; never overwrite node-local work to make a
 deployment look clean.
+
+For an editable tagged deployment such as `.41` card `0146f13f`, prove that Git, package
+metadata, and the imported module all name the same release before restarting anything.
+The operational venv is authoritative; do not use a user-site install or restart an
+unaffected service.
+
+```bash
+skharness_repo=/home/cbrd21/clawd/skcapstone-repos/skharness
+skharness_venv_python=/home/cbrd21/.venvs/skops/bin/python
+skharness_tag=v0.3.38
+
+test -z "$(git -C "$skharness_repo" status --porcelain --untracked-files=all)"
+git -C "$skharness_repo" fetch --tags origin
+skharness_tag_commit="$(git -C "$skharness_repo" rev-parse "${skharness_tag}^{commit}")"
+git -C "$skharness_repo" merge --ff-only "$skharness_tag_commit"
+test "$(git -C "$skharness_repo" rev-parse HEAD)" = "$skharness_tag_commit"
+
+"$skharness_venv_python" -m pip install --no-deps --no-build-isolation -e "$skharness_repo"
+SKHARNESS_DEPLOY_TAG="$skharness_tag" \
+SKHARNESS_DEPLOY_REPO="$skharness_repo" \
+  "$skharness_venv_python" - <<'PY'
+import importlib
+import os
+from importlib.metadata import version
+from pathlib import Path
+
+expected = os.environ["SKHARNESS_DEPLOY_TAG"].removeprefix("v")
+repo_src = (Path(os.environ["SKHARNESS_DEPLOY_REPO"]) / "src").resolve()
+module_path = Path(importlib.import_module("skharness").__file__).resolve()
+assert version("skharness") == expected
+assert module_path.is_relative_to(repo_src), (module_path, repo_src)
+PY
+
+systemctl --user restart skcode-hostd
+skcode_livez_url="http://$(tailscale ip -4):9394/livez"
+skcode_probe_ok=0
+for skcode_probe_attempt in $(seq 1 30); do
+  if curl -fsS "$skcode_livez_url" >/dev/null; then
+    skcode_probe_ok=1
+    break
+  fi
+  sleep 1
+done
+test "$skcode_probe_ok" = 1
+systemctl --user is-active --quiet skcode-hostd
+test -z "$(git -C "$skharness_repo" status --porcelain --untracked-files=all)"
+```
+
+Record the exact tag/commit and the metadata/module-path assertions without printing
+the service environment or any credential. On 2026-08-21, `.41` passed this contract
+at `v0.3.38` / `2e8e4d89aac1967fb297c0558b311998a9bc1e9a`.
 
 The two current qualification targets have deliberately different roles. Do not infer
 GPU capability from an address or reuse one node's readiness criteria for the other:

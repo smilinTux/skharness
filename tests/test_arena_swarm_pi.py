@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
+from skharness.arena.controller import ArenaController
 from skharness.arena.runner import PiExperimentRunner, RunOutcome
-from skharness.arena.scheduler import AttemptRequest
+from skharness.arena.scheduler import AttemptRequest, LeaseScheduler, ResourceRequest
+from skharness.arena.store import ArenaStore
 from skharness.arena.swarm import (
     ExecutionBudget,
     PhaseInput,
@@ -12,9 +16,15 @@ from skharness.arena.swarm import (
     SubagentContract,
     SubagentDisposition,
     SwarmIdentity,
+    SwarmPhaseSpec,
+    SwarmPlan,
     SwarmRole,
+    TeamBudget,
 )
+from skharness.arena.swarm_control import SwarmScheduler
+from skharness.arena.swarm_orchestrator import A2AJournal, TrustedSwarmOrchestrator
 from skharness.arena.swarm_pi import PiSwarmLaunch, PiSwarmWorkerRuntime
+from skharness.arena.swarm_verifier import SwarmCompletionGate
 from skharness.arena.trajectory import CardSize
 from skharness.autocode.sandbox import InspectionScope, LaunchSpec
 
@@ -96,7 +106,7 @@ def test_pi_runtime_maps_success_to_evidence_not_completion_authority():
     runtime = PiSwarmWorkerRuntime(
         runner_factory=lambda contract: runner,
         launch_factory=_launch,
-        observe_commit=lambda contract: COMMIT,
+        observe_commit=lambda contract, cancellation: COMMIT,
     )
     execution = runtime.execute(_contract())
 
@@ -113,6 +123,133 @@ def test_pi_runtime_maps_success_to_evidence_not_completion_authority():
     assert runner.spec.inspection_scope.max_calls == 10
 
 
+def test_pi_runtime_charges_monotonic_elapsed_time_across_wall_clock_rollback():
+    runner = Runner(
+        RunOutcome(
+            True,
+            "exit",
+            0,
+            DIGEST,
+            "sha256:" + "2" * 64,
+            metrics={"duration_s": 1},
+        )
+    )
+    monotonic = iter((100.0, 107.0))
+    utc = iter(
+        (
+            datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc),
+            datetime(2026, 8, 21, 11, 59, tzinfo=timezone.utc),
+        )
+    )
+    runtime = PiSwarmWorkerRuntime(
+        runner_factory=lambda contract: runner,
+        launch_factory=_launch,
+        observe_commit=lambda contract, cancellation: COMMIT,
+        monotonic=lambda: next(monotonic),
+        utcnow=lambda: next(utc),
+    )
+
+    execution = runtime.execute(_contract())
+
+    assert execution.usage.wall_seconds == 7
+    assert execution.result.finished_at == execution.result.started_at
+
+
+def test_stop_uses_one_monotonic_deadline_for_cancel_and_drain():
+    observed_waits = []
+
+    class Done:
+        @staticmethod
+        def wait(timeout):
+            observed_waits.append(timeout)
+            return True
+
+    class Cancellation:
+        @staticmethod
+        def cancel():
+            pass
+
+    class Supervisor:
+        @staticmethod
+        def cancel():
+            raise RuntimeError("bounded Docker cancellation failure")
+
+    monotonic = iter((100.0, 106.0))
+    runtime = PiSwarmWorkerRuntime(
+        runner_factory=lambda contract: None,
+        launch_factory=_launch,
+        observe_commit=lambda contract, cancellation: COMMIT,
+        stop_drain_timeout_s=20,
+        monotonic=lambda: next(monotonic),
+    )
+    runtime._active["lease-1"] = SimpleNamespace(
+        cancellation=Cancellation(),
+        runner=SimpleNamespace(supervisor=Supervisor()),
+        done=Done(),
+    )
+
+    assert runtime.stop("lease-1") is False
+    assert observed_waits == [14.0]
+
+
+def test_builder_pi_timeout_reserves_controller_time_inside_contract_wall():
+    runner = Runner(RunOutcome(True, "exit", 0, DIGEST, "sha256:" + "2" * 64))
+    observed = []
+    runtime = PiSwarmWorkerRuntime(
+        runner_factory=lambda contract: runner,
+        launch_factory=_launch,
+        observe_commit=lambda contract, cancellation: observed.append(
+            cancellation.cancelled
+        )
+        or COMMIT,
+        post_run_reserve_s=15,
+    )
+
+    execution = runtime.execute(_contract())
+
+    assert runner.kwargs["timeout_s"] == 45
+    assert observed == [False]
+    assert execution.result.observed_commit == COMMIT
+    runtime.assert_idle()
+
+
+def test_cancel_during_commit_observation_is_synchronously_drained_without_mutation():
+    runner = Runner(RunOutcome(True, "exit", 0, DIGEST, "sha256:" + "2" * 64))
+    entered = threading.Event()
+    mutation = []
+    executions = []
+
+    def observe(_contract, cancellation):
+        entered.set()
+        assert cancellation.wait(1)
+        cancellation.raise_if_cancelled()
+        mutation.append("late-commit")
+        return COMMIT
+
+    runtime = PiSwarmWorkerRuntime(
+        runner_factory=lambda contract: runner,
+        launch_factory=_launch,
+        observe_commit=observe,
+        post_run_reserve_s=10,
+        stop_drain_timeout_s=1,
+    )
+    thread = threading.Thread(
+        target=lambda: executions.append(runtime.execute(_contract()))
+    )
+    thread.start()
+    assert entered.wait(1)
+
+    assert runtime.stop("lease-1")
+    runtime.assert_idle()
+    thread.join(1)
+
+    assert not thread.is_alive()
+    assert mutation == []
+    assert executions[0].result.disposition is SubagentDisposition.FAILED
+    assert executions[0].result.controller_terminal_reason == "controller_cancelled"
+    assert "controller_cancelled" in executions[0].result.reason_codes
+
+
 def test_pi_runtime_preserves_blocked_disposition_and_can_cancel_active_runner():
     runner = Runner(
         RunOutcome(False, "blocked", 0, DIGEST, "sha256:" + "2" * 64,
@@ -121,16 +258,41 @@ def test_pi_runtime_preserves_blocked_disposition_and_can_cancel_active_runner()
     runtime = PiSwarmWorkerRuntime(
         runner_factory=lambda contract: runner,
         launch_factory=_launch,
-        observe_commit=lambda contract: COMMIT,
+        observe_commit=lambda contract, cancellation: COMMIT,
     )
     execution = runtime.execute(_contract(SwarmRole.SCOUT))
     assert execution.result.disposition is SubagentDisposition.BLOCKED
     assert execution.result.reason_codes == ("blocked",)
     assert execution.result.scout_assessment.value == "blocked"
     assert "SCOUT_ASSESSMENT:" in runner.spec.argv[2]
-    runtime._active["lease-1"] = runner
-    runtime.stop("lease-1")
-    assert runner.supervisor.cancelled
+
+    started = threading.Event()
+
+    class BlockingRunner(Runner):
+        def execute(self, request, spec, **kwargs):
+            started.set()
+            assert self.supervisor.cancelled is False
+            while not self.supervisor.cancelled:
+                threading.Event().wait(0.01)
+            return self.outcome
+
+    blocking = BlockingRunner(runner.outcome)
+    cancellable = PiSwarmWorkerRuntime(
+        runner_factory=lambda contract: blocking,
+        launch_factory=_launch,
+        observe_commit=lambda contract, cancellation: COMMIT,
+        stop_drain_timeout_s=1,
+    )
+    thread = threading.Thread(
+        target=cancellable.execute, args=(_contract(SwarmRole.SCOUT),)
+    )
+    thread.start()
+    assert started.wait(1)
+    assert cancellable.stop("lease-1")
+    thread.join(1)
+    assert not thread.is_alive()
+    assert blocking.supervisor.cancelled
+    cancellable.assert_idle()
 
 
 def test_pi_runtime_never_infers_actionable_scout_from_zero_exit():
@@ -140,13 +302,128 @@ def test_pi_runtime_never_infers_actionable_scout_from_zero_exit():
     runtime = PiSwarmWorkerRuntime(
         runner_factory=lambda contract: runner,
         launch_factory=_launch,
-        observe_commit=lambda contract: COMMIT,
+        observe_commit=lambda contract, cancellation: COMMIT,
     )
     execution = runtime.execute(_contract(SwarmRole.SCOUT))
 
     assert execution.result.disposition is SubagentDisposition.BLOCKED
     assert execution.result.scout_assessment.value == "blocked"
     assert "scout_assessment_missing_or_invalid" in execution.result.reason_codes
+
+
+def test_truncated_actionable_scout_stream_never_admits_builder(tmp_path):
+    identity = _contract().identity
+    plan = SwarmPlan(
+        plan_id="plan-incomplete-scout",
+        identity=identity,
+        phases=(
+            SwarmPhaseSpec(
+                phase_id="phase-scout",
+                role=SwarmRole.SCOUT,
+                contract_ids=("scout-1",),
+            ),
+            SwarmPhaseSpec(
+                phase_id="phase-builder",
+                role=SwarmRole.BUILDER,
+                contract_ids=("builder-1",),
+                predecessor_phase_ids=("phase-scout",),
+            ),
+        ),
+        created_at=datetime(2026, 8, 21, tzinfo=timezone.utc),
+    )
+
+    def contract(role, contract_id, phase_id):
+        base = _contract(role)
+        return base.model_copy(
+            update={
+                "contract_id": contract_id,
+                "plan_hash": plan.content_hash,
+                "phase_id": phase_id,
+                "child_agent_id": f"agent-{contract_id}",
+                "lease_id": f"lease-{contract_id}",
+            }
+        )
+
+    scout = contract(SwarmRole.SCOUT, "scout-1", "phase-scout")
+    builder = contract(SwarmRole.BUILDER, "builder-1", "phase-builder")
+    stream = (
+        b'{"type":"message_end","message":{"role":"assistant",'
+        b'"responseModel":"model-a","content":[{"type":"text","text":'
+        b'"SCOUT_ASSESSMENT: ACTIONABLE\\nSCOUT_FINDING: '
+        b'src/skharness/arena/swarm.py:1 - exact path scoped finding"}]}}\n'
+        b'{"type":"message_end","message":'
+    )
+
+    class StreamSupervisor:
+        def run(self, _spec, attempt_dir, _timeout_s):
+            (attempt_dir / "stdout.log").write_bytes(stream)
+            (attempt_dir / "stderr.log").write_bytes(b"")
+            return 0, "exit"
+
+        def cancel(self):
+            pass
+
+    arena_controller = ArenaController(
+        ArenaStore(tmp_path / "arena"),
+        LeaseScheduler(ResourceRequest(cpu=2, ram_gb=4, gateway_slots=1)),
+        writer_id="runner",
+        actor="orchestrator",
+        node="node",
+        session_id=identity.trajectory_id,
+    )
+    arena_controller.propose("experiment")
+    pi_runner = PiExperimentRunner(
+        arena_controller, StreamSupervisor(), tmp_path / "attempts"
+    )
+    runtime = PiSwarmWorkerRuntime(
+        runner_factory=lambda _contract: pi_runner,
+        launch_factory=_launch,
+        observe_commit=lambda _contract, _cancellation: (_ for _ in ()).throw(
+            AssertionError("builder must not run")
+        ),
+    )
+    scheduler = SwarmScheduler(
+        TeamBudget(
+            team_id="team-1",
+            wall_seconds=120,
+            token_limit=200,
+            tool_call_limit=20,
+            cost_limit=2,
+            max_concurrency=1,
+        ),
+        identity=identity,
+        orchestrator_id="orchestrator",
+    )
+    gate = SwarmCompletionGate(
+        plan=plan,
+        required_criteria=("criterion",),
+        trusted_verifier_ids=("verifier",),
+        verify_signature=lambda _item: False,
+    )
+    executed = []
+
+    def execute(item):
+        executed.append(item.contract_id)
+        return runtime.execute(item)
+
+    report = TrustedSwarmOrchestrator(
+        scheduler,
+        gate,
+        A2AJournal(tmp_path / "a2a.jsonl"),
+        plan,
+    ).run(
+        (scout, builder),
+        execute=execute,
+        stop=runtime.stop,
+        attest=lambda _results, _receipts: None,
+    )
+
+    assert executed == ["scout-1"]
+    assert report.results[0].disposition is SubagentDisposition.BLOCKED
+    assert "scout_assessment_missing_or_invalid" in report.results[0].reason_codes
+    assert "phase_not_completed:phase-scout" in report.failure_reasons
+    run_record = next((tmp_path / "attempts").glob("**/run.json"))
+    assert json.loads(run_record.read_text())["classification"] == "pi_event_stream_incomplete"
 
 
 def test_pi_runtime_accepts_only_parsed_path_scoped_scout_evidence():
@@ -169,7 +446,7 @@ def test_pi_runtime_accepts_only_parsed_path_scoped_scout_evidence():
     runtime = PiSwarmWorkerRuntime(
         runner_factory=lambda contract: runner,
         launch_factory=_launch,
-        observe_commit=lambda contract: COMMIT,
+        observe_commit=lambda contract, cancellation: COMMIT,
     )
     execution = runtime.execute(_contract(SwarmRole.SCOUT))
 

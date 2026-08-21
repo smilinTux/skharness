@@ -16,6 +16,25 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ### Added
 
+- Added immutable run/role/schema ownership labels to every managed sandbox worker,
+  egress proxy, and internal network. Live admissions now perform fail-closed startup
+  and rate-limited orphan reconciliation, with an explicit callable/status seam,
+  active-lease and running-worker preservation, bootstrap grace, exact-ID deletion,
+  bounded diagnostics, crash/restart coverage, and independently verified teardown of
+  the worker, proxy, and network. Live Pi Docker control calls, preflight, startup, OOM
+  inspection, cancellation, and teardown now have explicit fail-closed deadlines;
+  runtime stop uses one monotonic drain deadline and usage accounting cannot undercharge
+  after a wall-clock rollback.
+- Added a fail-closed, opt-in Pi S/M/L swarm qualification driver with immutable
+  CardStore content hashes, source/image/model/route/prompt/budget pins, isolated linked
+  worktrees, production phase authorization, controller-owned path/test gates, and
+  structured evidence. The exact release record and controller source are independently
+  pinned; managed Docker inventory and bounded validator cleanup gate every next-card
+  admission. Builder leases reserve bounded controller-validation time, cancellation is
+  synchronously drained before stop acknowledgement, and provisional Git disables hooks
+  and signing. Unknown telemetry remains null while reservations are charged conservatively.
+  Dry preflight is the default and neither provisional commits nor worker results can
+  mutate or complete coordination cards.
 - Extended `HarnessResult` with requested/served model, served backend, and gateway
   request-ID provenance. Pi records the requested route through its canonical
   `_effective_model` path and accepts served-model evidence only from provider-owned
