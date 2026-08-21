@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import shlex
 import shutil
@@ -21,13 +22,13 @@ import threading
 import time
 from dataclasses import dataclass, replace
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Protocol
 
 from skharness.autocode.sandbox import AuthMount, InspectionScope, LaunchSpec, Sandbox
 
 from .controller import ArenaController
-from .models import ExperimentState
+from .models import ExperimentState, canonical_digest
 from .scheduler import Admission, AttemptRequest
 from .trajectory import DEFAULT_PHASE_BUDGETS, CardSize, PhaseBudget, compact_pi_events
 
@@ -45,6 +46,8 @@ class RunOutcome:
     partial: bool = False
     metrics: dict[str, object] | None = None
     disposition: str | None = None
+    scout_assessment: str | None = None
+    scout_findings: tuple[dict[str, object], ...] = ()
 
 
 class TaskDisposition(str, Enum):
@@ -466,6 +469,7 @@ class PiExperimentRunner:
         stderr_digest = self._capture(directory / "stderr.log")
         terminal_error = self._pi_terminal_error(stdout_path)
         negative_disposition = self._pi_negative_disposition(stdout_path)
+        scout_assessment, scout_findings = self._pi_scout_terminal(stdout_path)
         inspection_denial = self._inspection_denial(directory / "inspection-denial.json")
         served_model = self._served_model(stdout_path)
         time_to_first_edit_s = self._time_to_first_edit(stdout_path)
@@ -530,6 +534,9 @@ class PiExperimentRunner:
             payload["terminal_error"] = terminal_error
         if negative_disposition is not None:
             payload["disposition"] = negative_disposition.value
+        if scout_assessment is not None:
+            payload["scout_assessment"] = scout_assessment
+            payload["scout_findings"] = scout_findings
         if inspection_denial is not None:
             payload["inspection_denial"] = inspection_denial
         if not cancelled:
@@ -548,6 +555,8 @@ class PiExperimentRunner:
             partial=not successful,
             metrics=metrics,
             disposition=negative_disposition.value if negative_disposition is not None else None,
+            scout_assessment=scout_assessment,
+            scout_findings=scout_findings,
         )
 
     @staticmethod
@@ -698,6 +707,74 @@ class PiExperimentRunner:
                     return disposition
             return None
         return None
+
+    @staticmethod
+    def _pi_scout_terminal(
+        path: Path,
+    ) -> tuple[str | None, tuple[dict[str, object], ...]]:
+        """Parse a strict final scout assessment and path-scoped finding evidence.
+
+        This is deliberately not a completion parser. It recognizes one narrow
+        controller-requested terminal form. Actionable/no-action assessments are
+        accepted only with concrete repository-relative findings retained in the
+        raw trajectory; generic claims and placeholder text fail closed.
+        """
+
+        final_text = ""
+        for event in PiExperimentRunner._events(path) or ():
+            if event.get("type") != "message_end":
+                continue
+            message = event.get("message")
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            content = message.get("content")
+            blocks = content if isinstance(content, list) else []
+            final_text = "\n".join(
+                block.get("text", "")
+                for block in blocks
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+        assessments = re.findall(
+            r"(?m)^SCOUT_ASSESSMENT: (ACTIONABLE|NO_ACTION|BLOCKED|NEEDS_INPUT)$",
+            final_text,
+        )
+        if len(assessments) != 1:
+            return None, ()
+        assessment = assessments[0].lower()
+        findings: list[dict[str, object]] = []
+        invalid = {"none", "n/a", "na", "unknown", "placeholder", "todo", "tbd"}
+        for line in final_text.splitlines():
+            if not line.startswith("SCOUT_FINDING: "):
+                continue
+            finding = line.removeprefix("SCOUT_FINDING: ").strip()
+            match = re.fullmatch(
+                r"([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)(?::([0-9]+))? - (.{12,})",
+                finding,
+            )
+            if match is None:
+                continue
+            candidate = PurePosixPath(match.group(1))
+            detail = match.group(3).strip()
+            lowered = detail.casefold()
+            if (
+                candidate.is_absolute()
+                or ".." in candidate.parts
+                or lowered in invalid
+                or any(
+                    token in lowered for token in ("placeholder", "fill this", "lorem ipsum")
+                )
+            ):
+                continue
+            payload: dict[str, object] = {
+                "path": candidate.as_posix(),
+                "line": int(match.group(2)) if match.group(2) is not None else None,
+                "detail": detail,
+            }
+            findings.append(payload | {"digest": canonical_digest(payload)})
+        if assessment in {"actionable", "no_action"} and not findings:
+            return None, ()
+        unique = {str(item["digest"]): item for item in findings}
+        return assessment, tuple(unique[key] for key in sorted(unique))
 
     def cancel(self, experiment_id: str, attempt: int = 1) -> None:
         self.controller.cancel(

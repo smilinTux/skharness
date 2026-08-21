@@ -356,15 +356,59 @@ and share the immutable trajectory identity.
 Role phases are scout -> build -> test. Workers within a phase may run concurrently
 only when their contracts and write scopes admit together. S cards default to one
 builder; M cards use one scout/builder/tester; L or cross-repository work may allocate
-bounded independent scouts/builders. Any non-completed phase cancels downstream work.
-The total team budget remains a hard global ceiling, rather than multiplying the
-single-worker budget by the number of children.
+up to two independent read-only scouts, one builder, and one tester. Multiple isolated
+builders are not yet a valid production topology: they produce divergent commits and
+there is no trusted controller-owned integration/cherry-pick stage. Any non-completed
+phase cancels downstream work. The total team budget remains a hard global ceiling,
+rather than multiplying the single-worker budget by the number of children.
+
+The production contract is a content-addressed `SwarmPlan`, not a caller-selected list
+of roles. It fixes the exact phase DAG and contract cardinality. Each completed worker
+gets a scheduler-owned `PhaseReceipt` binding its lease, result, evidence, input/output
+commit, and predecessor receipts. The scheduler then mints a one-use
+`PhaseAuthorization` for the exact downstream contract. Replayed, externally minted,
+stale, incomplete, or cross-plan authorizations are rejected. This authorization is
+required at admission; prompt instructions are not a security boundary.
+
+Scout output has a separate structured contract. `SCOUT_ASSESSMENT` is one of
+`ACTIONABLE`, `NO_ACTION`, `BLOCKED`, or `NEEDS_INPUT`. Positive assessments require at
+least one bounded repository-relative `SCOUT_FINDING` with content-derived digest.
+Typed findings flow through the result, receipt, phase input, and downstream contract,
+then are injected into the next Pi prompt as canonical JSON. Arbitrary scout prose is
+retained in raw evidence but is not a handoff or authorization input.
+
+Terminal usage and accounting are deliberately separate. The scheduler retains raw
+tokens, tool calls, wall time, and cost even when they exceed the child's reservation
+or arrive after a timeout/cancellation; its ledger settles only the bounded reserved
+amount. Late results remain failed terminal evidence and cannot resurrect a lease.
+Stop requests, raw usage, receipts, consumed authorizations, and terminal results all
+survive content-checked restart recovery.
 
 Completion is a separate trust boundary. Worker summaries, zero exit, and
-worker-authored tests cannot authorize it. The independent completion gate binds the
-exact worker-result hashes and requires signed verifier-owned evidence for every
-acceptance criterion. Negative worker disposition can only reduce trust. This preserves
-the Arena's existing reward-gaming rule: model output never promotes itself.
+worker-authored tests cannot authorize it. The independent completion gate derives the
+exact expected results from `SwarmPlan` and binds the plan hash, canonical phase-lineage
+digest, unique terminal commit, exact planned result hashes, and verifier-owned evidence
+for every acceptance criterion. Negative worker disposition can only reduce trust.
+This preserves the Arena's existing reward-gaming rule: model output never promotes
+itself.
+
+#### Live failure that fixed the boundary
+
+The first L-card swarm trial on `.41` (2026-08-21, card `41077231`) is negative evidence.
+Both scouts hit their 180-second hard deadline without a terminal `SubagentResult`.
+The old orchestrator removed the expired futures, obtained an empty result list, and
+vacuously passed `any(non_completed for result in [])`, admitting the builder without
+scout evidence. The builder was manually stopped; no worktree changed. Post-run budget
+rejection also discarded its measured 285,094 tokens and 22 tool calls from scheduler
+state. Incident `1df443cb` owns the remediation.
+
+The corrected boundary requires exact phase result cardinality, actionable typed scout
+evidence, scheduler-owned receipts, and one-use downstream authorization. It retains
+late and over-budget metrics without changing negative finality. Local tests prove the
+contract; they do not turn the failed `.41` run into a pass. Closure still requires a
+fresh `.41` run showing that unavailable cross-repository/live evidence terminates at
+the scout phase, starts no builder, leaves no worker container, and keeps the worktree
+clean.
 
 Implementation truth (repository audit, 2026-08-20): the Dockerfile now pins a Wolfi
 base digest, exact direct APKs, the Pi/npm graph, and hashed Python wheels. Core omits

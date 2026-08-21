@@ -10,18 +10,25 @@ from skharness.arena.swarm import (
     BudgetExceededError,
     BudgetUsage,
     ExecutionBudget,
+    PhaseAuthorization,
+    ScoutAssessment,
+    ScoutFinding,
     SubagentContract,
     SubagentDisposition,
     SubagentResult,
     SwarmContractError,
     SwarmIdentity,
+    SwarmPhaseSpec,
+    SwarmPlan,
     SwarmRole,
     TeamBudget,
+    bind_phase_inputs,
 )
 from skharness.arena.swarm_control import (
     SwarmAdmissionReason,
     SwarmScheduler,
     SwarmStateError,
+    UsageSettlement,
     WorkerLeaseState,
 )
 
@@ -64,6 +71,8 @@ def team_budget(**updates) -> TeamBudget:
 def contract(
     name: str,
     *,
+    plan: SwarmPlan,
+    phase_id: str | None = None,
     role: SwarmRole = SwarmRole.SCOUT,
     worktree: str = "shared",
     paths: tuple[str, ...] | None = None,
@@ -75,6 +84,8 @@ def contract(
         contract_id=name,
         team_id="team-1",
         identity=identity(),
+        plan_hash=plan.content_hash,
+        phase_id=phase_id or f"phase-{name}",
         parent_agent_id="orchestrator",
         child_agent_id=f"agent-{name}",
         role=role,
@@ -95,25 +106,83 @@ def contract(
     )
 
 
-def scheduler(clock: Clock, **budget_updates) -> SwarmScheduler:
-    return SwarmScheduler(
+def root_plan(*items: tuple[str, SwarmRole]) -> SwarmPlan:
+    return SwarmPlan(
+        plan_id="plan-1",
+        identity=identity(),
+        phases=tuple(
+            SwarmPhaseSpec(
+                phase_id=f"phase-{name}",
+                role=role,
+                contract_ids=(name,),
+            )
+            for name, role in items
+        ),
+        created_at=NOW,
+    )
+
+
+def scout_builder_plan() -> SwarmPlan:
+    return SwarmPlan(
+        plan_id="plan-pipeline",
+        identity=identity(),
+        phases=(
+            SwarmPhaseSpec(
+                phase_id="phase-scout",
+                role=SwarmRole.SCOUT,
+                contract_ids=("scout",),
+            ),
+            SwarmPhaseSpec(
+                phase_id="phase-builder",
+                role=SwarmRole.BUILDER,
+                contract_ids=("builder",),
+                predecessor_phase_ids=("phase-scout",),
+            ),
+        ),
+        created_at=NOW,
+    )
+
+
+def scheduler(clock: Clock, plan: SwarmPlan, **budget_updates) -> SwarmScheduler:
+    control = SwarmScheduler(
         team_budget(**budget_updates),
         identity=identity(),
         orchestrator_id="orchestrator",
         lease_ttl_s=20,
         clock=clock,
     )
+    control.register_plan(plan)
+    return control
 
 
 def result(item: SubagentContract, disposition=SubagentDisposition.COMPLETED):
     completed = disposition is SubagentDisposition.COMPLETED
+    scout_finding = (
+        ScoutFinding.create(
+            path="src/skharness/arena/swarm.py",
+            line=1,
+            detail="The immutable swarm contracts are defined in this module.",
+        )
+        if completed and item.role is SwarmRole.SCOUT
+        else None
+    )
     return SubagentResult.from_contract(
         item,
         disposition=disposition,
         summary="Bounded child work finished.",
         reason_codes=() if completed else ("blocked_dependency",),
-        evidence_refs=(DIGEST,) if completed else (),
+        evidence_refs=(
+            (DIGEST, scout_finding.digest)
+            if scout_finding is not None
+            else ((DIGEST,) if completed else ())
+        ),
         observed_commit="b" * 40 if completed and item.role is SwarmRole.BUILDER else None,
+        scout_assessment=(
+            ScoutAssessment.ACTIONABLE
+            if completed and item.role is SwarmRole.SCOUT
+            else (ScoutAssessment.BLOCKED if item.role is SwarmRole.SCOUT else None)
+        ),
+        scout_findings=(scout_finding,) if scout_finding is not None else (),
         started_at=NOW,
         finished_at=NOW + timedelta(seconds=5),
     )
@@ -121,8 +190,9 @@ def result(item: SubagentContract, disposition=SubagentDisposition.COMPLETED):
 
 def test_admission_is_contract_bound_and_duplicate_delivery_is_idempotent():
     clock = Clock()
-    control = scheduler(clock)
-    scout = contract("scout")
+    plan = root_plan(("scout", SwarmRole.SCOUT), ("other", SwarmRole.SCOUT))
+    control = scheduler(clock, plan)
+    scout = contract("scout", plan=plan)
     control.register(scout)
     first = control.admit(scout.contract_id, idempotency_key="delivery-1")
     duplicate = control.admit(scout.contract_id, idempotency_key="delivery-1")
@@ -130,7 +200,7 @@ def test_admission_is_contract_bound_and_duplicate_delivery_is_idempotent():
     assert duplicate.admitted and duplicate.duplicate
     assert duplicate.lease is first.lease
 
-    other = contract("other")
+    other = contract("other", plan=plan)
     control.register(other)
     collision = control.admit(other.contract_id, idempotency_key="delivery-1")
     assert not collision.admitted
@@ -139,8 +209,9 @@ def test_admission_is_contract_bound_and_duplicate_delivery_is_idempotent():
 
 def test_concurrent_duplicate_admission_creates_one_worker_lease():
     clock = Clock()
-    control = scheduler(clock)
-    scout = contract("scout")
+    plan = root_plan(("scout", SwarmRole.SCOUT))
+    control = scheduler(clock, plan)
+    scout = contract("scout", plan=plan)
     control.register(scout)
     with ThreadPoolExecutor(max_workers=8) as pool:
         admissions = list(
@@ -156,11 +227,22 @@ def test_concurrent_duplicate_admission_creates_one_worker_lease():
 
 def test_write_ownership_conflicts_only_inside_the_same_worktree():
     clock = Clock()
-    control = scheduler(clock)
-    first = contract("builder-a", role=SwarmRole.BUILDER, paths=("src/skharness",))
-    overlap = contract("builder-b", role=SwarmRole.BUILDER, paths=("src/skharness/arena",))
+    plan = root_plan(
+        ("builder-a", SwarmRole.BUILDER),
+        ("builder-b", SwarmRole.BUILDER),
+        ("builder-c", SwarmRole.BUILDER),
+    )
+    control = scheduler(clock, plan)
+    first = contract("builder-a", plan=plan, role=SwarmRole.BUILDER, paths=("src/skharness",))
+    overlap = contract(
+        "builder-b",
+        plan=plan,
+        role=SwarmRole.BUILDER,
+        paths=("src/skharness/arena",),
+    )
     isolated = contract(
         "builder-c",
+        plan=plan,
         role=SwarmRole.BUILDER,
         worktree="isolated-c",
         paths=("src/skharness/arena",),
@@ -176,9 +258,10 @@ def test_write_ownership_conflicts_only_inside_the_same_worktree():
 
 def test_global_budget_is_reserved_before_workers_start_and_released_at_actual_usage():
     clock = Clock()
-    control = scheduler(clock, wall_seconds=100, max_concurrency=2)
-    first = contract("first", seconds=60)
-    second = contract("second", seconds=60)
+    plan = root_plan(("first", SwarmRole.SCOUT), ("second", SwarmRole.SCOUT))
+    control = scheduler(clock, plan, wall_seconds=100, max_concurrency=2)
+    first = contract("first", plan=plan, seconds=60)
+    second = contract("second", plan=plan, seconds=60)
     control.register(first)
     control.register(second)
     first_lease = control.admit(first.contract_id, idempotency_key="first").lease
@@ -195,8 +278,9 @@ def test_global_budget_is_reserved_before_workers_start_and_released_at_actual_u
 
 def test_usage_delivery_is_idempotent_and_cannot_exceed_child_reservation():
     clock = Clock()
-    control = scheduler(clock)
-    scout = contract("scout")
+    plan = root_plan(("scout", SwarmRole.SCOUT))
+    control = scheduler(clock, plan)
+    scout = contract("scout", plan=plan)
     control.register(scout)
     lease = control.admit(scout.contract_id, idempotency_key="scout").lease
     delta = BudgetUsage(tokens=100, tool_calls=3, cost=0.1)
@@ -219,8 +303,9 @@ def test_usage_delivery_is_idempotent_and_cannot_exceed_child_reservation():
 
 def test_heartbeat_never_extends_hard_deadline_and_timeout_releases_authority():
     clock = Clock()
-    control = scheduler(clock)
-    scout = contract("scout", seconds=25)
+    plan = root_plan(("scout", SwarmRole.SCOUT))
+    control = scheduler(clock, plan)
+    scout = contract("scout", plan=plan, seconds=25)
     control.register(scout)
     lease = control.admit(scout.contract_id, idempotency_key="scout").lease
     clock.now += 15
@@ -238,10 +323,15 @@ def test_heartbeat_never_extends_hard_deadline_and_timeout_releases_authority():
 
 def test_team_cancellation_is_cascading_idempotent_and_closes_admission():
     clock = Clock()
-    control = scheduler(clock)
-    first = contract("first")
-    second = contract("second")
-    third = contract("third")
+    plan = root_plan(
+        ("first", SwarmRole.SCOUT),
+        ("second", SwarmRole.SCOUT),
+        ("third", SwarmRole.SCOUT),
+    )
+    control = scheduler(clock, plan)
+    first = contract("first", plan=plan)
+    second = contract("second", plan=plan)
+    third = contract("third", plan=plan)
     for item in (first, second, third):
         control.register(item)
     control.admit(first.contract_id, idempotency_key="first")
@@ -257,9 +347,10 @@ def test_team_cancellation_is_cascading_idempotent_and_closes_admission():
 
 def test_completion_requires_exact_structured_contract_result():
     clock = Clock()
-    control = scheduler(clock)
-    scout = contract("scout")
-    other = contract("other")
+    plan = root_plan(("scout", SwarmRole.SCOUT), ("other", SwarmRole.SCOUT))
+    control = scheduler(clock, plan)
+    scout = contract("scout", plan=plan)
+    other = contract("other", plan=plan)
     control.register(scout)
     lease = control.admit(scout.contract_id, idempotency_key="scout").lease
     with pytest.raises(SwarmStateError, match="exact worker contract"):
@@ -270,9 +361,66 @@ def test_completion_requires_exact_structured_contract_result():
     assert control.snapshot()["active_workers"] == 0
 
 
-def test_restart_recovers_lease_budget_write_scope_and_idempotency(tmp_path):
+def test_terminal_overage_is_retained_capped_and_accepts_failed_result():
     clock = Clock()
-    path = tmp_path / "swarm-control.json"
+    plan = root_plan(("builder", SwarmRole.BUILDER))
+    control = scheduler(clock, plan)
+    builder = contract("builder", plan=plan, role=SwarmRole.BUILDER)
+    control.register(builder)
+    lease = control.admit(builder.contract_id, idempotency_key="builder").lease
+    observed = BudgetUsage(
+        wall_seconds=75,
+        tokens=1_500,
+        tool_calls=25,
+        cost=1.5,
+    )
+
+    settlement = control.observe_terminal_usage(
+        lease.lease_id,
+        observed,
+        delivery_id="terminal-builder",
+    )
+
+    assert isinstance(settlement, UsageSettlement)
+    assert settlement.over_budget
+    assert settlement.observed == observed
+    assert settlement.accounted == BudgetUsage(
+        wall_seconds=60,
+        tokens=1_000,
+        tool_calls=20,
+        cost=1.0,
+    )
+    assert settlement.overage_dimensions == (
+        "wall_seconds",
+        "tokens",
+        "tool_calls",
+        "cost",
+    )
+    assert lease.state is WorkerLeaseState.OVER_BUDGET
+    duplicate = control.observe_terminal_usage(
+        lease.lease_id,
+        observed,
+        delivery_id="terminal-builder",
+    )
+    assert duplicate.duplicate
+
+    failed = SubagentResult.from_contract(
+        builder,
+        disposition=SubagentDisposition.FAILED,
+        summary="Worker exceeded its immutable execution budget.",
+        reason_codes=("budget_exceeded:wall_seconds,tokens,tool_calls,cost",),
+        started_at=NOW,
+        finished_at=NOW + timedelta(seconds=75),
+    )
+    assert control.record_terminal_result(lease.lease_id, failed).result == failed
+    consumed = control.snapshot()["budget"]["consumed"]
+    assert consumed == settlement.accounted.model_dump(mode="json")
+
+
+def test_late_timed_out_usage_and_stop_request_survive_restart(tmp_path):
+    clock = Clock()
+    path = tmp_path / "late-terminal-usage.json"
+    plan = root_plan(("builder", SwarmRole.BUILDER))
     control = SwarmScheduler(
         team_budget(),
         identity=identity(),
@@ -281,9 +429,189 @@ def test_restart_recovers_lease_budget_write_scope_and_idempotency(tmp_path):
         clock=clock,
         state_path=path,
     )
-    builder = contract("builder", role=SwarmRole.BUILDER)
+    control.register_plan(plan)
+    builder = contract(
+        "builder",
+        plan=plan,
+        role=SwarmRole.BUILDER,
+        seconds=5,
+    )
+    control.register(builder)
+    lease = control.admit(builder.contract_id, idempotency_key="builder").lease
+    clock.now += 6
+    assert control.reap_timeouts() == (lease.lease_id,)
+
+    observed = BudgetUsage(
+        wall_seconds=6,
+        tokens=1_250,
+        tool_calls=23,
+        cost=0.5,
+    )
+    settlement = control.observe_terminal_usage(
+        lease.lease_id,
+        observed,
+        delivery_id="late-builder-usage",
+    )
+    assert settlement.overage_dimensions == (
+        "wall_seconds",
+        "tokens",
+        "tool_calls",
+    )
+    failed = SubagentResult.from_contract(
+        builder,
+        disposition=SubagentDisposition.FAILED,
+        summary="Timed-out worker reported a terminal budget overage.",
+        reason_codes=(
+            "hard_deadline_exceeded",
+            "budget_exceeded:wall_seconds,tokens,tool_calls",
+        ),
+        controller_terminal_reason="hard_deadline_exceeded",
+        started_at=NOW,
+        finished_at=NOW + timedelta(seconds=6),
+    )
+    control.record_terminal_result(lease.lease_id, failed)
+
+    recovered = SwarmScheduler.recover(path, clock=clock)
+    recovered_lease = recovered.lease(lease.lease_id)
+    assert recovered_lease.state is WorkerLeaseState.TIMED_OUT
+    assert recovered_lease.usage.tokens == 1_250
+    assert recovered_lease.usage.tool_calls == 23
+    assert recovered_lease.settled_usage.tokens == 1_000
+    assert recovered_lease.settled_usage.tool_calls == 20
+    assert recovered_lease.result == failed
+    assert recovered.stop_requests() == (lease.lease_id,)
+
+    assert recovered.acknowledge_stopped(lease.lease_id)
+    acknowledged = SwarmScheduler.recover(path, clock=clock)
+    assert acknowledged.stop_requests() == ()
+
+
+def test_cancelled_stop_and_structured_failure_survive_restart(tmp_path):
+    clock = Clock()
+    path = tmp_path / "cancelled-worker.json"
+    plan = root_plan(("builder", SwarmRole.BUILDER))
+    control = SwarmScheduler(
+        team_budget(),
+        identity=identity(),
+        orchestrator_id="orchestrator",
+        lease_ttl_s=20,
+        clock=clock,
+        state_path=path,
+    )
+    control.register_plan(plan)
+    builder = contract("builder", plan=plan, role=SwarmRole.BUILDER)
+    control.register(builder)
+    lease = control.admit(builder.contract_id, idempotency_key="builder").lease
+    assert control.cancel_worker(lease.lease_id, reason="operator_cancelled") == (lease.lease_id,)
+    failed = SubagentResult.from_contract(
+        builder,
+        disposition=SubagentDisposition.FAILED,
+        summary="Controller cancelled the bounded worker.",
+        reason_codes=("operator_cancelled",),
+        controller_terminal_reason="operator_cancelled",
+        started_at=NOW,
+        finished_at=NOW + timedelta(seconds=1),
+    )
+    control.record_terminal_result(lease.lease_id, failed)
+
+    recovered = SwarmScheduler.recover(path, clock=clock)
+    assert recovered.lease(lease.lease_id).state is WorkerLeaseState.CANCELLED
+    assert recovered.lease(lease.lease_id).result == failed
+    assert recovered.stop_requests() == (lease.lease_id,)
+
+
+def test_downstream_authorization_is_scheduler_owned_and_restart_safe(tmp_path):
+    clock = Clock()
+    path = tmp_path / "phase-authorization.json"
+    plan = scout_builder_plan()
+    control = SwarmScheduler(
+        team_budget(),
+        identity=identity(),
+        orchestrator_id="orchestrator",
+        lease_ttl_s=20,
+        clock=clock,
+        state_path=path,
+    )
+    control.register_plan(plan)
+    scout = contract("scout", plan=plan)
+    control.register(scout)
+    scout_lease = control.admit(scout.contract_id, idempotency_key="scout").lease
+    scout_result = result(scout)
+    control.complete(scout_lease.lease_id, scout_result)
+    receipt = control.record_phase_receipt(
+        scout_lease.lease_id,
+        recorded_at=NOW + timedelta(seconds=6),
+    )
+
+    builder = bind_phase_inputs(
+        contract("builder", plan=plan, role=SwarmRole.BUILDER),
+        (receipt,),
+        plan=plan,
+        bound_at=NOW + timedelta(seconds=7),
+    )
+    control.register(builder)
+    missing = control.admit(builder.contract_id, idempotency_key="builder")
+    assert missing.reason is SwarmAdmissionReason.AUTHORIZATION
+
+    unowned = PhaseAuthorization.issue(
+        builder,
+        (receipt,),
+        authorized_by="orchestrator",
+        authorized_at=NOW + timedelta(seconds=8),
+    )
+    denied = control.admit(
+        builder.contract_id,
+        idempotency_key="builder",
+        authorization=unowned,
+    )
+    assert denied.reason is SwarmAdmissionReason.AUTHORIZATION
+    assert "not issued by this scheduler" in denied.detail
+
+    authorization = control.issue_phase_authorization(
+        builder.contract_id,
+        predecessor_receipt_hashes=(receipt.content_hash,),
+        authorized_at=NOW + timedelta(seconds=8),
+    )
+    admitted = control.admit(
+        builder.contract_id,
+        idempotency_key="builder",
+        authorization=authorization,
+    )
+    assert admitted.admitted
+
+    recovered = SwarmScheduler.recover(path, clock=clock)
+    duplicate = recovered.admit(
+        builder.contract_id,
+        idempotency_key="builder",
+        authorization=authorization,
+    )
+    assert duplicate.admitted and duplicate.duplicate
+    checkpoint = json.loads(path.read_text())["state"]
+    assert checkpoint["consumed_authorizations"] == {authorization.content_hash: builder.lease_id}
+
+
+def test_restart_recovers_lease_budget_write_scope_and_idempotency(tmp_path):
+    clock = Clock()
+    path = tmp_path / "swarm-control.json"
+    plan = root_plan(
+        ("builder", SwarmRole.BUILDER),
+        ("overlap", SwarmRole.BUILDER),
+    )
+    control = SwarmScheduler(
+        team_budget(),
+        identity=identity(),
+        orchestrator_id="orchestrator",
+        lease_ttl_s=20,
+        clock=clock,
+        state_path=path,
+    )
+    control.register_plan(plan)
+    builder = contract("builder", plan=plan, role=SwarmRole.BUILDER)
     overlap = contract(
-        "overlap", role=SwarmRole.BUILDER, paths=("src/skharness/arena/swarm.py",)
+        "overlap",
+        plan=plan,
+        role=SwarmRole.BUILDER,
+        paths=("src/skharness/arena/swarm.py",),
     )
     control.register(builder)
     control.register(overlap)
@@ -312,6 +640,7 @@ def test_restart_recovers_lease_budget_write_scope_and_idempotency(tmp_path):
 def test_corrupt_restart_checkpoint_fails_closed(tmp_path):
     clock = Clock()
     path = tmp_path / "swarm-control.json"
+    plan = root_plan(("scout", SwarmRole.SCOUT))
     control = SwarmScheduler(
         team_budget(),
         identity=identity(),
@@ -319,7 +648,8 @@ def test_corrupt_restart_checkpoint_fails_closed(tmp_path):
         clock=clock,
         state_path=path,
     )
-    control.register(contract("scout"))
+    control.register_plan(plan)
+    control.register(contract("scout", plan=plan))
     envelope = json.loads(path.read_text())
     envelope["state"]["orchestrator_id"] = "attacker"
     path.write_text(json.dumps(envelope))
@@ -329,7 +659,8 @@ def test_corrupt_restart_checkpoint_fails_closed(tmp_path):
 
 def test_contract_from_another_team_or_identity_is_rejected():
     clock = Clock()
-    control = scheduler(clock)
-    foreign = contract("foreign").model_copy(update={"team_id": "other-team"})
+    plan = root_plan(("foreign", SwarmRole.SCOUT))
+    control = scheduler(clock, plan)
+    foreign = contract("foreign", plan=plan).model_copy(update={"team_id": "other-team"})
     with pytest.raises(SwarmContractError, match="team_id"):
         control.register(foreign)

@@ -11,14 +11,22 @@ from skharness.arena import (
     BudgetExceededError,
     BudgetUsage,
     ExecutionBudget,
+    PhaseAuthorization,
+    PhaseInput,
+    PhaseReceipt,
+    ScoutAssessment,
+    ScoutFinding,
     SubagentContract,
     SubagentDisposition,
     SubagentResult,
     SwarmContractError,
     SwarmIdentity,
+    SwarmPhaseSpec,
+    SwarmPlan,
     SwarmRole,
     TeamBudget,
     TeamBudgetLedger,
+    bind_phase_inputs,
 )
 
 NOW = datetime(2026, 8, 21, tzinfo=timezone.utc)
@@ -52,6 +60,8 @@ def contract(
         contract_id=identifier,
         team_id="team-1",
         identity=identity(),
+        plan_hash=OTHER_DIGEST,
+        phase_id=f"phase-{role.value}",
         parent_agent_id="orchestrator-1",
         child_agent_id=f"agent-{identifier}",
         role=role,
@@ -283,3 +293,106 @@ def test_same_worktree_builders_require_exclusive_write_scopes():
             worktree_id="worktree-isolated",
         )
     )
+
+
+def test_downstream_contract_binds_exact_completed_phase_receipt():
+    plan = SwarmPlan(
+        plan_id="plan-lineage",
+        identity=identity(),
+        phases=(
+            SwarmPhaseSpec(
+                phase_id="phase-scout",
+                role=SwarmRole.SCOUT,
+                contract_ids=("scout",),
+            ),
+            SwarmPhaseSpec(
+                phase_id="phase-builder",
+                role=SwarmRole.BUILDER,
+                contract_ids=("builder",),
+                predecessor_phase_ids=("phase-scout",),
+            ),
+        ),
+        created_at=NOW,
+    )
+    scout = SubagentContract.model_validate(
+        contract("scout").model_dump()
+        | {"plan_hash": plan.content_hash, "phase_id": "phase-scout"}
+    )
+    builder = SubagentContract.model_validate(
+        contract("builder", role=SwarmRole.BUILDER).model_dump()
+        | {"plan_hash": plan.content_hash, "phase_id": "phase-builder"}
+    )
+    scout_result = SubagentResult.from_contract(
+        scout,
+        disposition=SubagentDisposition.COMPLETED,
+        summary="Inspection produced actionable evidence.",
+        evidence_refs=(
+            OTHER_DIGEST,
+            ScoutFinding.create(
+                path="src/skharness/arena/swarm.py",
+                line=129,
+                detail="Contract phase lineage requires an upstream receipt.",
+            ).digest,
+        ),
+        scout_assessment=ScoutAssessment.ACTIONABLE,
+        scout_findings=(
+            ScoutFinding.create(
+                path="src/skharness/arena/swarm.py",
+                line=129,
+                detail="Contract phase lineage requires an upstream receipt.",
+            ),
+        ),
+        started_at=NOW,
+        finished_at=NOW,
+    )
+    receipt = PhaseReceipt.from_result(scout, scout_result, recorded_at=NOW)
+    bound = bind_phase_inputs(builder, (receipt,), plan=plan, bound_at=NOW)
+
+    assert bound.content_hash != builder.content_hash
+    assert bound.input_result_hashes == (scout_result.content_hash,)
+    assert OTHER_DIGEST in bound.input_evidence_refs
+    assert bound.phase_inputs[0].source_receipt_hash == receipt.content_hash
+    authorization = PhaseAuthorization.issue(
+        bound,
+        (receipt,),
+        authorized_by="orchestrator-1",
+        authorized_at=NOW,
+    )
+    authorization.require_contract(bound, orchestrator_id="orchestrator-1")
+
+    tampered_input = PhaseInput.model_validate(
+        bound.phase_inputs[0].model_dump() | {"source_result_hash": DIGEST}
+    )
+    tampered = SubagentContract.model_validate(
+        bound.model_dump() | {"phase_inputs": (tampered_input,)}
+    )
+    assert tampered.content_hash != bound.content_hash
+    with pytest.raises(SwarmContractError, match="do not match observed"):
+        bind_phase_inputs(tampered, (receipt,), plan=plan, bound_at=NOW)
+
+
+def test_downstream_binding_rejects_missing_or_nonactionable_predecessors():
+    plan = SwarmPlan(
+        plan_id="plan-fail-closed",
+        identity=identity(),
+        phases=(
+            SwarmPhaseSpec(
+                phase_id="phase-scout",
+                role=SwarmRole.SCOUT,
+                contract_ids=("scout",),
+            ),
+            SwarmPhaseSpec(
+                phase_id="phase-builder",
+                role=SwarmRole.BUILDER,
+                contract_ids=("builder",),
+                predecessor_phase_ids=("phase-scout",),
+            ),
+        ),
+        created_at=NOW,
+    )
+    builder = SubagentContract.model_validate(
+        contract("builder", role=SwarmRole.BUILDER).model_dump()
+        | {"plan_hash": plan.content_hash, "phase_id": "phase-builder"}
+    )
+    with pytest.raises(SwarmContractError, match="exact plan cardinality"):
+        bind_phase_inputs(builder, (), plan=plan, bound_at=NOW)

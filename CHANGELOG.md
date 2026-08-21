@@ -16,12 +16,25 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ### Fixed
 
+- Closed the fail-open phase boundary found by the first live L-card Pi swarm trial.
+  Timed-out or missing scout results can no longer vacuously admit a builder; terminal
+  overage/late usage is retained, cancellation remains restart-safe, and failures
+  return structured negative reports instead of escaping the orchestrator.
 - Removed the fleet qualifier's accidental dependency on a host-global Pi executable.
   Fleet qualification continues to check and execute the integrity-pinned Pi inside the
   selected worker image; the host-level mock-gateway contract remains in CI.
 - Made fleet preflight use the invoking Python environment, inventory Wolfi packages
   with `apk` (while retaining Debian fallback), and accept gateway-authenticated
   served-model attribution when Pi's optional `responseModel` field is absent.
+
+### Architecture
+
+- Added trusted Pi team orchestration with immutable phase plans, typed path-scoped
+  scout findings, scheduler-owned receipts, one-use downstream authorizations,
+  parent/child A2A evidence, exact global budgets, and an independent verifier binding
+  the plan, ordered lineage, final commit, and acceptance evidence. S cards remain
+  single-builder; M cards use scout/build/test; L cards may parallelize read-only scouts
+  but retain one writer until a trusted integration stage exists.
 
 ## [0.3.28] - 2026-08-20
 

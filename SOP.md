@@ -243,23 +243,59 @@ syntax in neighboring `sed`/`awk` commands is not treated as a path.
 
 Use `SwarmTopologyPolicy` before allocating workers. S cards remain a single builder
 unless inspection proves independent workstreams; M cards use scout -> builder ->
-tester; L/cross-repository cards may use up to two scouts and three isolated builders,
-followed by a tester. The trusted `TrustedSwarmOrchestrator` owns ordering and delegates
-only immutable `SubagentContract` objects bound to the card hash, base commit, evidence
-ID, trajectory ID, lease, worktree, paths, tools, and child budget.
+tester; L/cross-repository cards may use up to two read-only scouts followed by one
+builder and one tester. Multiple isolated builders remain disabled until a trusted
+controller-owned integration/cherry-pick stage can join divergent commits. The trusted
+`TrustedSwarmOrchestrator` owns ordering and delegates only immutable
+`SubagentContract` objects bound to the card hash, base commit, evidence ID, trajectory
+ID, plan, phase, lease, worktree, paths, tools, and child budget.
+
+```mermaid
+flowchart LR
+    Plan["immutable SwarmPlan"] --> Scout["scout lease(s)<br/>read-only"]
+    Scout --> Receipt["scheduler-owned<br/>PhaseReceipt"]
+    Receipt --> Auth["one-use<br/>PhaseAuthorization"]
+    Auth --> Builder["builder lease<br/>declared writes only"]
+    Builder --> Test["tester lease<br/>read-only"]
+    Test --> Verify["independent verifier<br/>plan + lineage + final commit"]
+    Verify -->|approved| Disposition["controller final disposition"]
+    Verify -->|denied / absent| Stop["cancel + retain evidence"]
+```
+
+The plan declares the exact phase DAG and contract cardinality before the first lease.
+Every non-root admission consumes a one-use authorization minted from scheduler-owned
+predecessor receipts. A downstream contract therefore binds the exact prior result,
+receipt, evidence, typed scout findings, and commit hashes. Scouts must end with a
+machine-parsed `SCOUT_ASSESSMENT` and bounded repository-relative `SCOUT_FINDING`
+records. Exit zero or generic prose cannot mint build authority. Only validated finding
+fields—not arbitrary worker prose—are handed to the next Pi prompt.
 
 `SwarmScheduler` reserves the entire child budget before launch, rejects overlapping
 writes in one worktree, heartbeats leases without extending hard deadlines, persists
 stop requests, and recovers its content-checked checkpoint after restart. The runtime
 must kill every lease returned by cancellation/timeout and acknowledge that stop.
 Parent/child assignment and result messages are appended to the A2A journal; sibling
-or unrelated-agent messaging is not valid under these contracts.
+or unrelated-agent messaging is not valid under these contracts. Raw terminal usage is
+retained even when it exceeds the reservation or arrives after timeout; bounded ledger
+settlement is stored separately. A timeout, cancellation, overage, missing result, or
+wrong phase cardinality stops downstream admission and remains negative across restart.
 
 Never complete a card from worker prose, exit zero, or worker-authored tests.
-`SwarmCompletionGate` requires exact result hashes, an independent trusted verifier
-signature, and verifier-observed evidence for every criterion. A worker's negative
-`blocked`, `needs_input`, or `failed` report may ratchet trust downward; its
-`completed` report is evidence only and has no promotion authority.
+`SwarmCompletionGate` derives the expected result set from the immutable plan and
+requires a trusted independent signature over the plan hash, canonical receipt-lineage
+digest, unique final commit, exact planned result hashes, and verifier-observed evidence
+for every criterion. A worker's negative `blocked`, `needs_input`, or `failed` report
+may ratchet trust downward; its `completed` report is evidence only and has no promotion
+authority.
+
+The 2026-08-21 `.41` L-card trial found incident `1df443cb`: two scouts reached their
+hard deadlines without terminal results, the old empty-result check treated the phase
+as successful, and a builder was admitted without scout evidence. That run is failed
+evidence, not qualification. The invariant is now pinned by
+`test_missing_timed_out_scout_results_never_admit_builder` plus authorization,
+late-result, restart, and verifier-lineage tests. Fleet qualification must still rerun
+the same blocked-evidence scenario and prove that no builder starts before this incident
+can be closed.
 
 Passing `capability_profile=` to `PiAdapter` loads only the in-image SK bridge extension
 and emits Pi's explicit `--tools` allowlist. The extension calls
@@ -823,7 +859,7 @@ verdict, not an exception.
   detects staleness per node; it was not run across the fleet as part of this pass.
 
 <!-- docs-evidence
-verified: 2026-08-20
+verified: 2026-08-21
 checks:
   - name: console entry point still points at skharness.serve:main
     run: grep -q 'skcode-hostd = "skharness.serve:main"' pyproject.toml
@@ -855,4 +891,6 @@ checks:
     run: grep -qF 'if grade is None:' src/skharness/autocode/buckets.py && grep -qF 'return None' src/skharness/autocode/buckets.py && grep -qF 'dispatch_model = self._dispatch_model(item)' src/skharness/autocode/engineering.py
   - name: continual harness architecture and canonical epic remain discoverable
     run: test -f docs/architecture/continual-harness.md && grep -qF 'Canonical epic: `4aca533c`' docs/architecture/continual-harness.md
+  - name: Pi swarm phase admission remains evidence-bound and verifier-gated
+    run: grep -qF 'class PhaseAuthorization' src/skharness/arena/swarm.py && grep -qF 'def record_phase_receipt' src/skharness/arena/swarm_control.py && grep -qF 'def phase_lineage_digest' src/skharness/arena/swarm_verifier.py && grep -qF 'test_missing_timed_out_scout_results_never_admit_builder' tests/test_arena_swarm_orchestrator.py
 -->
