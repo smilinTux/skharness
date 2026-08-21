@@ -404,11 +404,22 @@ state. Incident `1df443cb` owns the remediation.
 
 The corrected boundary requires exact phase result cardinality, actionable typed scout
 evidence, scheduler-owned receipts, and one-use downstream authorization. It retains
-late and over-budget metrics without changing negative finality. Local tests prove the
-contract; they do not turn the failed `.41` run into a pass. Closure still requires a
-fresh `.41` run showing that unavailable cross-repository/live evidence terminates at
-the scout phase, starts no builder, leaves no worker container, and keeps the worktree
-clean.
+late and over-budget metrics without changing negative finality. A fresh `.41` run at
+commit `3bfe5b4` exercised the same unavailable cross-repository/live-evidence case.
+Exactly two scout assignments were journaled; both returned bounded negative results,
+and the orchestrator emitted no builder/tester assignment, phase receipt, or downstream
+authorization. Completion remained denied, the team was cancelled, measured usage was
+retained, all run-owned containers were removed, and the worktree remained clean. The
+evidence and limits of that claim are recorded in
+`docs/evidence/1df443cb-pi-swarm-41.md`.
+
+The run also distinguishes tool envelopes from guarded discovery operations. Pi emitted
+4 and 7 tool-start envelopes, while command-aware parsing found 9 and 10 discovery
+subcommands inside compound shell invocations and enforced the immutable ceiling of 8.
+This was a real budget denial, not the earlier regex-as-path false positive. Both partial
+runs lacked a provider-owned served-model field, so the evidence binds the requested
+model only; canonical SKGateway request/backend/served-model joins remain owned by card
+`d3c6377a`.
 
 Implementation truth (repository audit, 2026-08-20): the Dockerfile now pins a Wolfi
 base digest, exact direct APKs, the Pi/npm graph, and hashed Python wheels. Core omits

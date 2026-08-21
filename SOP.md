@@ -293,9 +293,13 @@ hard deadlines without terminal results, the old empty-result check treated the 
 as successful, and a builder was admitted without scout evidence. That run is failed
 evidence, not qualification. The invariant is now pinned by
 `test_missing_timed_out_scout_results_never_admit_builder` plus authorization,
-late-result, restart, and verifier-lineage tests. Fleet qualification must still rerun
-the same blocked-evidence scenario and prove that no builder starts before this incident
-can be closed.
+late-result, restart, and verifier-lineage tests. The corrected `.41` rerun at commit
+`3bfe5b4` admitted only the two read-only scouts. Both were stopped by their bounded
+inspection policy, no builder/tester assignment, phase receipt, or downstream
+authorization was issued, completion remained denied, all measured usage was settled,
+no worker container remained, and the worktree stayed clean. The signed-off measurements
+and raw-evidence hashes are in `docs/evidence/1df443cb-pi-swarm-41.md`. This closes the
+fail-open incident; it does not complete the separate S/M/L quality evaluation.
 
 Passing `capability_profile=` to `PiAdapter` loads only the in-image SK bridge extension
 and emits Pi's explicit `--tools` allowlist. The extension calls

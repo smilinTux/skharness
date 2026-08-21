@@ -19,7 +19,9 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 - Closed the fail-open phase boundary found by the first live L-card Pi swarm trial.
   Timed-out or missing scout results can no longer vacuously admit a builder; terminal
   overage/late usage is retained, cancellation remains restart-safe, and failures
-  return structured negative reports instead of escaping the orchestrator.
+  return structured negative reports instead of escaping the orchestrator. A corrected
+  `.41` rerun admitted only two bounded scouts, issued no downstream authorization, and
+  left both containers and the worktree clean.
 - Removed the fleet qualifier's accidental dependency on a host-global Pi executable.
   Fleet qualification continues to check and execute the integrity-pinned Pi inside the
   selected worker image; the host-level mock-gateway contract remains in CI.
