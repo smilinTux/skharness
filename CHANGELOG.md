@@ -9,6 +9,12 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ## [Unreleased]
 
+### Fixed
+
+- Removed the fleet qualifier's accidental dependency on a host-global Pi executable.
+  Fleet qualification continues to check and execute the integrity-pinned Pi inside the
+  selected worker image; the host-level mock-gateway contract remains in CI.
+
 ## [0.3.28] - 2026-08-20
 
 ### Fixed

@@ -385,6 +385,12 @@ restart result, and health evidence. A code pull alone is not a deployment. If e
 node is dirty, unreachable, cannot fast-forward, or fails readiness, leave the prior
 service running where safe and open/update an incident with the observed evidence.
 
+The Arena qualifier intentionally does not require a host-global `pi` executable.
+Pi is an image-owned, integrity-pinned runtime: qualification checks its version inside
+the selected image and the live gate executes every attributed worker through that
+image. `tests/test_pi_mock_gateway_it.py` remains a CI contract test (CI provisions the
+pinned fixture explicitly), but it is not part of the fleet host preflight.
+
 ### Service deploy (`skcode-hostd`)
 
 The unit is a **systemd user unit**, installed from the repo and never auto-started.

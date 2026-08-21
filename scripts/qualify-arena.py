@@ -539,7 +539,6 @@ def main() -> int:
                 "pytest",
                 "tests/test_arena_qualification.py",
                 "tests/test_arena_sk_backend.py",
-                "tests/test_pi_mock_gateway_it.py",
                 "tests/test_arena_verifier.py",
                 "tests/test_arena_controller.py",
                 "tests/test_arena_scheduler.py",
