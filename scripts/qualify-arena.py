@@ -10,6 +10,7 @@ import json
 import os
 import platform
 import subprocess
+import sys
 import tempfile
 import threading
 from copy import deepcopy
@@ -534,7 +535,7 @@ def main() -> int:
     checks = [
         command(
             [
-                "python",
+                sys.executable,
                 "-m",
                 "pytest",
                 "tests/test_arena_qualification.py",
@@ -559,7 +560,19 @@ def main() -> int:
                 "print(json.dumps(sorted((d.metadata['Name'],d.version) for d in m.distributions())))",
             ]
         ),
-        command(["docker", "run", "--rm", args.image, "dpkg-query", "-W"]),
+        command(
+            [
+                "docker",
+                "run",
+                "--rm",
+                args.image,
+                "sh",
+                "-c",
+                "if command -v apk >/dev/null; then apk info -vv; "
+                "elif command -v dpkg-query >/dev/null; then dpkg-query -W; "
+                "else echo 'no supported package inventory tool' >&2; exit 1; fi",
+            ]
+        ),
     ]
     bundle = {
         "schema": "skharness.arena.qualification.v1",
@@ -632,7 +645,10 @@ def main() -> int:
                 and live["models"]["status"] == 200
                 and live["completion_status"] == 200
                 and live["pi"]["exit_code"] == 0
-                and bool(live["pi"]["responseModel"])
+                # Pi does not emit responseModel for every OpenAI-compatible
+                # response dialect. The relay-observed, gateway-authenticated
+                # served-model header is the canonical fallback provenance.
+                and bool(live["pi"]["responseModel"] or live["pi"]["served_model"])
                 and live["pi"]["completion_status"] == 200
                 and bool(live["pi"]["served_model"])
                 and bool(live["pi"]["output"])

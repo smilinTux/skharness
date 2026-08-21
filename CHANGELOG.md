@@ -14,6 +14,9 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 - Removed the fleet qualifier's accidental dependency on a host-global Pi executable.
   Fleet qualification continues to check and execute the integrity-pinned Pi inside the
   selected worker image; the host-level mock-gateway contract remains in CI.
+- Made fleet preflight use the invoking Python environment, inventory Wolfi packages
+  with `apk` (while retaining Debian fallback), and accept gateway-authenticated
+  served-model attribution when Pi's optional `responseModel` field is absent.
 
 ## [0.3.28] - 2026-08-20
 
