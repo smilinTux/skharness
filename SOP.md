@@ -694,8 +694,9 @@ unaffected service.
 
 ```bash
 skharness_repo=/home/cbrd21/clawd/skcapstone-repos/skharness
-skharness_venv_python=/home/cbrd21/.venvs/skops/bin/python
-skharness_tag=v0.3.38
+skharness_venv=/home/cbrd21/.venvs/skops
+skharness_venv_python="$skharness_venv/bin/python"
+skharness_tag=v0.3.39
 
 test -z "$(git -C "$skharness_repo" status --porcelain --untracked-files=all)"
 git -C "$skharness_repo" fetch --tags origin
@@ -703,7 +704,9 @@ skharness_tag_commit="$(git -C "$skharness_repo" rev-parse "${skharness_tag}^{co
 git -C "$skharness_repo" merge --ff-only "$skharness_tag_commit"
 test "$(git -C "$skharness_repo" rev-parse HEAD)" = "$skharness_tag_commit"
 
-"$skharness_venv_python" -m pip install --no-deps --no-build-isolation -e "$skharness_repo"
+SKOPS_VENV="$skharness_venv" \
+  "$skharness_repo/systemd/install-skops-runtime.sh"
+"$skharness_venv_python" -m pip check
 SKHARNESS_DEPLOY_TAG="$skharness_tag" \
 SKHARNESS_DEPLOY_REPO="$skharness_repo" \
   "$skharness_venv_python" - <<'PY'
@@ -734,9 +737,20 @@ systemctl --user is-active --quiet skcode-hostd
 test -z "$(git -C "$skharness_repo" status --porcelain --untracked-files=all)"
 ```
 
+Use the owned installer for the tagged path as well as ordinary fleet updates. Python
+3.12 operational venvs need not carry `setuptools.build_meta`; the installer uses an
+isolated build environment for editable metadata, installs the declared service/SKOS
+dependencies, and runs `pip check` plus both CLI probes. Do not replace it with a direct
+`pip install --no-deps --no-build-isolation`: that both requires build tooling in the
+runtime venv and can omit a newly declared runtime dependency. The exact tag/package/
+module-path assertions above remain the release-identity gate before restart.
+
 Record the exact tag/commit and the metadata/module-path assertions without printing
-the service environment or any credential. On 2026-08-21, `.41` passed this contract
-at `v0.3.38` / `2e8e4d89aac1967fb297c0558b311998a9bc1e9a`.
+the service environment or any credential. On 2026-08-21, `.41` passed the original
+contract at `v0.3.38` / `2e8e4d89aac1967fb297c0558b311998a9bc1e9a`, then
+passed the corrected owned-installer contract at `v0.3.39` /
+`1b9b4b5bb55df02ec33872af2448b464f0f20807` after the direct no-build-isolation
+attempt stopped before restart.
 
 The two current qualification targets have deliberately different roles. Do not infer
 GPU capability from an address or reuse one node's readiness criteria for the other:

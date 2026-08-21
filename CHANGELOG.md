@@ -60,6 +60,12 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ### Fixed
 
+- Corrected the tagged editable `.41` deployment path after the `v0.3.39` Git
+  fetch/fast-forward succeeded but its direct `--no-deps --no-build-isolation` install
+  stopped safely before service restart because the operational Python 3.12 venv did
+  not contain `setuptools.build_meta`. Tagged deployments now invoke the owned SKOps
+  runtime installer with an explicit venv, retaining declared dependency installation,
+  `pip check`, CLI probes, and the exact tag/package/module-path gate.
 - Closed the Pi image package-provenance gap exposed by `v0.3.36`: release builds now
   require one exact non-zero SemVer/tag/full-commit contract, use it for
   `setuptools-scm`, bake it into an image provenance record and OCI labels, and make
