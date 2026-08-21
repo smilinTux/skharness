@@ -412,6 +412,18 @@ def test_arena_build_inspection_budget_scales_with_card_size(tmp_path, size, max
     assert spec.inspection_scope == InspectionScope(root="/work", max_calls=max_calls)
 
 
+def test_arena_verify_is_read_only_but_keeps_bounded_inspection(tmp_path):
+    adapter = PiAdapter(
+        Sandbox(), model="verify", base_url="http://gateway/v1", capability_profile="arena-verify"
+    )
+    spec = pi_launch_spec(
+        adapter, prompt="verify", worktree=str(tmp_path), card_size=CardSize.MEDIUM
+    )
+    assert spec.inspection_scope == InspectionScope(root="/work", max_calls=48)
+    tools = spec.argv[spec.argv.index("--tools") + 1].split(",")
+    assert "edit" not in tools and "write" not in tools
+
+
 def test_inspection_monitor_emits_structured_denial_and_cancels(tmp_path):
     path = tmp_path / "stdout.log"
     path.write_bytes(_tool_start("bash", {"command": "find / -type f"}) + b"\n")

@@ -358,7 +358,7 @@ def pi_launch_spec(
         inspection_scope=(
             InspectionScope(max_calls={CardSize.SMALL: 24, CardSize.MEDIUM: 48,
                                        CardSize.LARGE: 80}.get(card_size, 24))
-            if adapter.capability_profile == "arena-build"
+            if adapter.capability_profile in {"arena-build", "arena-verify"}
             else None
         ),
     )
