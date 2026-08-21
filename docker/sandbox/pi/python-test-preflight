@@ -14,6 +14,7 @@ REQUIRED_MODULES = (
     "pytest",
     "pytest_asyncio",
     "pytest_mock",
+    "ruff",
     "skcapstone.coordination",
     "skcoord",
     "skharness",
@@ -50,7 +51,9 @@ def main() -> int:
 
     versions = {
         name: importlib.metadata.version(name)
-        for name in ("skharness", "pytest", "pytest-asyncio", "pytest-mock", "skcapstone", "skcoord")
+        for name in (
+            "skharness", "pytest", "pytest-asyncio", "pytest-mock", "ruff", "skcapstone", "skcoord"
+        )
     }
     print("skharness-pi-python-test qualified", " ".join(f"{k}={v}" for k, v in versions.items()))
     return 0

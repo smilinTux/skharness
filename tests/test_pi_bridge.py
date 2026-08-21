@@ -190,6 +190,7 @@ def test_python_test_target_is_project_qualified_and_published_like_other_images
         "jsonschema",
         "pytest-asyncio",
         "pytest-mock",
+        "ruff",
         "skcapstone",
         "skcoord",
         "skmemory",
