@@ -182,6 +182,42 @@ def test_normal_pi_terminal_event_with_zero_exit_remains_successful(tmp_path):
     assert outcome.classification == "exit"
 
 
+def test_pi_blocked_assessment_cannot_be_successful_on_zero_exit(tmp_path):
+    controller = _controller(tmp_path)
+    controller.propose("experiment")
+    stream = (
+        b'{"type":"message_end","message":{"role":"assistant",'
+        b'"stopReason":"stop","content":[{"type":"text",'
+        b'"text":"## Assessment\\n\\n**Status: BLOCKED - acceptance not met.**"}]}}\n'
+    )
+    outcome = PiExperimentRunner(
+        controller, ScriptedSupervisor(exit_code=0, stdout=stream), tmp_path / "runs"
+    ).execute(_request(), _spec(tmp_path))
+
+    assert not outcome.successful and outcome.partial
+    assert outcome.classification == "blocked"
+    assert outcome.disposition == "blocked"
+    event = controller.store.read_all_events()[-1]
+    assert event.to_state is ExperimentState.FAILED
+    assert event.payload["disposition"] == "blocked"
+
+
+def test_worker_text_can_only_ratchet_trust_down_not_claim_completion(tmp_path):
+    controller = _controller(tmp_path)
+    controller.propose("experiment")
+    stream = (
+        b'{"type":"message_end","message":{"role":"assistant",'
+        b'"stopReason":"stop","content":[{"type":"text",'
+        b'"text":"Status: COMPLETED by the worker"}]}}\n'
+    )
+    outcome = PiExperimentRunner(
+        controller, ScriptedSupervisor(exit_code=0, stdout=stream), tmp_path / "runs"
+    ).execute(_request(), _spec(tmp_path))
+
+    assert outcome.successful
+    assert outcome.disposition is None
+
+
 def test_corrupt_committed_event_tail_stops_restart_recovery(tmp_path):
     controller = _controller(tmp_path)
     controller.propose("experiment")

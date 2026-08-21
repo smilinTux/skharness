@@ -343,6 +343,29 @@ bounded reason, permitted root, call count, and limit. The policy covers direct 
 discovery tools and discovery invoked through `bash`, including the adversarial
 filesystem-wide commands observed in the `.41` trace.
 
+### Trusted swarm orchestration
+
+The Arena controller, not Pi, is the root orchestrator. Immutable swarm contracts bind
+each scout, builder, tester, and verifier to the same card hash, base commit, evidence
+ID, trajectory ID, parent, lease, path/tool scope, worktree, and budget. The scheduling
+control plane reserves aggregate team resources before process launch, rejects
+same-worktree write overlap, persists liveness and pending process-stop acknowledgments,
+and reconstructs them after restart. A2A records are limited to each parent/child edge
+and share the immutable trajectory identity.
+
+Role phases are scout -> build -> test. Workers within a phase may run concurrently
+only when their contracts and write scopes admit together. S cards default to one
+builder; M cards use one scout/builder/tester; L or cross-repository work may allocate
+bounded independent scouts/builders. Any non-completed phase cancels downstream work.
+The total team budget remains a hard global ceiling, rather than multiplying the
+single-worker budget by the number of children.
+
+Completion is a separate trust boundary. Worker summaries, zero exit, and
+worker-authored tests cannot authorize it. The independent completion gate binds the
+exact worker-result hashes and requires signed verifier-owned evidence for every
+acceptance criterion. Negative worker disposition can only reduce trust. This preserves
+the Arena's existing reward-gaming rule: model output never promotes itself.
+
 Implementation truth (repository audit, 2026-08-20): the Dockerfile now pins a Wolfi
 base digest, exact direct APKs, the Pi/npm graph, and hashed Python wheels. Core omits
 package/build managers; polyglot supplies verified Node/npm, Python/uv, Go, Rust/Cargo,

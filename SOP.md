@@ -239,6 +239,28 @@ not loosen this to accommodate a broad search. Shell inspection is command-aware
 only discovery-command arguments and `cd` destinations are path checked, so regex
 syntax in neighboring `sed`/`awk` commands is not treated as a path.
 
+### Orchestrated Pi teams
+
+Use `SwarmTopologyPolicy` before allocating workers. S cards remain a single builder
+unless inspection proves independent workstreams; M cards use scout -> builder ->
+tester; L/cross-repository cards may use up to two scouts and three isolated builders,
+followed by a tester. The trusted `TrustedSwarmOrchestrator` owns ordering and delegates
+only immutable `SubagentContract` objects bound to the card hash, base commit, evidence
+ID, trajectory ID, lease, worktree, paths, tools, and child budget.
+
+`SwarmScheduler` reserves the entire child budget before launch, rejects overlapping
+writes in one worktree, heartbeats leases without extending hard deadlines, persists
+stop requests, and recovers its content-checked checkpoint after restart. The runtime
+must kill every lease returned by cancellation/timeout and acknowledge that stop.
+Parent/child assignment and result messages are appended to the A2A journal; sibling
+or unrelated-agent messaging is not valid under these contracts.
+
+Never complete a card from worker prose, exit zero, or worker-authored tests.
+`SwarmCompletionGate` requires exact result hashes, an independent trusted verifier
+signature, and verifier-observed evidence for every criterion. A worker's negative
+`blocked`, `needs_input`, or `failed` report may ratchet trust downward; its
+`completed` report is evidence only and has no promotion authority.
+
 Passing `capability_profile=` to `PiAdapter` loads only the in-image SK bridge extension
 and emits Pi's explicit `--tools` allowlist. The extension calls
 `skharness-pi-bridge`, whose Python policy independently denies operations absent from

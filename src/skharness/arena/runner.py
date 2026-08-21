@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
@@ -43,6 +44,16 @@ class RunOutcome:
     stderr_digest: str
     partial: bool = False
     metrics: dict[str, object] | None = None
+    disposition: str | None = None
+
+
+class TaskDisposition(str, Enum):
+    """Task-level state, deliberately separate from process termination."""
+
+    COMPLETED = "completed"
+    BLOCKED = "blocked"
+    NEEDS_INPUT = "needs_input"
+    FAILED = "failed"
 
 
 class AttemptSupervisor(Protocol):
@@ -454,6 +465,7 @@ class PiExperimentRunner:
         stdout_digest = self._capture(stdout_path, compact_events=True)
         stderr_digest = self._capture(directory / "stderr.log")
         terminal_error = self._pi_terminal_error(stdout_path)
+        negative_disposition = self._pi_negative_disposition(stdout_path)
         inspection_denial = self._inspection_denial(directory / "inspection-denial.json")
         served_model = self._served_model(stdout_path)
         time_to_first_edit_s = self._time_to_first_edit(stdout_path)
@@ -479,6 +491,8 @@ class PiExperimentRunner:
             # Pi can report a provider/parser failure in its structured event
             # stream and still exit zero. A zero shell status alone is not success.
             classification = "pi_terminal_error"
+        if exit_code == 0 and classification == "exit" and negative_disposition is not None:
+            classification = negative_disposition.value
         if exit_code not in (None, 0) and classification == "exit":
             stderr_path = directory / "stderr.log"
             stderr = (
@@ -512,6 +526,8 @@ class PiExperimentRunner:
         }
         if terminal_error is not None:
             payload["terminal_error"] = terminal_error
+        if negative_disposition is not None:
+            payload["disposition"] = negative_disposition.value
         if inspection_denial is not None:
             payload["inspection_denial"] = inspection_denial
         if not cancelled:
@@ -529,6 +545,7 @@ class PiExperimentRunner:
             stderr_digest,
             partial=not successful,
             metrics=metrics,
+            disposition=negative_disposition.value if negative_disposition is not None else None,
         )
 
     @staticmethod
@@ -619,6 +636,43 @@ class PiExperimentRunner:
             detail = message.get("errorMessage")
             error = detail.strip() if isinstance(detail, str) and detail.strip() else "pi error"
         return error[:2000] if error is not None else None
+
+    @staticmethod
+    def _pi_negative_disposition(path: Path) -> TaskDisposition | None:
+        """Accept model text only as a one-way, fail-safe negative signal.
+
+        A worker can never claim completion through this seam. An explicit blocked,
+        needs-input, or failed status can only reduce trust, and must still be
+        independently verified before board mutation.
+        """
+        if not path.exists():
+            return None
+        statuses = {
+            "blocked": TaskDisposition.BLOCKED,
+            "needs_input": TaskDisposition.NEEDS_INPUT,
+            "needs input": TaskDisposition.NEEDS_INPUT,
+            "failed": TaskDisposition.FAILED,
+        }
+        for raw in reversed(path.read_bytes().splitlines()):
+            try:
+                envelope = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            message = envelope.get("message") if isinstance(envelope, dict) else None
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            content = message.get("content")
+            blocks = content if isinstance(content, list) else []
+            text = "\n".join(
+                block.get("text", "")
+                for block in blocks
+                if isinstance(block, dict) and block.get("type") == "text"
+            ).casefold()
+            for label, disposition in statuses.items():
+                if f"status: {label}" in text or f"status: **{label}" in text:
+                    return disposition
+            return None
+        return None
 
     def cancel(self, experiment_id: str, attempt: int = 1) -> None:
         self.controller.cancel(
