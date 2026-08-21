@@ -446,11 +446,29 @@ python -m pytest -q tests/test_arena_evaluation.py
 ```
 
 Pi attribution has two distinct sources. Request/card IDs are injected headers;
-the served model is read only from Pi's provider-owned `message_end.responseModel`
-event and exposed as `model_served` in the parsed result. A similarly named field in
-assistant-authored JSON is stripped, and the requested model is never used as a
-fallback. The live `.41` evidence for this contract is
-`docs/evidence/0172231c-live-41.md`.
+served-model evidence is read only from Pi's provider-owned assistant
+`message_end.responseModel` events. `HarnessResult.model_requested` is resolved
+through the same `PiAdapter._effective_model` call used by both the command line and
+generated `models.json`. `HarnessResult.model_served` aggregates only assistant
+`message_end.responseModel` evidence: all calls reporting the same non-blank model is
+observed; distinct models are conflict; and a reported model plus an assistant call
+without one is partial. Conflict and partial both leave the model null with a closed
+reason. Any malformed, truncated, or non-event nonblank stream line makes the run
+incomplete and null unless distinct observed models already establish conflict.
+The scanner accepts only the exact Pi 0.84.2 `JsonAgentSessionEvent` type vocabulary;
+unknown types and `message_end` envelopes without a recognized message object/role are
+incomplete. User/tool messages never count. Parsed assistant JSON is bound only to its own
+event's response model; controller-owned requested/served/backend/request fields are
+stripped from top-level, nested, event-stream, and single-object assistant replies.
+The requested model is never used as a fallback. Pi JSON mode does not expose
+SKGateway response headers: its `provider` names the configured provider and its
+`responseId` is an upstream response identifier, so neither may be relabeled as
+`backend_served` or `gateway_req_id`.
+Those fields remain `None` with closed, field-specific unobserved reasons until an
+adapter-owned response-header observation exists. The live `.41` evidence for this
+transport is `docs/evidence/0172231c-live-41.md`; it predates the aggregation,
+closed-reason, and all-shape sanitization contract above and is not live proof of those
+new semantics.
 The qualification bundle retains Pi stdout as `pi.raw_event_stream` so a card can
 prove the provider metadata was present; generated provider configuration and
 authorization headers are never written to that stream or bundle.

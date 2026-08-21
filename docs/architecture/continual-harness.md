@@ -98,6 +98,23 @@ any conflicting request evidence leaves the total null with a `conflict` disposi
 The schema cannot silently retain a plausible aggregate that the ordered requests do
 not prove.
 
+The live adapter boundary follows the same rule before a durable record exists.
+`HarnessResult.model_requested` comes from Pi's single `_effective_model` path, while
+`model_served` aggregates only provider-owned assistant `message_end.responseModel`
+evidence. Repeated identical observations produce one observed model; distinct models
+produce conflict; and observed-plus-missing assistant calls produce partial. Conflict
+and partial remain null with closed controller reasons, and user/tool events are
+excluded. Any malformed, truncated, or non-event nonblank line marks the stream
+incomplete and null unless distinct observed values already prove conflict. The event
+allowlist is pinned to Pi 0.84.2; unknown types and structurally invalid `message_end`
+envelopes also make the stream incomplete. Pi's
+`provider` and `responseId` fields are not SKGateway backend/request-ID evidence.
+Assistant-authored provenance is stripped from every parse shape, and parsed JSON is
+annotated only from its corresponding assistant event so metadata from a later call
+cannot be cross-associated. Unobservable backend/request facts remain null with closed,
+controller-authored, field-specific reasons. Blank model IDs fail at the adapter
+boundary; padded nonblank IDs are normalized once before argv, config, and result use.
+
 The planned persistence seam is the existing atomic run journal at
 `~/.skcapstone/coordination/autopilot/runs/<run_id>.json`, under
 `items.<card_id>.run_records[]`. That durable record is the source of truth. It is never

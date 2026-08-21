@@ -16,6 +16,16 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ### Added
 
+- Extended `HarnessResult` with requested/served model, served backend, and gateway
+  request-ID provenance. Pi records the requested route through its canonical
+  `_effective_model` path and accepts served-model evidence only from provider-owned
+  assistant events. Repeated calls now aggregate explicitly as observed, partial, or
+  conflict; malformed, schema-invalid, unknown, or non-event output fails closed as
+  incomplete against the pinned Pi 0.84.2 envelope vocabulary. Parsed replies bind
+  metadata to the corresponding event and strip assistant-authored provenance in every
+  raw shape. Blank model routes are rejected and padded nonblank IDs are
+  normalized consistently. Unavailable gateway facts retain typed, field-specific
+  reasons without coercing Pi provider/response IDs into attribution.
 - Added a digest-only, containerized Pi-to-SKGateway integration gate that joins the
   canonical provider config, requested model, card/session headers, provider-owned
   response model, assistant output, and blocked direct Internet egress in one confined

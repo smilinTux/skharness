@@ -1,6 +1,7 @@
 """BaseCliAdapter: the shared harness seam. Holds a Sandbox and composes the
 assess/run_task/grade prompts (framing untrusted text as data), building a
 LaunchSpec the sandbox runs. Concrete adapters supply only what varies."""
+
 from __future__ import annotations
 
 import json
@@ -16,8 +17,7 @@ from ..claude_code import frame
 from ..grading import GRADE_RUBRIC, parse_grade
 from ..sandbox import LaunchSpec
 from ..sensitivity import classify_sensitivity
-from ..types import (AssessBrief, GateResult, GradeBrief, HarnessResult,
-                     TaskBrief, Verdict)
+from ..types import AssessBrief, GateResult, GradeBrief, HarnessResult, TaskBrief, Verdict
 
 #: The verdicts assess may legitimately return; anything else is "inconclusive".
 _ASSESS_VERDICTS = ("valid", "stale", "obsolete", "needs_decision", "decompose")
@@ -32,11 +32,13 @@ def _brief_as_card(brief: AssessBrief) -> dict:
     full card before it writes, and that pass is the authoritative one. Both
     passes are deterministic, so they only ever differ when an override exists.
     """
-    return {"title": getattr(brief, "title", "") or "",
-            "description": getattr(brief, "description", "") or "",
-            "acceptance": getattr(brief, "acceptance", None) or [],
-            "tags": getattr(brief, "tags", None) or [],
-            "repo": getattr(brief, "repo", None) or ""}
+    return {
+        "title": getattr(brief, "title", "") or "",
+        "description": getattr(brief, "description", "") or "",
+        "acceptance": getattr(brief, "acceptance", None) or [],
+        "tags": getattr(brief, "tags", None) or [],
+        "repo": getattr(brief, "repo", None) or "",
+    }
 
 
 def _grade_axes(out, brief: AssessBrief) -> tuple[str | None, str | None, str | None]:
@@ -62,18 +64,25 @@ def _grade_axes(out, brief: AssessBrief) -> tuple[str | None, str | None, str | 
         parsed = parse_grade(json.dumps(out)) if isinstance(out, dict) else None
         if parsed:
             size, risk = parsed["size"], parsed["risk"]
-    except Exception as exc:                                   # never fatal
-        health.record("assess_grade_parse_failed", task=getattr(brief, "task_id", None),
-                      error=type(exc).__name__)
+    except Exception as exc:  # never fatal
+        health.record(
+            "assess_grade_parse_failed",
+            task=getattr(brief, "task_id", None),
+            error=type(exc).__name__,
+        )
     if size is None or risk is None:
         health.record("assess_grade_absent", task=getattr(brief, "task_id", None))
     try:
         sensitivity, _reasons = classify_sensitivity(_brief_as_card(brief))
-    except Exception as exc:                                   # never fatal
-        health.record("assess_sensitivity_failed", task=getattr(brief, "task_id", None),
-                      error=type(exc).__name__)
+    except Exception as exc:  # never fatal
+        health.record(
+            "assess_sensitivity_failed",
+            task=getattr(brief, "task_id", None),
+            error=type(exc).__name__,
+        )
         sensitivity = None
     return size, risk, sensitivity
+
 
 class ModelOverrideUnsupported(RuntimeError):
     """A per-call model override was requested of an adapter that cannot honour it.
@@ -87,8 +96,11 @@ def _record_assess_inconclusive(brief: AssessBrief, out: dict) -> None:
     """Telemetry: the CLI gave no parseable verdict for an assess (declined or
     errored through all retries). Fed to the learning layer so the assess decline
     rate is observable and the retry budget can adapt (see BaseCliAdapter._run)."""
-    health.record("assess_inconclusive", task=getattr(brief, "task_id", None),
-                  had_error=bool(isinstance(out, dict) and out.get("is_error")))
+    health.record(
+        "assess_inconclusive",
+        task=getattr(brief, "task_id", None),
+        had_error=bool(isinstance(out, dict) and out.get("is_error")),
+    )
 
 
 def extract_json(text) -> dict | None:
@@ -112,7 +124,7 @@ def extract_json(text) -> dict | None:
         return obj if isinstance(obj, dict) else None
     except (json.JSONDecodeError, TypeError):
         pass
-    start = s.find("{")               # fall back to the first balanced {...}
+    start = s.find("{")  # fall back to the first balanced {...}
     if start == -1:
         return None
     depth = 0
@@ -123,7 +135,7 @@ def extract_json(text) -> dict | None:
             depth -= 1
             if depth == 0:
                 try:
-                    obj = json.loads(s[start:i + 1])
+                    obj = json.loads(s[start : i + 1])
                     return obj if isinstance(obj, dict) else None
                 except (json.JSONDecodeError, TypeError):
                     return None
@@ -141,10 +153,13 @@ def _event_text(ev: dict) -> str | None:
         return part["text"]
     if ev.get("type") == "text" and isinstance(ev.get("text"), str):
         return ev["text"]
-    msg = ev.get("message")                       # pi: assistant message with content list
+    msg = ev.get("message")  # pi: assistant message with content list
     if isinstance(msg, dict) and msg.get("role") == "assistant":
-        chunks = [c.get("text") for c in (msg.get("content") or [])
-                  if isinstance(c, dict) and c.get("type") == "text" and c.get("text")]
+        chunks = [
+            c.get("text")
+            for c in (msg.get("content") or [])
+            if isinstance(c, dict) and c.get("type") == "text" and c.get("text")
+        ]
         if chunks:
             return "".join(chunks)
     return None
@@ -156,9 +171,10 @@ def parse_event_stream(body: str) -> dict:
     assistant text decoding to a JSON object, not the last: opencode's first
     assistant text chunk is the model's direct reply, and it then agentic-loops
     with further (non-JSON, rambling) chunks that must not clobber the real answer.
-    pi emits its reply once, in the assistant message_end event, so first-valid-JSON
-    is unchanged for pi. Returns {} when no decodable reply is present. Grounded in
-    captured opencode + pi samples."""
+    Pi may emit several assistant message_end events; this generic helper retains
+    the same first-valid reply selection but does not bind or aggregate Pi provider
+    provenance. PiAdapter performs that event-local trust work itself. Returns {}
+    when no decodable reply is present. Grounded in captured opencode + pi samples."""
     for line in (body or "").splitlines():
         line = line.strip()
         if not line:
@@ -183,6 +199,7 @@ class BaseCliAdapter(Harness):
     Harness contract: it implements the task plane (assess/run_task/grade below)
     and leaves the session plane at Harness's gated default. Concrete adapters
     declare merged capabilities (task_plane=True, session_plane=False)."""
+
     name = "base"
 
     def __init__(self, sandbox, egress_hosts=None, live_execution: bool = False):
@@ -195,14 +212,35 @@ class BaseCliAdapter(Harness):
     # same shape, threaded down the same path). It is passed ONLY when non-None AND
     # the adapter declares supports_model_override(), so an adapter that has not
     # implemented it keeps its narrow (prompt, light) / () signatures untouched.
-    def _argv(self, prompt: str, light: bool = False,
-              model: str | None = None) -> list[str]: raise NotImplementedError
-    def _image(self) -> str: raise NotImplementedError
-    def _auth_mounts(self) -> list: raise NotImplementedError
-    def _auth_env(self) -> dict: raise NotImplementedError
-    def _config_files(self, model: str | None = None) -> dict: return {}
-    def _required_commands(self) -> list[str]: return []
-    def _required_checks(self) -> list[list[str]]: return []
+    def _argv(self, prompt: str, light: bool = False, model: str | None = None) -> list[str]:
+        raise NotImplementedError
+
+    def _image(self) -> str:
+        raise NotImplementedError
+
+    def _auth_mounts(self) -> list:
+        raise NotImplementedError
+
+    def _auth_env(self) -> dict:
+        raise NotImplementedError
+
+    def _config_files(self, model: str | None = None) -> dict:
+        return {}
+
+    def _required_commands(self) -> list[str]:
+        return []
+
+    def _required_checks(self) -> list[list[str]]:
+        return []
+
+    def _result_provenance(self, raw: dict, model: str | None = None) -> dict:
+        """Provider-observed fields for :class:`HarnessResult`.
+
+        The default is deliberately empty: adapters that cannot prove a fact do
+        not inherit requested routing as served attribution.  Concrete adapters
+        may populate only evidence their provider-owned response exposes.
+        """
+        return {}
 
     def supports_model_override(self) -> bool:
         """True only when this adapter honours a per-call model id in BOTH _argv and
@@ -212,17 +250,26 @@ class BaseCliAdapter(Harness):
         the card's sensitivity ceiling quietly discarded, which is exactly the class
         of failure this seam exists to prevent. Fail closed and loudly instead."""
         return False
-    def _stdin_for(self, prompt: str) -> str | None: return None
-    def _parse(self, raw: dict) -> dict: raise NotImplementedError
-    def capabilities(self): raise NotImplementedError
+
+    def _stdin_for(self, prompt: str) -> str | None:
+        return None
+
+    def _parse(self, raw: dict) -> dict:
+        raise NotImplementedError
+
+    def capabilities(self):
+        raise NotImplementedError
 
     # -- egress host derivation --
     def _remote_host(self, repo):
         if repo is None:
             return None
         try:
-            r = subprocess.run(["git", "-C", repo.path, "remote", "get-url", "origin"],
-                               capture_output=True, text=True)
+            r = subprocess.run(
+                ["git", "-C", repo.path, "remote", "get-url", "origin"],
+                capture_output=True,
+                text=True,
+            )
         except OSError:
             return None
         url = (r.stdout or "").strip()
@@ -242,8 +289,16 @@ class BaseCliAdapter(Harness):
         return None
 
     # -- shared spawn helpers --
-    def _run_raw(self, instruction: str, data: str, *, worktree: str, repo,
-                 light: bool = False, model: str | None = None) -> dict:
+    def _run_raw(
+        self,
+        instruction: str,
+        data: str,
+        *,
+        worktree: str,
+        repo,
+        light: bool = False,
+        model: str | None = None,
+    ) -> dict:
         prompt = frame(instruction, data)
         image = getattr(repo, "sandbox_image", None) or self._image()
         # One kwargs dict feeds BOTH hooks, so _argv and _config_files can never be
@@ -256,19 +311,26 @@ class BaseCliAdapter(Harness):
                 raise ModelOverrideUnsupported(
                     f"{self.name} adapter cannot honour a per-call model override "
                     f"({model!r}); refusing rather than silently running the static "
-                    "model without the requested routing.")
-            validate_bucket(model)          # never emit an unvalidated bucket id
+                    "model without the requested routing."
+                )
+            validate_bucket(model)  # never emit an unvalidated bucket id
             mkw["model"] = model
-        spec = LaunchSpec(name=self.name, argv=self._argv(prompt, light=light, **mkw),
-                          image=image,
-                          worktree=worktree, auth_mounts=self._auth_mounts(),
-                          auth_env=self._auth_env(), egress_hosts=self.egress_hosts,
-                          config_files=self._config_files(**mkw),
-                          stdin=self._stdin_for(prompt),
-                          required_commands=self._required_commands(),
-                          required_checks=self._required_checks())
-        return self.sandbox.spawn(spec, repo_remote_host=self._remote_host(repo),
-                                  ci_host=self._ci_host(repo))
+        spec = LaunchSpec(
+            name=self.name,
+            argv=self._argv(prompt, light=light, **mkw),
+            image=image,
+            worktree=worktree,
+            auth_mounts=self._auth_mounts(),
+            auth_env=self._auth_env(),
+            egress_hosts=self.egress_hosts,
+            config_files=self._config_files(**mkw),
+            stdin=self._stdin_for(prompt),
+            required_commands=self._required_commands(),
+            required_checks=self._required_checks(),
+        )
+        return self.sandbox.spawn(
+            spec, repo_remote_host=self._remote_host(repo), ci_host=self._ci_host(repo)
+        )
 
     # A judgment call (assess/grade) must not turn a transient hiccup into a
     # wrong answer. The sandboxed CLI intermittently returns a hard API error
@@ -287,9 +349,8 @@ class BaseCliAdapter(Harness):
         is the learning loop reading its own health telemetry."""
         base = self._RUN_ATTEMPTS
         try:
-            decline = health.rate("run_inconclusive",
-                                  over=("run_inconclusive", "run_ok"))
-        except Exception:              # noqa: BLE001 - telemetry never gates the run
+            decline = health.rate("run_inconclusive", over=("run_inconclusive", "run_ok"))
+        except Exception:  # noqa: BLE001 - telemetry never gates the run
             return base
         if decline >= 0.5:
             return self._RUN_ATTEMPTS_MAX
@@ -297,23 +358,31 @@ class BaseCliAdapter(Harness):
             return min(self._RUN_ATTEMPTS_MAX, base + 2)
         return base
 
-    def _run(self, instruction: str, data: str, *, worktree: str, repo,
-             light: bool = False, model: str | None = None) -> dict:
+    def _run(
+        self,
+        instruction: str,
+        data: str,
+        *,
+        worktree: str,
+        repo,
+        light: bool = False,
+        model: str | None = None,
+    ) -> dict:
         parsed: dict = {}
         attempts = self._run_attempts()
         for i in range(attempts):
-            raw = self._run_raw(instruction, data, worktree=worktree, repo=repo,
-                                light=light, model=model)
+            raw = self._run_raw(
+                instruction, data, worktree=worktree, repo=repo, light=light, model=model
+            )
             if not (isinstance(raw, dict) and raw.get("is_error")):
                 parsed = self._parse(raw)
-                if parsed:                      # non-empty parse == usable answer
+                if parsed:  # non-empty parse == usable answer
                     if i:
                         health.record("run_retry_recovered", attempt=i + 1)
                     health.record("run_ok")
                     return parsed
             # hard API error, or empty/unparseable reply: try again
-        health.record("run_inconclusive", attempts=attempts,
-                      name=getattr(self, "name", "?"))
+        health.record("run_inconclusive", attempts=attempts, name=getattr(self, "name", "?"))
         return parsed
 
     # -- the three seam methods (prompts copied verbatim from ClaudeCodeAdapter) --
@@ -332,24 +401,32 @@ class BaseCliAdapter(Harness):
             "itself is ambiguous or self-contradictory. When REPO FACTS are provided, "
             "treat them as authoritative: prefer decompose over valid when the "
             "acceptance names nothing that resolves in the facts and is not clearly "
-            "greenfield. Reply strictly as JSON: {\"verdict\":\"valid|stale|obsolete|"
-            "needs_decision|decompose\",\"reason\":\"...\"}.")
+            'greenfield. Reply strictly as JSON: {"verdict":"valid|stale|obsolete|'
+            'needs_decision|decompose","reason":"..."}.'
+        )
         # SECOND job, same call: the Joule Economy work grade (spec 3.1 to 3.6).
         # Piggy-backing on assess means grading costs no extra model call, and the
         # grade is produced exactly once per card rather than per dispatch.
         instruction += (
             "\n\nSECOND TASK, in the SAME reply: grade the WORK this card asks for "
-            "(not the quality of the card's writing). Add \"size\", \"risk\", and "
-            "\"sensitivity\" keys to the SAME JSON object described above, alongside "
-            "verdict and reason.\n\nYour \"sensitivity\" is ADVISORY ONLY. It is "
+            '(not the quality of the card\'s writing). Add "size", "risk", and '
+            '"sensitivity" keys to the SAME JSON object described above, alongside '
+            'verdict and reason.\n\nYour "sensitivity" is ADVISORY ONLY. It is '
             "discarded and replaced by a deterministic rule pass before anything is "
             "written, because a guessed data-exposure label is a credential leak "
             "rather than a wrong score. Answer it anyway so the reply is complete.\n\n"
-            + GRADE_RUBRIC)
-        data = json.dumps({"task_id": brief.task_id, "title": brief.title,
-                           "description": brief.description,
-                           "acceptance": brief.acceptance, "tags": brief.tags,
-                           "codebase_context": brief.codebase_context})
+            + GRADE_RUBRIC
+        )
+        data = json.dumps(
+            {
+                "task_id": brief.task_id,
+                "title": brief.title,
+                "description": brief.description,
+                "acceptance": brief.acceptance,
+                "tags": brief.tags,
+                "codebase_context": brief.codebase_context,
+            }
+        )
         out = self._run(instruction, data, worktree=os.getcwd(), repo=None, light=True)
         size, risk, sensitivity = _grade_axes(out, brief)
         verdict = out.get("verdict")
@@ -365,10 +442,14 @@ class BaseCliAdapter(Harness):
             # protects. The inconclusive count is recorded so a learning layer can
             # watch the assess decline rate (see AssessHealth).
             _record_assess_inconclusive(brief, out)
-            return Verdict(verdict="valid",
-                           reason="assess inconclusive after retries; proceeding to "
-                                  "the twin gate (fail-open)",
-                           size=size, risk=risk, sensitivity=sensitivity)
+            return Verdict(
+                verdict="valid",
+                reason="assess inconclusive after retries; proceeding to "
+                "the twin gate (fail-open)",
+                size=size,
+                risk=risk,
+                sensitivity=sensitivity,
+            )
         if verdict == "needs_decision":
             # A single needs_decision may be a flaky HEDGE, not a real ambiguity:
             # the same well-formed task grades `valid` on most calls and
@@ -381,21 +462,30 @@ class BaseCliAdapter(Harness):
             # rather than a missing one.
             confirm = self._run(instruction, data, worktree=os.getcwd(), repo=None, light=True)
             if confirm.get("verdict") != "needs_decision":
-                health.record("assess_needs_decision_unconfirmed",
-                              task=getattr(brief, "task_id", None),
-                              confirm=confirm.get("verdict"))
-                return Verdict(verdict="valid",
-                               reason="needs_decision not confirmed on a second "
-                                      "opinion; proceeding to the twin gate",
-                               size=size, risk=risk, sensitivity=sensitivity)
-            health.record("assess_needs_decision_confirmed",
-                          task=getattr(brief, "task_id", None))
+                health.record(
+                    "assess_needs_decision_unconfirmed",
+                    task=getattr(brief, "task_id", None),
+                    confirm=confirm.get("verdict"),
+                )
+                return Verdict(
+                    verdict="valid",
+                    reason="needs_decision not confirmed on a second "
+                    "opinion; proceeding to the twin gate",
+                    size=size,
+                    risk=risk,
+                    sensitivity=sensitivity,
+                )
+            health.record("assess_needs_decision_confirmed", task=getattr(brief, "task_id", None))
         health.record("assess_ok", verdict=verdict, task=getattr(brief, "task_id", None))
-        return Verdict(verdict=verdict,
-                       reason=out.get("reason", ""),
-                       updated_description=out.get("updated_description"),
-                       updated_acceptance=out.get("updated_acceptance"),
-                       size=size, risk=risk, sensitivity=sensitivity)
+        return Verdict(
+            verdict=verdict,
+            reason=out.get("reason", ""),
+            updated_description=out.get("updated_description"),
+            updated_acceptance=out.get("updated_acceptance"),
+            size=size,
+            risk=risk,
+            sensitivity=sensitivity,
+        )
 
     def decompose(self, brief: AssessBrief) -> list[dict]:
         """Split a too-coarse card into 2-8 independently buildable subtasks. Each
@@ -409,12 +499,19 @@ class BaseCliAdapter(Harness):
             "into 2 to 8 INDEPENDENTLY buildable subtasks. Each subtask must be a small "
             "single-diff unit whose acceptance NAMES concrete files/functions (prefer "
             "ones from the facts). Do NOT restate the parent; produce real sub-steps. "
-            "Reply strictly as JSON: {\"subtasks\":[{\"title\":\"...\",\"description\":"
-            "\"...\",\"acceptance\":[\"...\"]}, ...]}.")
-        data = json.dumps({"task_id": brief.task_id, "title": brief.title,
-                           "description": brief.description,
-                           "acceptance": brief.acceptance, "tags": brief.tags,
-                           "codebase_context": brief.codebase_context})
+            'Reply strictly as JSON: {"subtasks":[{"title":"...","description":'
+            '"...","acceptance":["..."]}, ...]}.'
+        )
+        data = json.dumps(
+            {
+                "task_id": brief.task_id,
+                "title": brief.title,
+                "description": brief.description,
+                "acceptance": brief.acceptance,
+                "tags": brief.tags,
+                "codebase_context": brief.codebase_context,
+            }
+        )
         out = self._run(instruction, data, worktree=os.getcwd(), repo=None, light=True)
         subs = out.get("subtasks") if isinstance(out, dict) else None
         if not isinstance(subs, list):
@@ -424,10 +521,15 @@ class BaseCliAdapter(Harness):
         for s in subs:
             if isinstance(s, dict) and s.get("title"):
                 acc = s.get("acceptance")
-                clean.append({"title": str(s["title"]),
-                              "description": str(s.get("description", "")),
-                              "acceptance": acc if isinstance(acc, list) else (
-                                  [str(acc)] if acc else [])})
+                clean.append(
+                    {
+                        "title": str(s["title"]),
+                        "description": str(s.get("description", "")),
+                        "acceptance": acc
+                        if isinstance(acc, list)
+                        else ([str(acc)] if acc else []),
+                    }
+                )
         health.record("decompose_ok", n=len(clean), task=getattr(brief, "task_id", None))
         return clean
 
@@ -438,7 +540,8 @@ class BaseCliAdapter(Harness):
             "acceptance names). If they ARE already satisfied, make NO changes and "
             "stop -- do not re-implement working code. Otherwise implement the task "
             "in the current git worktree, test-driven (failing test first), matching "
-            "the repo's conventions.")
+            "the repo's conventions."
+        )
         # Both memory channels are sent, and they are NOT interchangeable.
         # prior_feedback carries reports from runs that FAILED, to be checked
         # rather than believed. prior_success_feedback carries an approach a
@@ -446,35 +549,54 @@ class BaseCliAdapter(Harness):
         # overwritten round to round. Sending only the failure half is what made
         # S9/S18's success memory recorded, read back, seeded onto the brief and
         # never seen by the model: a complete, tested, entirely inert feature.
-        data = json.dumps({"task_id": brief.task_id, "title": brief.title,
-                           "description": brief.description,
-                           "acceptance": brief.acceptance,
-                           "prior_feedback": brief.prior_feedback,
-                           "prior_success_feedback": brief.prior_success_feedback,
-                           "round": brief.round})
+        data = json.dumps(
+            {
+                "task_id": brief.task_id,
+                "title": brief.title,
+                "description": brief.description,
+                "acceptance": brief.acceptance,
+                "prior_feedback": brief.prior_feedback,
+                "prior_success_feedback": brief.prior_success_feedback,
+                "round": brief.round,
+            }
+        )
         # A dispatcher may pin this ONE call to a graded bucket (see buckets.py);
         # absent that, dispatch_model_of is None and this is the pre-existing call.
-        raw = self._run_raw(instruction, data, worktree=brief.worktree, repo=brief.repo,
-                            model=dispatch_model_of(brief))
+        # Resolve the dispatch model once.  This exact value feeds both launch
+        # hooks in _run_raw and the result-provenance hook, preventing the model
+        # recorded as requested from drifting from the model actually launched.
+        model = dispatch_model_of(brief)
+        raw = self._run_raw(
+            instruction, data, worktree=brief.worktree, repo=brief.repo, model=model
+        )
         usage = raw.get("usage", {}) if isinstance(raw, dict) else {}
         return HarnessResult(
             ok=(not bool(raw.get("is_error"))) and int(raw.get("exit_code", 0) or 0) == 0,
             artifact=brief.worktree,
             tokens=int(usage.get("input_tokens", 0)) + int(usage.get("output_tokens", 0)),
             cost_usd=float(raw.get("total_cost_usd", 0.0) or 0.0),
-            raw=raw)
+            raw=raw,
+            **self._result_provenance(raw, model=model),
+        )
 
     def grade(self, brief: GradeBrief) -> GateResult:
         instruction = (
             "You are an independent grader. Score the diff 1-5 against the "
             "acceptance criteria and CI status. A 5 requires: every acceptance "
             "criterion met, tests present and passing, CI green. Reply strictly as "
-            "JSON: {\"score\":N,\"passed\":bool,\"notes\":\"...\"}. ONLY when the "
+            'JSON: {"score":N,"passed":bool,"notes":"..."}. ONLY when the '
             "score is 5 and the work is genuinely complete, include the exact token "
-            "<promise>COMPLETE</promise> inside notes; never include it otherwise.")
-        data = json.dumps({"task_id": brief.task_id, "diff": brief.diff,
-                           "acceptance": brief.acceptance, "ci_status": brief.ci_status,
-                           "diff_coverage": brief.diff_coverage})
+            "<promise>COMPLETE</promise> inside notes; never include it otherwise."
+        )
+        data = json.dumps(
+            {
+                "task_id": brief.task_id,
+                "diff": brief.diff,
+                "acceptance": brief.acceptance,
+                "ci_status": brief.ci_status,
+                "diff_coverage": brief.diff_coverage,
+            }
+        )
         # The grader reads the DIFF, which carries the card's content, so it sits in
         # the same sensitivity zone as the build. That leg IS inherited, exactly and
         # unwidened: a secret card's diff must never reach a looser trust zone.
@@ -485,7 +607,17 @@ class BaseCliAdapter(Harness):
         # grader_bucket keeps the zone and replaces the class with a fixed pin the
         # card cannot influence (see grader_pin.py; Joule Economy design D6).
         # Ungraded card -> None in, None out -> no override, today's exact behaviour.
-        out = self._run(instruction, data, worktree=brief.worktree, repo=brief.repo,
-                        light=True, model=grader_bucket(dispatch_model_of(brief)))
-        return GateResult(score=out.get("score"), passed=bool(out.get("passed")),
-                          notes=out.get("notes", ""), artifact=out.get("artifact"))
+        out = self._run(
+            instruction,
+            data,
+            worktree=brief.worktree,
+            repo=brief.repo,
+            light=True,
+            model=grader_bucket(dispatch_model_of(brief)),
+        )
+        return GateResult(
+            score=out.get("score"),
+            passed=bool(out.get("passed")),
+            notes=out.get("notes", ""),
+            artifact=out.get("artifact"),
+        )

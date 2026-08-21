@@ -5,23 +5,53 @@ from skharness.autocode.types import AssessBrief, RepoSpec, TaskBrief
 
 class _Fake(BaseCliAdapter):
     name = "fake"
-    def _argv(self, prompt, light=False): return ["fake", prompt]
-    def _image(self): return "sandbox-fake:1"
-    def _auth_mounts(self): return [AuthMount("/h/.cred", "/c/.cred")]
-    def _auth_env(self): return {"BASE_URL": "http://gw.local"}
-    def _parse(self, raw): return raw.get("result", raw)
-    def capabilities(self): return {"session_resume": False, "structured_output": "json",
-                                    "sandbox": True, "tool_restrictions": True}
+
+    def _argv(self, prompt, light=False):
+        return ["fake", prompt]
+
+    def _image(self):
+        return "sandbox-fake:1"
+
+    def _auth_mounts(self):
+        return [AuthMount("/h/.cred", "/c/.cred")]
+
+    def _auth_env(self):
+        return {"BASE_URL": "http://gw.local"}
+
+    def _parse(self, raw):
+        return raw.get("result", raw)
+
+    def capabilities(self):
+        return {
+            "session_resume": False,
+            "structured_output": "json",
+            "sandbox": True,
+            "tool_restrictions": True,
+        }
 
 
 def test_assess_builds_spec_and_delegates_to_sandbox(monkeypatch):
     seen = {}
     sb = Sandbox(live_execution=True)
-    monkeypatch.setattr(sb, "spawn",
-        lambda spec, **kw: seen.setdefault("spec", spec) and {"result": {"verdict": "valid", "reason": "ok"}})
+    monkeypatch.setattr(
+        sb,
+        "spawn",
+        lambda spec, **kw: (
+            seen.setdefault("spec", spec) and {"result": {"verdict": "valid", "reason": "ok"}}
+        ),
+    )
     a = _Fake(sb, egress_hosts=["gw.local"])
-    v = a.assess(AssessBrief(task_id="t1", title="t", description="d", acceptance=[],
-                             tags=[], repo=None, codebase_context=""))
+    v = a.assess(
+        AssessBrief(
+            task_id="t1",
+            title="t",
+            description="d",
+            acceptance=[],
+            tags=[],
+            repo=None,
+            codebase_context="",
+        )
+    )
     assert v.verdict == "valid"
     spec = seen["spec"]
     assert isinstance(spec, LaunchSpec) and spec.image == "sandbox-fake:1"
@@ -30,21 +60,36 @@ def test_assess_builds_spec_and_delegates_to_sandbox(monkeypatch):
 
 
 def _repo(**kw):
-    base = dict(name="r", path="/tmp/r", base_branch="main", integration_branch="int",
-                test_cmd="pytest", ci="none")
+    base = dict(
+        name="r",
+        path="/tmp/r",
+        base_branch="main",
+        integration_branch="int",
+        test_cmd="pytest",
+        ci="none",
+    )
     base.update(kw)
     return RepoSpec(**base)
 
 
 def _task_brief(repo):
-    return TaskBrief(task_id="t1", repo=repo, worktree="/tmp/wt", title="t",
-                     description="d", acceptance=[], prior_feedback=None, round=0)
+    return TaskBrief(
+        task_id="t1",
+        repo=repo,
+        worktree="/tmp/wt",
+        title="t",
+        description="d",
+        acceptance=[],
+        prior_feedback=None,
+        round=0,
+    )
 
 
 def test_run_task_crash_is_not_ok(monkeypatch):
     sb = Sandbox(live_execution=True)
-    monkeypatch.setattr(sb, "spawn",
-        lambda spec, **kw: {"result": "boom", "exit_code": 1, "is_error": True})
+    monkeypatch.setattr(
+        sb, "spawn", lambda spec, **kw: {"result": "boom", "exit_code": 1, "is_error": True}
+    )
     a = _Fake(sb, egress_hosts=[])
     result = a.run_task(_task_brief(_repo()))
     assert result.ok is False
@@ -56,13 +101,18 @@ def test_run_task_clean_json_exit_zero_is_ok(monkeypatch):
     a = _Fake(sb, egress_hosts=[])
     result = a.run_task(_task_brief(_repo()))
     assert result.ok is True
+    # The base adapter manufactures no routing provenance.  Existing adapters
+    # keep constructing HarnessResult through the new defaulted fields.
+    assert result.model_requested is None and result.model_served is None
+    assert result.backend_served is None and result.gateway_req_id is None
 
 
 def test_run_raw_uses_per_repo_sandbox_image_override(monkeypatch):
     seen = {}
     sb = Sandbox(live_execution=True)
-    monkeypatch.setattr(sb, "spawn",
-        lambda spec, **kw: seen.setdefault("spec", spec) and {"result": {}})
+    monkeypatch.setattr(
+        sb, "spawn", lambda spec, **kw: seen.setdefault("spec", spec) and {"result": {}}
+    )
     a = _Fake(sb, egress_hosts=[])
     a._run_raw("instr", "data", worktree="/tmp/wt", repo=_repo(sandbox_image="repo-img:9"))
     assert seen["spec"].image == "repo-img:9"
@@ -71,8 +121,9 @@ def test_run_raw_uses_per_repo_sandbox_image_override(monkeypatch):
 def test_run_raw_falls_back_to_adapter_image_when_repo_image_is_none(monkeypatch):
     seen = {}
     sb = Sandbox(live_execution=True)
-    monkeypatch.setattr(sb, "spawn",
-        lambda spec, **kw: seen.setdefault("spec", spec) and {"result": {}})
+    monkeypatch.setattr(
+        sb, "spawn", lambda spec, **kw: seen.setdefault("spec", spec) and {"result": {}}
+    )
     a = _Fake(sb, egress_hosts=[])
     a._run_raw("instr", "data", worktree="/tmp/wt", repo=_repo(sandbox_image=None))
     assert seen["spec"].image == "sandbox-fake:1"
@@ -95,11 +146,12 @@ def test_run_raw_sets_stdin_from_hook_override(monkeypatch):
 
     seen = {}
     sb = Sandbox(live_execution=True)
-    monkeypatch.setattr(sb, "spawn",
-        lambda spec, **kw: seen.setdefault("spec", spec) and {"result": {}})
+    monkeypatch.setattr(
+        sb, "spawn", lambda spec, **kw: seen.setdefault("spec", spec) and {"result": {}}
+    )
     a = _FakeStdin(sb, egress_hosts=[])
     a._run_raw("instr", "data", worktree="/tmp/wt", repo=_repo(sandbox_image=None))
-    framed_prompt = seen["spec"].argv[1]           # _Fake._argv returns ["fake", prompt]
+    framed_prompt = seen["spec"].argv[1]  # _Fake._argv returns ["fake", prompt]
     assert seen["spec"].stdin == framed_prompt
 
 
@@ -110,8 +162,9 @@ def test_run_raw_passes_config_files_to_launch_spec(monkeypatch):
 
     seen = {}
     sb = Sandbox(live_execution=True)
-    monkeypatch.setattr(sb, "spawn",
-        lambda spec, **kw: seen.setdefault("spec", spec) and {"result": {}})
+    monkeypatch.setattr(
+        sb, "spawn", lambda spec, **kw: seen.setdefault("spec", spec) and {"result": {}}
+    )
     a = _FakeCfg(sb, egress_hosts=[])
     a._run_raw("instr", "data", worktree="/tmp/wt", repo=_repo(sandbox_image=None))
     assert seen["spec"].config_files == {"/agent/x.json": "hi"}
@@ -119,16 +172,18 @@ def test_run_raw_passes_config_files_to_launch_spec(monkeypatch):
 
 def test_extract_json_tolerates_fences_and_prose():
     from skharness.autocode.adapters.base import extract_json
+
     assert extract_json('{"score": 5}') == {"score": 5}
     assert extract_json('```json\n{"a":1}\n```') == {"a": 1}
     assert extract_json('answer: {"verdict":"valid"} done') == {"verdict": "valid"}
-    assert extract_json('no json') is None
+    assert extract_json("no json") is None
     assert extract_json(None) is None
 
 
 def test_claude_parse_extracts_from_result_string():
     from skharness.autocode.adapters.claude_code import ClaudeCodeAdapter
     from skharness.autocode.sandbox import Sandbox
+
     a = ClaudeCodeAdapter(["Read"], sandbox=Sandbox())
     raw = {"type": "result", "result": '{"score":5,"passed":true,"notes":"ok"}', "is_error": False}
     assert a._parse(raw) == {"score": 5, "passed": True, "notes": "ok"}
@@ -139,20 +194,22 @@ def test_run_retries_past_api_error_and_empty_then_returns_usable(monkeypatch):
     become the answer: it retries and returns the first usable (non-empty) parse."""
     sb = Sandbox(live_execution=True)
     seq = [
-        {"is_error": True, "result": "API Error: 401 token expired"},   # hard error -> retry
-        {"result": {}},                                                 # empty parse -> retry
-        {"result": {"verdict": "valid", "reason": "ok"}},               # usable -> return
+        {"is_error": True, "result": "API Error: 401 token expired"},  # hard error -> retry
+        {"result": {}},  # empty parse -> retry
+        {"result": {"verdict": "valid", "reason": "ok"}},  # usable -> return
     ]
     calls = {"n": 0}
+
     def fake_spawn(spec, **kw):
         r = seq[calls["n"]]
         calls["n"] += 1
         return r
+
     monkeypatch.setattr(sb, "spawn", fake_spawn)
     a = _Fake(sb, egress_hosts=[])
     out = a._run("instr", "data", worktree="/tmp/wt", repo=None)
     assert out == {"verdict": "valid", "reason": "ok"}
-    assert calls["n"] == 3                                              # exhausted the two bad rolls
+    assert calls["n"] == 3  # exhausted the two bad rolls
 
 
 def test_run_gives_up_after_bounded_attempts(monkeypatch):
@@ -160,9 +217,11 @@ def test_run_gives_up_after_bounded_attempts(monkeypatch):
     the last (empty) parse rather than looping forever."""
     sb = Sandbox(live_execution=True)
     calls = {"n": 0}
+
     def fake_spawn(spec, **kw):
         calls["n"] += 1
         return {"is_error": True, "result": "still down"}
+
     monkeypatch.setattr(sb, "spawn", fake_spawn)
     a = _Fake(sb, egress_hosts=[])
     out = a._run("instr", "data", worktree="/tmp/wt", repo=None)
@@ -171,8 +230,15 @@ def test_run_gives_up_after_bounded_attempts(monkeypatch):
 
 
 def _brief():
-    return AssessBrief(task_id="t", title="T", description="d", acceptance=[],
-                       tags=[], repo="r", codebase_context="")
+    return AssessBrief(
+        task_id="t",
+        title="T",
+        description="d",
+        acceptance=[],
+        tags=[],
+        repo="r",
+        codebase_context="",
+    )
 
 
 def test_assess_fails_open_to_valid_on_inconclusive(tmp_path, monkeypatch):
@@ -180,11 +246,12 @@ def test_assess_fails_open_to_valid_on_inconclusive(tmp_path, monkeypatch):
     inconclusive assess (no parseable verdict after retries) proceeds as valid."""
     monkeypatch.setenv("SKHARNESS_HEALTH_PATH", str(tmp_path / "h.jsonl"))
     a = _Fake(Sandbox(), egress_hosts=[])
-    monkeypatch.setattr(a, "_run", lambda *args, **kw: {})     # inconclusive
+    monkeypatch.setattr(a, "_run", lambda *args, **kw: {})  # inconclusive
     v = a.assess(_brief())
     assert v.verdict == "valid" and "fail-open" in v.reason
     from skharness.autocode import health
-    assert health.recent("assess_inconclusive")               # telemetry recorded
+
+    assert health.recent("assess_inconclusive")  # telemetry recorded
 
 
 def test_assess_honors_explicit_needs_decision(tmp_path, monkeypatch):
@@ -192,8 +259,9 @@ def test_assess_honors_explicit_needs_decision(tmp_path, monkeypatch):
     fails open)."""
     monkeypatch.setenv("SKHARNESS_HEALTH_PATH", str(tmp_path / "h.jsonl"))
     a = _Fake(Sandbox(), egress_hosts=[])
-    monkeypatch.setattr(a, "_run",
-                        lambda *args, **kw: {"verdict": "needs_decision", "reason": "contradictory"})
+    monkeypatch.setattr(
+        a, "_run", lambda *args, **kw: {"verdict": "needs_decision", "reason": "contradictory"}
+    )
     v = a.assess(_brief())
     assert v.verdict == "needs_decision" and v.reason == "contradictory"
 
@@ -203,12 +271,13 @@ def test_run_attempts_adapt_to_decline_rate(tmp_path, monkeypatch):
     decline rate is high, and sits at base when the CLI is healthy."""
     monkeypatch.setenv("SKHARNESS_HEALTH_PATH", str(tmp_path / "h.jsonl"))
     from skharness.autocode import health
+
     a = _Fake(Sandbox(), egress_hosts=[])
-    assert a._run_attempts() == a._RUN_ATTEMPTS                # no data -> base
+    assert a._run_attempts() == a._RUN_ATTEMPTS  # no data -> base
     for _ in range(8):
         health.record("run_inconclusive")
     for _ in range(2):
-        health.record("run_ok")                               # 80% decline
+        health.record("run_ok")  # 80% decline
     assert a._run_attempts() == a._RUN_ATTEMPTS_MAX
 
 
@@ -217,8 +286,9 @@ def test_assess_needs_decision_unconfirmed_proceeds(tmp_path, monkeypatch):
     flaky hedge: proceed as valid (the twin gate is the real arbiter)."""
     monkeypatch.setenv("SKHARNESS_HEALTH_PATH", str(tmp_path / "h.jsonl"))
     a = _Fake(Sandbox(), egress_hosts=[])
-    seq = iter([{"verdict": "needs_decision", "reason": "hedge"},
-                {"verdict": "valid", "reason": "ok"}])
+    seq = iter(
+        [{"verdict": "needs_decision", "reason": "hedge"}, {"verdict": "valid", "reason": "ok"}]
+    )
     monkeypatch.setattr(a, "_run", lambda *args, **kw: next(seq))
     v = a.assess(_brief())
     assert v.verdict == "valid" and "not confirmed" in v.reason
@@ -228,7 +298,8 @@ def test_assess_needs_decision_confirmed_escalates(tmp_path, monkeypatch):
     """A needs_decision the second opinion ALSO returns is a real ambiguity: escalate."""
     monkeypatch.setenv("SKHARNESS_HEALTH_PATH", str(tmp_path / "h.jsonl"))
     a = _Fake(Sandbox(), egress_hosts=[])
-    monkeypatch.setattr(a, "_run",
-                        lambda *args, **kw: {"verdict": "needs_decision", "reason": "contradictory"})
+    monkeypatch.setattr(
+        a, "_run", lambda *args, **kw: {"verdict": "needs_decision", "reason": "contradictory"}
+    )
     v = a.assess(_brief())
     assert v.verdict == "needs_decision" and v.reason == "contradictory"

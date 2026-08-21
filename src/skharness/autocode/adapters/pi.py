@@ -18,13 +18,15 @@ and nothing else), which is why skgateway `request_log` rows have NULL agent_id 
 session_id for every harness run. pi reads a provider-level `headers` map from the
 same models.json we already generate, so the fix is a config change here rather than
 new plumbing. See _attribution_headers for the literal-values rule."""
+
 from __future__ import annotations
 
 import json
 import re
 
-from .base import BaseCliAdapter, parse_event_stream
+from .base import BaseCliAdapter, extract_json, parse_event_stream
 from ...arena.pi_bridge import PI_PROFILES, BridgeDeniedError
+from ..types import HarnessProvenanceReason
 
 # Attribution header values must be plain, inert tokens. pi treats a LEADING `!`
 # in a header value as "run this shell command and use its stdout", re-executed on
@@ -36,6 +38,49 @@ from ...arena.pi_bridge import PI_PROFILES, BridgeDeniedError
 # it silently would leave the run unattributable with nothing to show for it.
 _ATTRIBUTION_TOKEN = re.compile(r"\A[A-Za-z0-9._:@/=+-]{1,200}\Z")
 
+# Exact stdout event vocabulary from pi-coding-agent 0.84.2's
+# JsonAgentSessionEvent (core/agent-session.d.ts + pi-agent-core/types.d.ts).
+# An upgrade that emits a new event must update this pin deliberately; silently
+# accepting a future envelope would make provenance semantics version-dependent.
+_PI_0842_EVENT_TYPES = frozenset(
+    {
+        "agent_start",
+        "agent_end",
+        "agent_settled",
+        "turn_start",
+        "turn_end",
+        "message_start",
+        "message_update",
+        "message_end",
+        "tool_execution_start",
+        "tool_execution_update",
+        "tool_execution_end",
+        "queue_update",
+        "compaction_start",
+        "compaction_end",
+        "entry_appended",
+        "session_info_changed",
+        "thinking_level_changed",
+        "auto_retry_start",
+        "auto_retry_end",
+        "summarization_retry_scheduled",
+        "summarization_retry_attempt_start",
+        "summarization_retry_finished",
+        "bash_execution_update",
+    }
+)
+_PI_0842_MESSAGE_ROLES = frozenset(
+    {
+        "user",
+        "assistant",
+        "toolResult",
+        "bashExecution",
+        "custom",
+        "branchSummary",
+        "compactionSummary",
+    }
+)
+
 
 def _attribution_value(name: str, value):
     """Validate one attribution header value. None -> None (header is omitted)."""
@@ -46,27 +91,180 @@ def _attribution_value(name: str, value):
         raise ValueError(
             f"unsafe pi attribution header value for {name!r}: {value!r}. Allowed: "
             "1-200 chars of [A-Za-z0-9._:@/=+-]. A leading '!' or '$' is a pi magic "
-            "prefix (shell exec / env lookup), so such a value is never passed through.")
+            "prefix (shell exec / env lookup), so such a value is never passed through."
+        )
     return value
 
 
-def _observed_served_model(body: str) -> str | None:
-    """Read Pi's provider-owned responseModel; never infer it from the request."""
-    for line in (body or "").splitlines():
+def _model_id(value: str | None) -> str | None:
+    """Normalize a model id while refusing the ambiguous blank route."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError("pi model id must be a string or None")
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("pi model id must not be blank")
+    return normalized
+
+
+def _valid_pi_event_envelope(event) -> bool:
+    """Minimum trusted envelope contract for pinned Pi 0.84.2 JSON events."""
+    if not isinstance(event, dict) or event.get("type") not in _PI_0842_EVENT_TYPES:
+        return False
+    if event["type"] == "message_end":
+        message = event.get("message")
+        if not isinstance(message, dict) or message.get("role") not in _PI_0842_MESSAGE_ROLES:
+            return False
+        # Assistant content is required by Pi's AssistantMessage. Validate the
+        # portion needed by parsing/provenance rather than pretending a role-only
+        # object is a complete provider event.
+        if message["role"] == "assistant" and not isinstance(message.get("content"), list):
+            return False
+    return True
+
+
+def _pi_event_scan(raw) -> tuple[list[dict], bool]:
+    """Return Pi envelopes plus whether nonblank output was not an event.
+
+    Normal Pi output is NDJSON under ``raw["result"]``.  A one-event stream is
+    valid JSON, though, so Sandbox may return that event directly. Malformed,
+    truncated, scalar, and non-event JSON lines are retained as an incomplete
+    signal rather than silently discarded. Neither a model reply dict nor
+    arbitrary nested JSON is promoted to an event.
+    """
+    candidate = raw.get("result") if isinstance(raw, dict) and "result" in raw else raw
+    if isinstance(candidate, dict):
+        if _valid_pi_event_envelope(candidate):
+            return [candidate], False
+        return [], bool(candidate)
+    if not isinstance(candidate, str):
+        return [], False
+    events = []
+    incomplete = False
+    for line in candidate.splitlines():
+        if not line.strip():
+            continue
         try:
             event = json.loads(line)
         except (json.JSONDecodeError, TypeError):
+            incomplete = True
             continue
-        if not isinstance(event, dict):
-            continue
+        if _valid_pi_event_envelope(event):
+            events.append(event)
+        else:
+            incomplete = True
+    return events, incomplete
+
+
+def _pi_events(raw) -> list[dict]:
+    """Compatibility view of valid envelopes; trust callers use scan status too."""
+    return _pi_event_scan(raw)[0]
+
+
+def _assistant_message_events(raw) -> list[tuple[dict, dict]]:
+    """Only provider-owned assistant ``message_end`` events count as calls."""
+    result = []
+    for event in _pi_events(raw):
         message = event.get("message")
-        candidates = [event.get("responseModel")]
-        if isinstance(message, dict):
-            candidates.insert(0, message.get("responseModel"))
-        for candidate in candidates:
-            if isinstance(candidate, str) and candidate.strip():
-                return candidate.strip()
-    return None
+        if (
+            event.get("type") == "message_end"
+            and isinstance(message, dict)
+            and message.get("role") == "assistant"
+        ):
+            result.append((event, message))
+    return result
+
+
+def _event_response_models(event: dict, message: dict) -> tuple[str, ...]:
+    """Distinct non-blank responseModel values in one trusted event."""
+    values = []
+    for candidate in (message.get("responseModel"), event.get("responseModel")):
+        if isinstance(candidate, str) and candidate.strip():
+            value = candidate.strip()
+            if value not in values:
+                values.append(value)
+    return tuple(values)
+
+
+def _model_served_evidence(raw) -> tuple[str | None, HarnessProvenanceReason | None]:
+    """Aggregate every assistant call without collapsing gaps or conflicts."""
+    events, incomplete = _pi_event_scan(raw)
+    messages = []
+    for event in events:
+        message = event.get("message")
+        if (
+            event.get("type") == "message_end"
+            and isinstance(message, dict)
+            and message.get("role") == "assistant"
+        ):
+            messages.append((event, message))
+    observed = []
+    missing = False
+    for event, message in messages:
+        values = _event_response_models(event, message)
+        if len(values) > 1:
+            return None, HarnessProvenanceReason.MODEL_SERVED_CONFLICT
+        if not values:
+            missing = True
+        else:
+            observed.append(values[0])
+
+    if len(set(observed)) > 1:
+        return None, HarnessProvenanceReason.MODEL_SERVED_CONFLICT
+    if incomplete:
+        return None, HarnessProvenanceReason.MODEL_SERVED_INCOMPLETE_STREAM
+    if observed and missing:
+        return None, HarnessProvenanceReason.MODEL_SERVED_PARTIAL
+    if observed:
+        return observed[0], None
+    return None, HarnessProvenanceReason.MODEL_SERVED_NOT_OBSERVED
+
+
+def _observed_served_model(raw) -> str | None:
+    """Compatibility helper: return a model only for complete, agreeing evidence."""
+    return _model_served_evidence(raw)[0]
+
+
+_ASSISTANT_PROVENANCE_FIELDS = frozenset(
+    {
+        "model_requested",
+        "model_served",
+        "backend_served",
+        "gateway_req_id",
+        "model_served_reason",
+        "backend_served_reason",
+        "gateway_req_id_reason",
+    }
+)
+
+
+def _without_assistant_provenance(value: dict) -> dict:
+    """Copy a model reply while removing every controller-owned provenance key."""
+    return {key: item for key, item in value.items() if key not in _ASSISTANT_PROVENANCE_FIELDS}
+
+
+def _assistant_event_result(event: dict, message: dict) -> dict | None:
+    """Parse one assistant reply and annotate it only from that same event."""
+    chunks = [
+        part.get("text")
+        for part in (message.get("content") or [])
+        if isinstance(part, dict)
+        and part.get("type") == "text"
+        and isinstance(part.get("text"), str)
+    ]
+    obj = extract_json("".join(chunks)) if chunks else None
+    if not obj:
+        return None
+    clean = _without_assistant_provenance(obj)
+    if not clean:
+        # Provider metadata must not turn an otherwise empty/forged assistant
+        # reply into a usable assess/grade result.
+        return None
+    response_models = _event_response_models(event, message)
+    if len(response_models) == 1:
+        clean["model_served"] = response_models[0]
+    return clean
 
 
 class PiAdapter(BaseCliAdapter):
@@ -83,11 +281,23 @@ class PiAdapter(BaseCliAdapter):
     _H_SESSION = "x-session-id"
     _H_CARD = "x-sk-card-id"
 
-    def __init__(self, sandbox=None, model=None, base_url=None, egress_hosts=None,
-                 live_execution: bool = False, image=None, max_tokens=None,
-                 run_timeout=None, session_id=None, card_id=None, capability_profile=None):
+    def __init__(
+        self,
+        sandbox=None,
+        model=None,
+        base_url=None,
+        egress_hosts=None,
+        live_execution: bool = False,
+        image=None,
+        max_tokens=None,
+        run_timeout=None,
+        session_id=None,
+        card_id=None,
+        capability_profile=None,
+    ):
         from ..sandbox import Sandbox
-        self.model = model
+
+        self.model = _model_id(model)
         self.base_url = base_url
         # Attribution ids. Optional and None by default: a caller that does not know
         # who it is sends NO attribution headers at all, rather than empty strings.
@@ -115,10 +325,16 @@ class PiAdapter(BaseCliAdapter):
         super().__init__(sb, egress_hosts=egress_hosts, live_execution=live_execution)
 
     def capabilities(self):
-        return {"session_resume": True, "structured_output": "json",
-                "sandbox": True, "tool_restrictions": True,
-                "task_plane": True, "session_plane": False,
-                "headless_api": "none", "hot_set_model": False}
+        return {
+            "session_resume": True,
+            "structured_output": "json",
+            "sandbox": True,
+            "tool_restrictions": True,
+            "task_plane": True,
+            "session_plane": False,
+            "headless_api": "none",
+            "hot_set_model": False,
+        }
 
     def supports_model_override(self) -> bool:
         # pi honours it in both places that name a model: _argv (the REQUEST) and
@@ -133,18 +349,24 @@ class PiAdapter(BaseCliAdapter):
         _config_files: pi DECLARES a provider model in models.json and REQUESTS one
         on the command line, and if those two disagree pi asks skgw for a model it
         never declared."""
-        return model if model is not None else self.model
+        return _model_id(model) if model is not None else self.model
 
-    def _argv(self, prompt: str, light: bool = False,
-              model: str | None = None) -> list[str]:
+    def _argv(self, prompt: str, light: bool = False, model: str | None = None) -> list[str]:
         # light (assess/grade judgment) accepted for the unified seam; pi's
         # --no-session already runs a single non-agentic shot.
         eff = self._effective_model(model)
         argv = ["pi", "-p", prompt, "--mode", "json", "--no-session"]
         if self.capability_profile:
             profile = PI_PROFILES[self.capability_profile]
-            argv.extend(["--no-extensions", "-e", "/opt/skharness/pi/sk-bridge.ts",
-                         "--tools", ",".join(profile.pi_tools)])
+            argv.extend(
+                [
+                    "--no-extensions",
+                    "-e",
+                    "/opt/skharness/pi/sk-bridge.ts",
+                    "--tools",
+                    ",".join(profile.pi_tools),
+                ]
+            )
         if eff:
             argv.extend(["--model", f"skgw/{eff}", "--api-key", "sk-local"])
         return argv
@@ -153,7 +375,7 @@ class PiAdapter(BaseCliAdapter):
         return self.image
 
     def _auth_mounts(self):
-        return []                              # local skgateway: no external cred
+        return []  # local skgateway: no external cred
 
     def _auth_env(self):
         # points pi at the injected config dir (models.json); do NOT set
@@ -200,9 +422,9 @@ class PiAdapter(BaseCliAdapter):
         return headers
 
     def _config_files(self, model: str | None = None, session_id=None, card_id=None):
+        eff = self._effective_model(model)
         if not self.base_url:
             return {}
-        eff = self._effective_model(model)
         skgw = {
             "baseUrl": self.base_url,
             "api": "openai-completions",
@@ -214,39 +436,65 @@ class PiAdapter(BaseCliAdapter):
             # key, so the only x-session-id skgateway ever sees from pi is the one the
             # harness put there and can join back to a run.
             "compat": {"supportsDeveloperRole": False},
-            "models": [{"id": eff,
-                        "limit": {"context": self.max_tokens,
-                                  "output": self.max_tokens}}],
+            "models": [
+                {"id": eff, "limit": {"context": self.max_tokens, "output": self.max_tokens}}
+            ],
         }
         headers = self._attribution_headers(session_id=session_id, card_id=card_id)
-        if headers:                       # absent, never {}, when we know no ids
+        if headers:  # absent, never {}, when we know no ids
             skgw["headers"] = headers
         return {"/agent/models.json": json.dumps({"providers": {"skgw": skgw}})}
+
+    def _result_provenance(self, raw: dict, model: str | None = None) -> dict:
+        """Facts Pi's provider-owned event stream actually exposes.
+
+        ``responseModel`` is part of Pi's AssistantMessage contract.  Its
+        ``provider`` is the configured provider (``skgw``), not the backend that
+        served the request, and ``responseId`` is an upstream response identifier,
+        not SKGateway's ``x-sk-req-id`` response header.  Pi does not expose those
+        response headers in JSON mode, so neither field may be coerced into gateway
+        attribution.  The closed reasons keep each absence explicit.
+        """
+        served, served_reason = _model_served_evidence(raw)
+        return {
+            "model_requested": self._effective_model(model),
+            "model_served": served,
+            "backend_served": None,
+            "gateway_req_id": None,
+            "model_served_reason": served_reason,
+            "backend_served_reason": (HarnessProvenanceReason.BACKEND_SERVED_NOT_OBSERVED),
+            "gateway_req_id_reason": (HarnessProvenanceReason.GATEWAY_REQ_ID_NOT_OBSERVED),
+        }
 
     def _parse(self, raw: dict) -> dict:
         if not isinstance(raw, dict):
             return {}
         # already the model reply dict
         if any(k in raw for k in ("verdict", "score", "passed")):
-            return raw
+            return _without_assistant_provenance(raw)
+
+        # Pi can emit several assistant message_end events in one agentic turn.
+        # Parse the first usable reply as before, but bind responseModel ONLY from
+        # that exact event.  Aggregating metadata across the stream here would
+        # cross-associate one assistant's JSON with another provider call.
+        for event, message in _assistant_message_events(raw):
+            if obj := _assistant_event_result(event, message):
+                return obj
+
         body = raw.get("result")
         if isinstance(body, dict):
-            return body
+            return _without_assistant_provenance(body)
         if isinstance(body, str):
-            # pi `--mode json` is an event stream (same shape family as opencode);
-            # Sandbox.spawn hands it over as result=<stream> when not a lone object.
+            # Compatibility fallback for the older opencode-like text event shape.
+            # It has no Pi AssistantMessage envelope, so it cannot contribute
+            # provider attribution.
             obj = parse_event_stream(body)
             if obj:
-                # A model-authored JSON field is not provenance. Replace it only
-                # when Pi's provider-owned event envelope reports responseModel.
-                obj.pop("model_served", None)
-                if observed := _observed_served_model(body):
-                    obj["model_served"] = observed
-                return obj
-            try:                                   # single-object fallback
+                return _without_assistant_provenance(obj)
+            try:  # single-object fallback
                 single = json.loads(body)
-                if isinstance(single, dict):
-                    return single
+                if isinstance(single, dict) and "type" not in single:
+                    return _without_assistant_provenance(single)
             except (json.JSONDecodeError, TypeError):
                 pass
         return {}
