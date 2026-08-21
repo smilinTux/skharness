@@ -409,6 +409,25 @@ RUN_SANDBOX_IT=1 SANDBOX_TEST_IMAGE=sandbox-pi:1 \
   python -m pytest -q tests/test_sandbox_confinement_it.py
 ```
 
+The Pi provider release gate is stricter than the host-level mock contract. Pull an
+already-qualified image by digest, then run the opt-in container test with that exact
+reference:
+
+```bash
+docker pull \
+  ghcr.io/smilintux/skharness-pi-python-test@sha256:e7268563898230b39ca512d3614a9263c19bde79d9e1193d1c595d971aec1dfa
+RUN_PI_GATEWAY_CONTAINER_IT=1 \
+PI_GATEWAY_TEST_IMAGE=ghcr.io/smilintux/skharness-pi-python-test@sha256:e7268563898230b39ca512d3614a9263c19bde79d9e1193d1c595d971aec1dfa \
+  python -m pytest -q tests/test_pi_container_gateway_it.py
+```
+
+The test rejects mutable image references. It runs both the Python-stdlib mock gateway
+and real Pi worker from the supplied digest on a unique Docker `--internal` network,
+checks the requested model, card/session attribution, provider-owned response model and
+assistant output, and makes a raw public-IP connection from that same worker fail. It
+removes both containers and the network even after a failed assertion. No gateway or
+registry credential is needed after the digest has been pulled.
+
 Continual-loop comparisons use `skharness.arena.evaluation`. A report is valid only
 when every baseline, memory-only, skills-only, subagents-only, and full-loop cell is
 present for the declared fixed seeds and repetition count. The report always includes

@@ -448,6 +448,14 @@ PID/CPU/memory limits, internal network plus allowlist proxy, per-run worktree, 
 separate writable temp/home volumes. GPU access is opt-in by ChallengeSpec and requires
 real GPU telemetry; host RAM is never labeled VRAM.
 
+The canonical Pi/SKGateway transport gate uses a registry-digest-pinned image for both
+the real Pi worker and a Python-stdlib mock gateway on one unique Docker `--internal`
+network. One run must join the requested `skgw/<model>`, gateway-observed model and
+card/session headers, provider-owned `responseModel`, and assistant output. A raw
+public-IP connection attempted by the same worker must fail; a host Pi contract, a
+separate generic confinement test, or a container launched with host networking cannot
+substitute for this joined proof. The opt-in procedure is maintained in `SOP.md`.
+
 ## 9. Trust boundaries and anti-gaming controls
 
 | Boundary | Worker may | Worker may not |

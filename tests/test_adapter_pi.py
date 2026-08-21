@@ -26,7 +26,9 @@ def test_local_model_routes_to_skgateway_via_injected_models_json():
     cfg = a._config_files()
     models = json.loads(cfg["/agent/models.json"])
     skgw = models["providers"]["skgw"]
+    assert {"baseUrl", "api", "apiKey", "compat", "models"} <= skgw.keys()
     assert skgw["api"] == "openai-completions"
+    assert skgw["apiKey"] == "sk-local"
     assert skgw["baseUrl"] == "http://localhost:18780/v1"
     assert skgw["compat"]["supportsDeveloperRole"] is False
     assert skgw["models"][0]["id"] == "ornith-big"
