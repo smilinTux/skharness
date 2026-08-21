@@ -201,7 +201,20 @@ def sign_one(path: Path, *, home: Path | None, identity: str,
     # Re-verify against the SAME roster a reader will check, before trusting
     # our own write: an unverifiable signature is worse than none, since it
     # LOOKS trustworthy without being checkable.
-    verifier = capauth_verifier()
+    # Self-check against the same explicitly selected operator home used to
+    # sign.  The ordinary verifier is acting-agent aware; without this pin an
+    # operator ceremony launched from an agent session signs with Chef but
+    # attempts verification against that agent's roster.
+    previous_home = os.environ.get("CAPAUTH_HOME")
+    if home is not None:
+        os.environ["CAPAUTH_HOME"] = str(home)
+    try:
+        verifier = capauth_verifier()
+    finally:
+        if previous_home is None:
+            os.environ.pop("CAPAUTH_HOME", None)
+        else:
+            os.environ["CAPAUTH_HOME"] = previous_home
     if verifier is None:
         print(f"REFUSE {path}: signed, but no local trust roster available to "
               f"confirm it against; not writing an unverifiable file",

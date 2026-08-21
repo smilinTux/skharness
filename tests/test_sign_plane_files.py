@@ -7,6 +7,7 @@ actual sign/verify round trip through real PGP is exercised end to end.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -139,6 +140,36 @@ def test_signs_and_self_verifies_freeze_file(fleet_root, operator_home):
 
     status, detail = fleet_signing.verify_payload(on_disk, _verifier)
     assert status == "verified", detail
+
+
+def test_self_check_pins_explicit_home_and_restores_ambient_home(
+    fleet_root, operator_home, tmp_path, monkeypatch
+):
+    """An active agent's unrelated trust home cannot break Chef's ceremony."""
+    home, fpr = operator_home
+    unrelated_home = tmp_path / "agent-capauth-home"
+    (unrelated_home / "identity").mkdir(parents=True)
+    unrelated = get_backend().generate_keypair(
+        "unrelated-agent", "agent@skworld.io", "", Algorithm.ED25519
+    )
+    (unrelated_home / "identity" / "public.asc").write_text(unrelated.public_armor)
+    monkeypatch.setenv("CAPAUTH_HOME", str(unrelated_home))
+    _write(
+        fleet_root,
+        "_freeze.json",
+        {"frozen": True, "writer": {"identity": "x", "signature": None}},
+    )
+
+    ok = spf.sign_one(
+        fleet_root / "objects" / "_freeze.json",
+        home=home,
+        identity="capauth:chef@skworld.io",
+        expect_fingerprint=fpr,
+        dry_run=False,
+    )
+
+    assert ok is True
+    assert os.environ["CAPAUTH_HOME"] == str(unrelated_home)
 
 
 def test_signs_and_migrates_legacy_protected_json(fleet_root, operator_home):
