@@ -13,7 +13,7 @@ from skharness.arena.swarm import (
 )
 from skharness.arena.swarm_pi import PiSwarmLaunch, PiSwarmWorkerRuntime
 from skharness.arena.trajectory import CardSize
-from skharness.autocode.sandbox import LaunchSpec
+from skharness.autocode.sandbox import InspectionScope, LaunchSpec
 
 DIGEST = "sha256:" + "1" * 64
 COMMIT = "a" * 40
@@ -70,7 +70,9 @@ class Runner:
 def _launch(contract):
     return PiSwarmLaunch(
         request=AttemptRequest("challenge", "experiment", "1", contract.contract_id),
-        spec=LaunchSpec("pi", ["pi"], "image", "/work"),
+        spec=LaunchSpec(
+            "pi", ["pi"], "image", "/work", inspection_scope=InspectionScope(max_calls=48)
+        ),
         card_size=CardSize.MEDIUM,
         requested_model="ornith",
         timeout_s=600,
@@ -80,7 +82,7 @@ def _launch(contract):
 def test_pi_runtime_maps_success_to_evidence_not_completion_authority():
     runner = Runner(
         RunOutcome(True, "exit", 0, DIGEST, "sha256:" + "2" * 64,
-                   metrics={"duration_s": 1.2})
+                   metrics={"duration_s": 1.2, "tokens": 80, "tool_calls": 4, "cost": 0.5})
     )
     runtime = PiSwarmWorkerRuntime(
         runner_factory=lambda contract: runner,
@@ -93,9 +95,13 @@ def test_pi_runtime_maps_success_to_evidence_not_completion_authority():
     assert execution.result.evidence_refs == (DIGEST, "sha256:" + "2" * 64)
     assert execution.result.observed_commit == COMMIT
     assert execution.usage.wall_seconds == 2
+    assert execution.usage.tokens == 80
+    assert execution.usage.tool_calls == 4
+    assert execution.usage.cost == 0.5
     assert runner.kwargs["timeout_s"] == 60
     assert runner.spec.scoped_readable_paths == ["src"]
     assert runner.spec.scoped_writable_paths == ["src"]
+    assert runner.spec.inspection_scope.max_calls == 10
 
 
 def test_pi_runtime_preserves_blocked_disposition_and_can_cancel_active_runner():

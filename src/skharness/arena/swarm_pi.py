@@ -56,6 +56,17 @@ class PiSwarmWorkerRuntime:
                 launch.spec,
                 scoped_readable_paths=list(contract.readable_paths),
                 scoped_writable_paths=list(contract.writable_paths),
+                inspection_scope=(
+                    replace(
+                        launch.spec.inspection_scope,
+                        max_calls=min(
+                            launch.spec.inspection_scope.max_calls,
+                            contract.budget.tool_call_limit,
+                        ),
+                    )
+                    if launch.spec.inspection_scope is not None
+                    else None
+                ),
             ),
         )
         started = datetime.now(timezone.utc)
@@ -87,11 +98,19 @@ class PiSwarmWorkerRuntime:
             evidence_refs = tuple(dict.fromkeys((raw.stdout_digest, raw.stderr_digest)))
             summary = f"Pi worker terminal classification: {raw.classification}"
             duration = (raw.metrics or {}).get("duration_s", 0)
+            tokens = (raw.metrics or {}).get("tokens", 0)
+            tool_calls = (raw.metrics or {}).get("tool_calls", 0)
+            cost = (raw.metrics or {}).get("cost", 0.0)
             usage = BudgetUsage(
                 wall_seconds=min(
                     contract.budget.wall_seconds,
                     max(0, math.ceil(duration)) if isinstance(duration, (int, float)) else 0,
-                )
+                ),
+                tokens=tokens if isinstance(tokens, int) and tokens >= 0 else 0,
+                tool_calls=(
+                    tool_calls if isinstance(tool_calls, int) and tool_calls >= 0 else 0
+                ),
+                cost=float(cost) if isinstance(cost, (int, float)) and cost >= 0 else 0.0,
             )
         result = SubagentResult.from_contract(
             contract,

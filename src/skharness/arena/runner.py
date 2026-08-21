@@ -469,6 +469,7 @@ class PiExperimentRunner:
         inspection_denial = self._inspection_denial(directory / "inspection-denial.json")
         served_model = self._served_model(stdout_path)
         time_to_first_edit_s = self._time_to_first_edit(stdout_path)
+        event_usage = self._usage_metrics(stdout_path)
         requested_model = requested_model or self._requested_model(spec)
         timeout_phase = None
         if classification == "timeout":
@@ -486,6 +487,7 @@ class PiExperimentRunner:
                 "build": budget.build_s,
                 "test": budget.test_s,
             },
+            **event_usage,
         }
         if exit_code == 0 and classification == "exit" and terminal_error is not None:
             # Pi can report a provider/parser failure in its structured event
@@ -614,6 +616,29 @@ class PiExperimentRunner:
                     return round(float(value), 3)
             return None
         return None
+
+    @classmethod
+    def _usage_metrics(cls, path: Path) -> dict[str, int | float]:
+        tool_calls = 0
+        tokens = 0
+        cost = 0.0
+        for event in cls._events(path):
+            if event.get("type") == "tool_execution_start":
+                tool_calls += 1
+            if event.get("type") != "message_end":
+                continue
+            message = event.get("message")
+            usage = message.get("usage") if isinstance(message, dict) else None
+            if not isinstance(usage, dict):
+                continue
+            total = usage.get("totalTokens")
+            if isinstance(total, int) and total >= 0:
+                tokens += total
+            costs = usage.get("cost")
+            total_cost = costs.get("total") if isinstance(costs, dict) else None
+            if isinstance(total_cost, (int, float)) and total_cost >= 0:
+                cost += float(total_cost)
+        return {"tool_calls": tool_calls, "tokens": tokens, "cost": round(cost, 8)}
 
     @staticmethod
     def _pi_terminal_error(path: Path) -> str | None:

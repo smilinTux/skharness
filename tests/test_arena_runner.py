@@ -218,6 +218,21 @@ def test_worker_text_can_only_ratchet_trust_down_not_claim_completion(tmp_path):
     assert outcome.disposition is None
 
 
+def test_pi_usage_metrics_are_derived_from_structured_events(tmp_path):
+    path = tmp_path / "stdout.log"
+    path.write_bytes(
+        b'{"type":"tool_execution_start","toolName":"read","args":{}}\n'
+        b'{"type":"message_end","message":{"role":"assistant",'
+        b'"usage":{"totalTokens":123,"cost":{"total":0.25}}}}\n'
+        b'{"type":"tool_execution_start","toolName":"bash","args":{}}\n'
+    )
+    assert PiExperimentRunner._usage_metrics(path) == {
+        "tool_calls": 2,
+        "tokens": 123,
+        "cost": 0.25,
+    }
+
+
 def test_corrupt_committed_event_tail_stops_restart_recovery(tmp_path):
     controller = _controller(tmp_path)
     controller.propose("experiment")
