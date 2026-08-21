@@ -15,6 +15,23 @@ def test_spawn_disabled_raises_when_not_live():
         Sandbox(live_execution=False).spawn(_spec(), repo_remote_host="github.com", ci_host=None)
 
 
+def test_image_preflight_fails_clearly_when_required_test_command_is_absent(monkeypatch):
+    def fake_run(argv, **kwargs):
+        class Result:
+            returncode = 1 if "command -v pytest" in argv else 0
+            stdout = ""
+            stderr = ""
+
+        return Result()
+
+    monkeypatch.setattr("skharness.autocode.sandbox.shutil.which", lambda _: "/usr/bin/docker")
+    monkeypatch.setattr("skharness.autocode.sandbox.subprocess.run", fake_run)
+    spec = _spec()
+    spec.required_commands = ["pytest"]
+    with pytest.raises(HarnessUnavailable, match="test-capable image"):
+        Sandbox()._ensure_capable(spec)
+
+
 def test_proxy_readiness_retries_until_listening(monkeypatch):
     results = iter([1, 1, 0])
 

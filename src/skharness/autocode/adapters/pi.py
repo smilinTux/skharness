@@ -163,6 +163,11 @@ class PiAdapter(BaseCliAdapter):
             env["SKHARNESS_PI_PROFILE"] = self.capability_profile
         return env
 
+    def _required_commands(self) -> list[str]:
+        # arena-build promises a test toolchain. Refuse a minimal pi-core image
+        # before spending an agent turn trying to bootstrap pytest in /tmp.
+        return ["pytest"] if self.capability_profile == "arena-build" else []
+
     def _attribution_headers(self, session_id=None, card_id=None) -> dict:
         """The provider-level `headers` map, or {} when we have nothing to attribute.
 

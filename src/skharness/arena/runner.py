@@ -203,6 +203,7 @@ def pi_launch_spec(
         egress_hosts=list(adapter.egress_hosts),
         config_files=adapter._config_files(model=model),
         stdin=adapter._stdin_for(prompt),
+        required_commands=adapter._required_commands(),
     )
 
 
@@ -298,6 +299,11 @@ class PiExperimentRunner:
             classification = "lease_lost"
         stdout_digest = self._capture(directory / "stdout.log")
         stderr_digest = self._capture(directory / "stderr.log")
+        terminal_error = self._pi_terminal_error(directory / "stdout.log")
+        if exit_code == 0 and classification == "exit" and terminal_error is not None:
+            # Pi can report a provider/parser failure in its structured event
+            # stream and still exit zero. A zero shell status alone is not success.
+            classification = "pi_terminal_error"
         if exit_code not in (None, 0) and classification == "exit":
             stderr_path = directory / "stderr.log"
             stderr = (
@@ -328,6 +334,8 @@ class PiExperimentRunner:
             "stderr_digest": stderr_digest,
             "partial": not successful,
         }
+        if terminal_error is not None:
+            payload["terminal_error"] = terminal_error
         if not cancelled:
             self.controller.finish_run(
                 request.experiment_id, attempt, successful=successful, payload=payload
@@ -343,6 +351,28 @@ class PiExperimentRunner:
             stderr_digest,
             partial=not successful,
         )
+
+    @staticmethod
+    def _pi_terminal_error(path: Path) -> str | None:
+        """Return Pi's last structured terminal error, bounded for event metadata."""
+        if not path.exists():
+            return None
+        error = None
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                event = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(event, dict) or event.get("type") != "message_end":
+                continue
+            message = event.get("message")
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            if message.get("stopReason") != "error":
+                continue
+            detail = message.get("errorMessage")
+            error = detail.strip() if isinstance(detail, str) and detail.strip() else "pi error"
+        return error[:2000] if error is not None else None
 
     def cancel(self, experiment_id: str, attempt: int = 1) -> None:
         self.controller.cancel(

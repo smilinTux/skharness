@@ -147,6 +147,39 @@ def test_gateway_outage_is_classified_and_retains_diagnostics(tmp_path):
     assert controller.store.get_artifact(outcome.stderr_digest) == supervisor.stderr
 
 
+def test_pi_structured_terminal_error_overrides_zero_process_exit(tmp_path):
+    controller = _controller(tmp_path)
+    controller.propose("experiment")
+    stream = (
+        b'{"type":"message_end","message":{"role":"assistant",'
+        b'"stopReason":"error","errorMessage":"unexpected tokens remaining"}}\n'
+    )
+    outcome = PiExperimentRunner(
+        controller, ScriptedSupervisor(exit_code=0, stdout=stream), tmp_path / "runs"
+    ).execute(_request(), _spec(tmp_path))
+
+    assert not outcome.successful and outcome.partial
+    assert outcome.exit_code == 0
+    assert outcome.classification == "pi_terminal_error"
+    event = controller.store.read_all_events()[-1]
+    assert event.to_state is ExperimentState.FAILED
+    assert event.payload["terminal_error"] == "unexpected tokens remaining"
+
+
+def test_normal_pi_terminal_event_with_zero_exit_remains_successful(tmp_path):
+    controller = _controller(tmp_path)
+    controller.propose("experiment")
+    stream = (
+        b'{"type":"message_end","message":{"role":"assistant",'
+        b'"stopReason":"stop","content":[{"type":"text","text":"done"}]}}\n'
+    )
+    outcome = PiExperimentRunner(
+        controller, ScriptedSupervisor(exit_code=0, stdout=stream), tmp_path / "runs"
+    ).execute(_request(), _spec(tmp_path))
+    assert outcome.successful
+    assert outcome.classification == "exit"
+
+
 def test_corrupt_committed_event_tail_stops_restart_recovery(tmp_path):
     controller = _controller(tmp_path)
     controller.propose("experiment")
@@ -266,6 +299,7 @@ def test_pi_launch_spec_reuses_adapter_routing_profile_and_model_config(tmp_path
     assert spec.argv[:3] == ["pi", "-p", "optimize"]
     assert "skgw/build" in spec.argv
     assert "http://skgateway:18780/v1" in spec.config_files["/agent/models.json"]
+    assert spec.required_commands == ["pytest"]
 
 
 def test_production_factory_can_only_construct_real_sandbox_supervisor(tmp_path):

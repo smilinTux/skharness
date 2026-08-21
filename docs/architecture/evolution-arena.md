@@ -283,6 +283,22 @@ that are read-only to ordinary jobs or isolated per experiment. Flutter/Android 
 GPU compiler stacks remain separate heavyweight variants; they must not inflate every
 worker startup.
 
+### `skharness-pi-python-test`
+
+Extends `pi-polyglot` with the repository's hash-locked pytest/coverage environment.
+Use this target, or a project-qualified derivative, for coding tickets whose acceptance
+criteria require Python tests. `pi-core` is not a coding-test image: an agent must not
+spend its task budget installing dev dependencies into an ephemeral directory. Runtime
+temp mounts may be `noexec`; preserving that confinement is preferable to making an
+improvised virtualenv executable. Select a qualified image before admission and fail
+preflight clearly when the declared test command is unavailable.
+
+Live run classification consumes Pi's structured terminal events as well as the process
+status. An assistant `message_end` with `stopReason=error` fails the run even when Pi
+exits zero. A wall-time expiry remains `timeout`, and partial stdout/stderr are retained.
+Independent host-side tests may validate a patch after a timeout, but that evidence does
+not rewrite the autonomous attempt into a successful finish.
+
 Implementation truth (repository audit, 2026-08-20): the Dockerfile now pins a Wolfi
 base digest, exact direct APKs, the Pi/npm graph, and hashed Python wheels. Core omits
 package/build managers; polyglot supplies verified Node/npm, Python/uv, Go, Rust/Cargo,

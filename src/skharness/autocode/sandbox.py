@@ -44,6 +44,7 @@ class LaunchSpec:
     stdin: str | None = None
     cpu_limit: float | None = None
     memory_gb_limit: float | None = None
+    required_commands: list[str] = field(default_factory=list)
 
 
 class Sandbox:
@@ -129,6 +130,18 @@ class Sandbox:
         if r.returncode != 0:
             raise HarnessUnavailable(
                 f"sandbox image {spec.image!r} not present; build it before live run (fail closed)")
+        for command in spec.required_commands:
+            probe = subprocess.run(
+                [self.docker, "run", "--rm", "--network", "none", "--read-only",
+                 "--entrypoint", "sh", spec.image, "-c", f"command -v {command}"],
+                capture_output=True,
+                text=True,
+            )
+            if probe.returncode != 0:
+                raise HarnessUnavailable(
+                    f"sandbox image {spec.image!r} lacks required command {command!r}; "
+                    "select a project-qualified/test-capable image before admission"
+                )
 
     def _wait_for_proxy(self, name: str, attempts: int = 50) -> None:
         """Do not launch a worker until its only permitted egress route listens."""

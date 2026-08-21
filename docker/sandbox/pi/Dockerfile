@@ -25,7 +25,14 @@ COPY pyproject.toml README.md /src/skharness/
 COPY src /src/skharness/src
 COPY docker/sandbox/pi/requirements.lock /opt/skharness/pi/requirements.lock
 RUN pip install --no-cache-dir --require-hashes -r /opt/skharness/pi/requirements.lock \
-    && pip install --no-cache-dir --no-deps /src/skharness \
+    && pip install --no-cache-dir --no-deps /src/skharness
+
+FROM pi-python-builder AS pi-python-runtime
+RUN pip uninstall -y pip setuptools
+
+FROM pi-python-builder AS pi-python-test-builder
+COPY docker/sandbox/pi/test-requirements.lock /opt/skharness/pi/test-requirements.lock
+RUN pip install --no-cache-dir --require-hashes -r /opt/skharness/pi/test-requirements.lock \
     && pip uninstall -y pip setuptools
 
 FROM ${WOLFI_IMAGE} AS pi-base
@@ -41,7 +48,7 @@ RUN apk add --no-cache ca-certificates=20260413-r1 curl=8.21.0-r2 \
 COPY --from=pi-node-builder /build/pi/node_modules /opt/skharness/pi/node_modules
 RUN install -d /usr/local/bin \
     && ln -s /opt/skharness/pi/node_modules/.bin/pi /usr/local/bin/pi
-COPY --from=pi-python-builder /opt/skharness/venv /opt/skharness/venv
+COPY --from=pi-python-runtime /opt/skharness/venv /opt/skharness/venv
 ENV PATH="/opt/skharness/venv/bin:${PATH}" \
     PI_CODING_AGENT_DIR=/agent \
     PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
@@ -70,4 +77,12 @@ RUN apk add --no-cache go-1.27=1.27.0-r1 \
 WORKDIR /work
 USER 10001:10001
 ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["pi", "--version"]
+
+# Coding-ticket target: polyglot toolchains plus the pinned Python test runner.
+# Keep this separate so pi-core retains its smaller runtime-only attack surface.
+FROM pi-polyglot AS pi-python-test
+USER root
+COPY --from=pi-python-test-builder /opt/skharness/venv /opt/skharness/venv
+USER 10001:10001
 CMD ["pi", "--version"]

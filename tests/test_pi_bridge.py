@@ -142,12 +142,16 @@ def test_image_manifest_pins_base_pi_and_two_targets():
     assert f"{lock['base_image']['reference']}@{lock['base_image']['index_digest']}" in dockerfile
     assert f"ARG PI_VERSION={lock['npm']['version']}" in dockerfile
     assert "AS pi-core" in dockerfile and "AS pi-polyglot" in dockerfile
+    assert "AS pi-python-test" in dockerfile
     assert "USER 10001:10001" in dockerfile
     assert "package-lock.json" in dockerfile
     assert "ghcr.io/astral-sh/uv:0.9.27@sha256:" in dockerfile
     assert "COPY --from=uv-tools /uv /uvx /usr/local/bin/" in dockerfile
     polyglot = dockerfile.split("FROM pi-base AS pi-polyglot", 1)[1]
     assert "npm-12=12.0.2-r2" in polyglot
+    python_test = dockerfile.split("FROM pi-polyglot AS pi-python-test", 1)[1]
+    assert "pi-python-test-builder" in python_test
+    assert "/opt/skharness/venv" in python_test
     assert '].version")" = "${PI_VERSION}"' in dockerfile
     assert lock["npm"]["integrity"].startswith("sha512-")
 
@@ -161,7 +165,7 @@ def test_core_image_keeps_build_and_package_managers_out_of_runtime():
     )[0]
 
     assert "COPY --from=pi-node-builder" in runtime
-    assert "COPY --from=pi-python-builder" in runtime
+    assert "COPY --from=pi-python-runtime" in runtime
     assert "build-base" not in runtime
     assert "py3.13-pip" not in runtime
     assert "test-requirements.lock" not in runtime

@@ -178,7 +178,7 @@ placeholder like `0.1.dev1`. Every CI checkout therefore sets `fetch-depth: 0` a
 ./docker/sandbox/build.sh
 ```
 
-The Pi Dockerfile has `pi-core` and `pi-polyglot` targets. The Wolfi base image
+The Pi Dockerfile has `pi-core`, `pi-polyglot`, and `pi-python-test` targets. The Wolfi base image
 digest, exact direct APKs, exact Pi version, and complete npm transitive integrity lock are recorded in
 `docker/sandbox/pi/dependencies.lock.json`; both targets run as UID/GID `10001`, and
 `docker/sandbox/build.sh pi` deliberately builds `pi-core` as `sandbox-pi:1`.
@@ -188,7 +188,22 @@ docker build --target pi-core -t skharness-pi-core:dev \
   -f docker/sandbox/pi/Dockerfile .
 docker build --target pi-polyglot -t skharness-pi-polyglot:dev \
   -f docker/sandbox/pi/Dockerfile .
+docker build --target pi-python-test -t skharness-pi-python-test:dev \
+  -f docker/sandbox/pi/Dockerfile .
 ```
+
+Use `pi-core` only for minimal runtime/qualification work. Use `pi-python-test` (or a
+project-qualified derivative) when a coding card requires Python tests. The
+`arena-build` profile declares `pytest` as a required image command; sandbox preflight
+fails before admission if the chosen image lacks it. Do not bootstrap a virtualenv in
+`/tmp`: deployments may correctly mount temporary storage `noexec`, and dependency
+installation during a verified run is outside the frozen environment contract.
+
+Pi process status is not sufficient completion evidence. SKHarness also reads the
+structured event stream: `message_end.message.stopReason=error` classifies the attempt
+as `pi_terminal_error` even if Pi exits zero. A wall-time expiry remains a timeout with
+partial evidence. Operator-run tests may validate the resulting patch, but must not be
+reported as an autonomous clean finish.
 
 Passing `capability_profile=` to `PiAdapter` loads only the in-image SK bridge extension
 and emits Pi's explicit `--tools` allowlist. The extension calls

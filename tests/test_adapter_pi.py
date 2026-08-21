@@ -118,6 +118,11 @@ def test_pi_declares_the_per_call_override_seam():
     assert _a().supports_model_override() is True
 
 
+def test_arena_build_declares_pytest_as_an_image_preflight_requirement():
+    assert _a(capability_profile="arena-build")._required_commands() == ["pytest"]
+    assert _a(capability_profile="arena-verify")._required_commands() == []
+
+
 def test_config_files_budget_overridable():
     import json
     from skharness.autocode.sandbox import Sandbox
