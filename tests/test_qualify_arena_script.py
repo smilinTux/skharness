@@ -146,6 +146,14 @@ def test_live_qualification_records_gateway_and_pi_evidence_without_secret(tmp_p
     assert evidence["pi"] == {
         "exit_code": 0,
         "stderr": "",
+        "raw_event_stream": json.dumps({
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "responseModel": "served-model-variant",
+                "content": [{"type": "text", "text": "qualified"}],
+            },
+        }),
         "responseModel": "served-model-variant",
         "served_model": "served-model",
         "completion_status": 200,
@@ -160,6 +168,9 @@ def test_live_qualification_records_gateway_and_pi_evidence_without_secret(tmp_p
     }
     assert evidence["pi_relay"]["captured_requests"] == 1
     assert secret not in json.dumps(evidence)
+    assert json.loads(evidence["pi"]["raw_event_stream"])["message"]["responseModel"] == (
+        "served-model-variant"
+    )
     post = next(item for item in Gateway.requests if item[0] == "POST")
     assert post[1] == "/v1/chat/completions"
     assert {key.lower(): value for key, value in post[2].items()}["x-sk-card-id"] == "card-1"

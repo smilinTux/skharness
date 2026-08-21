@@ -485,6 +485,9 @@ def live_qualification(args: argparse.Namespace) -> dict:
         "pi": {
             "exit_code": pi["exit_code"],
             "stderr": pi["stderr"],
+            # Preserve the provider event envelope as evidence. Pi stdout does
+            # not contain generated models.json credentials or request headers.
+            "raw_event_stream": pi["stdout"],
             "responseModel": response_model,
             "served_model": pi_served_model,
             "attribution": pi_attribution,

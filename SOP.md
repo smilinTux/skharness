@@ -286,6 +286,9 @@ event and exposed as `model_served` in the parsed result. A similarly named fiel
 assistant-authored JSON is stripped, and the requested model is never used as a
 fallback. The live `.41` evidence for this contract is
 `docs/evidence/0172231c-live-41.md`.
+The qualification bundle retains Pi stdout as `pi.raw_event_stream` so a card can
+prove the provider metadata was present; generated provider configuration and
+authorization headers are never written to that stream or bundle.
 
 ---
 
