@@ -9,6 +9,11 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ## [Unreleased]
 
+- Updated the plane-signing default to the governed 2026-08-20 Chef
+  fingerprint and documented the verified live freeze/protected ceremony.
+  Explicit operator-home self-verification remains mandatory even when an
+  unrelated agent profile is active.
+
 ### Fixed
 
 - Removed the fleet qualifier's accidental dependency on a host-global Pi executable.

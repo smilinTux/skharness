@@ -4,14 +4,11 @@
 
 WHY THE LIVE FILES ARE NOT SIGNED BY THIS CHANGE
 --------------------------------------------------
-The operator/root capauth identity (chef@skworld.io, fingerprint
-`BD7EEECA23D90A594400751CFDB582D9CB7272A6`) has its private key held in
-OFFLINE custody by policy (`~/.skcapstone/capauth/identity/custody.json`:
-`"private_key": "offline"`, per COLD_MACHINE_BOOTSTRAP_AND_DR.md and
-ROOT_ROTATION_CEREMONY.md). That is not an obstacle to route around: it is
-the property this whole card exists to protect, that the freeze card stays
-the one thing an autonomous agent session cannot forge unattended. This
-script therefore:
+The operator/root capauth identity (chef@skworld.io, current fingerprint
+`ADAD14CCAC8D6D0BF5A4209DB994E78200BF6422`) is human-controlled custody.
+That is not an obstacle to route around: it is the property this whole card
+exists to protect, that the freeze card stays the one thing an autonomous
+agent session cannot forge unattended. This script therefore:
 
   - Resolves the capauth home to sign with EXPLICITLY (`--capauth-home`, or
     `capauth.resolve_capauth_home()`, the agent-BLIND operator home), never
@@ -60,7 +57,7 @@ import sys
 from pathlib import Path
 
 DEFAULT_IDENTITY = "capauth:chef@skworld.io"
-DEFAULT_FINGERPRINT = "BD7EEECA23D90A594400751CFDB582D9CB7272A6"
+DEFAULT_FINGERPRINT = "ADAD14CCAC8D6D0BF5A4209DB994E78200BF6422"
 
 
 def _fleet_root() -> Path:

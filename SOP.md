@@ -652,10 +652,20 @@ deletes the freeze check (such a diff still passes).
   (`automerge_repos: []`) is still what keeps every build in front of a human. The
   carve-out is the backstop for the day that flag flips, which is exactly why it must not
   be reachable only through the flag it is meant to survive.
-- **The manifest half is unsigned.** `objects/_protected.json` ships
-  `"signature": null` and no caller passes `verify`, so the only unforgeable half of the
-  floor is the hardcoded `_ALWAYS_PROTECTED` tuple. Treat manifest entries as additive
-  convenience, never as the guarantee.
+- **The manifest half is human-signed.** As of the 2026-08-20 governed Chef
+  rotation, live `objects/_protected.json` and `objects/_freeze.json` verify
+  against Chef fingerprint `ADAD14CCAC8D6D0BF5A4209DB994E78200BF6422`.
+  Signing preserves the freeze value; it does not unfreeze ATLAS. The
+  `skharness-sign-plane-files` ceremony pins both signing and self-verification
+  to the explicit operator CapAuth home, because an active agent seat has a
+  different valid trust roster. The prior implementation signed with Chef but
+  self-checked against the active agent and refused the write; commit
+  `edafcd0` adds the regression gate. A missing, invalid, or unverifiable
+  manifest remains fail-closed under enforcement. Before this ceremony the
+  manifest shipped with `"signature": null`; the hardcoded
+  `_ALWAYS_PROTECTED` tuple remains the independent constitutional floor.
+  Treat manifest entries as signed additive policy, never as permission to
+  narrow that floor.
 
 ### Preflight self-check (`autocode/doctor.py`)
 
