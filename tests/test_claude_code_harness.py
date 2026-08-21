@@ -1371,7 +1371,7 @@ def test_map_model_routes_gateway_ids_to_gateway_model_names():
     # Gateway ids now resolve to the model NAME skgateway routes on (via the
     # Anthropic /v1/messages frontend), not a sonnet placeholder.
     assert map_model("sk-default") == "sk-default"   # skgateway registry role -> ornith
-    assert map_model("ornith-big") == "ornith-big"   # skgateway -> chiap08 ornith 35B
+    assert map_model("qwen3.8-27b-huihui-abliterated-q4_k_m") == "qwen3.8-27b-huihui-abliterated-q4_k_m"
     # unknown / empty never left blank (spawn always passes --model), and fall
     # closed to a safe concrete Anthropic model.
     assert map_model("") == "sonnet"
@@ -1381,8 +1381,8 @@ def test_map_model_routes_gateway_ids_to_gateway_model_names():
 
 def test_is_gateway_model_flags_local_routes_only():
     assert is_gateway_model("sk-default")
-    assert is_gateway_model("ornith-big")
-    assert is_gateway_model("  ornith-big  ")     # trimmed
+    assert is_gateway_model("qwen3.8-27b-huihui-abliterated-q4_k_m")
+    assert is_gateway_model("  qwen3.8-27b-huihui-abliterated-q4_k_m  ")  # trimmed
     assert not is_gateway_model("claude-opus-4-8")
     assert not is_gateway_model("claude-sonnet-5")
     assert not is_gateway_model("")
@@ -1402,7 +1402,8 @@ async def test_spawn_gateway_model_points_claude_at_skgateway(tmp_path, monkeypa
     h = _spawn_harness(repo, runner=runner, git_runner=git,
                        gateway_base="http://localhost:18780", gateway_token="sk-local")
 
-    desc = SessionDescriptor(repo=str(repo), branch="x", model="ornith-big",
+    desc = SessionDescriptor(repo=str(repo), branch="x",
+                             model="qwen3.8-27b-huihui-abliterated-q4_k_m",
                              quality="sandbox")
     await h.spawn(desc, prompt="p")
 
@@ -1418,7 +1419,7 @@ async def test_spawn_gateway_model_points_claude_at_skgateway(tmp_path, monkeypa
     # (skgateway owns the real routing + context limits for gateway ids).
     assert env["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] == "1"
     # --model carries the gateway model name skgateway routes on
-    assert launch[launch.index("--model") + 1] == "ornith-big"
+    assert launch[launch.index("--model") + 1] == "qwen3.8-27b-huihui-abliterated-q4_k_m"
 
 
 @pytest.mark.asyncio
