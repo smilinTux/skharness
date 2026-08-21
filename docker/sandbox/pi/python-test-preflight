@@ -3,9 +3,22 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib
 import importlib.metadata
+import json
+import os
+import re
 import sys
+from pathlib import Path
+from typing import Any
+
+LOCAL_BUILD_VERSION = "0.0.0+local"
+LOCAL_BUILD_TAG = "local"
+LOCAL_BUILD_REVISION = "unknown"
+DEFAULT_PROVENANCE_FILE = Path("/opt/skharness/pi/image-provenance.json")
+RELEASE_VERSION_RE = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
+REVISION_RE = re.compile(r"[0-9a-f]{40}")
 
 REQUIRED_MODULES = (
     "capauth.authz",
@@ -23,8 +36,125 @@ REQUIRED_MODULES = (
 REQUIRED_PYTEST_PLUGINS = {"asyncio", "pytest_mock"}
 
 
-def main() -> int:
+def validate_build_contract(
+    *, build_mode: str, version: str, release_tag: str, revision: str
+) -> list[str]:
+    """Validate the version inputs used to build a Pi image.
+
+    Args:
+        build_mode: Either ``development`` or ``release``.
+        version: Python distribution version to embed.
+        release_tag: Source Git tag, or the local-build marker.
+        revision: Full source commit, or the local-build marker.
+
+    Returns:
+        Human-readable contract violations. An empty list means valid.
+    """
+    if build_mode == "development":
+        expected = (LOCAL_BUILD_VERSION, LOCAL_BUILD_TAG, LOCAL_BUILD_REVISION)
+        actual = (version, release_tag, revision)
+        if actual != expected:
+            return [
+                "development builds must use the explicit provenance fallback "
+                f"version={expected[0]} tag={expected[1]} revision={expected[2]}"
+            ]
+        return []
+
+    if build_mode != "release":
+        return [f"unsupported build mode: {build_mode!r}"]
+
     failures: list[str] = []
+    if not RELEASE_VERSION_RE.fullmatch(version) or version == "0.0.0":
+        failures.append(f"release version must be a non-zero exact SemVer: {version!r}")
+    if release_tag != f"v{version}":
+        failures.append(
+            f"release tag {release_tag!r} does not exactly match version {version!r}"
+        )
+    if not REVISION_RE.fullmatch(revision):
+        failures.append("release revision must be a full 40-character lowercase Git commit")
+    return failures
+
+
+def read_provenance(path: Path) -> dict[str, str]:
+    """Read and minimally type-check the image provenance record.
+
+    Args:
+        path: JSON file baked into the image at build time.
+
+    Returns:
+        The four string-valued provenance fields.
+
+    Raises:
+        ValueError: If the record is absent, malformed, or incomplete.
+    """
+    try:
+        document: Any = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read image provenance {path}: {exc}") from exc
+    required = ("build_mode", "version", "tag", "revision")
+    if not isinstance(document, dict) or any(
+        not isinstance(document.get(field), str) or not document[field] for field in required
+    ):
+        raise ValueError("image provenance must contain non-empty string build_mode/version/tag/revision")
+    return {field: document[field] for field in required}
+
+
+def version_failures(*, expected_version: str | None, provenance_file: Path) -> list[str]:
+    """Compare expected, baked, and installed SKHarness versions.
+
+    Args:
+        expected_version: Optional external release expectation.
+        provenance_file: Build-time provenance record inside the image.
+
+    Returns:
+        Human-readable provenance failures. An empty list means valid.
+    """
+    try:
+        provenance = read_provenance(provenance_file)
+    except ValueError as exc:
+        return [str(exc)]
+
+    failures = validate_build_contract(
+        build_mode=provenance["build_mode"],
+        version=provenance["version"],
+        release_tag=provenance["tag"],
+        revision=provenance["revision"],
+    )
+    baked_version = provenance["version"]
+    if expected_version is not None and expected_version != baked_version:
+        failures.append(
+            f"expected skharness version {expected_version!r}, image records {baked_version!r}"
+        )
+    try:
+        installed_version = importlib.metadata.version("skharness")
+    except importlib.metadata.PackageNotFoundError:
+        failures.append("installed skharness distribution metadata is missing")
+    else:
+        if installed_version != baked_version:
+            failures.append(
+                f"installed skharness version {installed_version!r}, image records {baked_version!r}"
+            )
+        if expected_version is not None and installed_version != expected_version:
+            failures.append(
+                f"installed skharness version {installed_version!r}, expected {expected_version!r}"
+            )
+    return failures
+
+
+def qualify_image(*, expected_version: str | None, provenance_file: Path) -> int:
+    """Run the project capability and version-provenance checks.
+
+    Args:
+        expected_version: Optional release version supplied by the caller.
+        provenance_file: Build-time provenance record inside the image.
+
+    Returns:
+        Zero when the image is qualified, otherwise one.
+    """
+    failures: list[str] = []
+    failures.extend(
+        version_failures(expected_version=expected_version, provenance_file=provenance_file)
+    )
     for module in REQUIRED_MODULES:
         try:
             importlib.import_module(module)
@@ -57,6 +187,50 @@ def main() -> int:
     }
     print("skharness-pi-python-test qualified", " ".join(f"{k}={v}" for k, v in versions.items()))
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Validate build inputs or qualify the completed Python test image.
+
+    Args:
+        argv: Optional command-line arguments for tests.
+
+    Returns:
+        Process exit status.
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--validate-build-contract", action="store_true")
+    parser.add_argument("--build-mode")
+    parser.add_argument("--expected-version")
+    parser.add_argument("--release-tag")
+    parser.add_argument("--revision")
+    parser.add_argument(
+        "--provenance-file",
+        type=Path,
+        default=Path(os.environ.get("SKHARNESS_IMAGE_PROVENANCE_FILE", DEFAULT_PROVENANCE_FILE)),
+    )
+    args = parser.parse_args(argv)
+    if args.validate_build_contract:
+        missing = [
+            name
+            for name in ("build_mode", "expected_version", "release_tag", "revision")
+            if getattr(args, name) is None
+        ]
+        if missing:
+            parser.error(f"build-contract validation requires: {', '.join(missing)}")
+        failures = validate_build_contract(
+            build_mode=args.build_mode,
+            version=args.expected_version,
+            release_tag=args.release_tag,
+            revision=args.revision,
+        )
+        for failure in failures:
+            print(f"build provenance invalid: {failure}", file=sys.stderr)
+        return int(bool(failures))
+    return qualify_image(
+        expected_version=args.expected_version,
+        provenance_file=args.provenance_file,
+    )
 
 
 if __name__ == "__main__":

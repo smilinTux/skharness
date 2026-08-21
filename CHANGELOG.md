@@ -16,6 +16,12 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ### Fixed
 
+- Closed the Pi image package-provenance gap exposed by `v0.3.36`: release builds now
+  require one exact non-zero SemVer/tag/full-commit contract, use it for
+  `setuptools-scm`, bake it into an image provenance record and OCI labels, and make
+  the Python-test preflight compare the caller's expected version with both the record
+  and installed distribution metadata. Local builds retain the explicit
+  `0.0.0+local` / `local` / `unknown` non-release identity.
 - Closed the fail-open phase boundary found by the first live L-card Pi swarm trial.
   Timed-out or missing scout results can no longer vacuously admit a builder; terminal
   overage/late usage is retained, cancellation remains restart-safe, and failures
@@ -42,7 +48,9 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 - Published `pi-python-test` with the `v0.3.36` image matrix, SBOM/provenance
   attestations, keyless Cosign signing and identity verification, an immutable Grype
-  gate, and a successful digest-pinned confined preflight on `.41`.
+  gate, and a digest-pinned confined preflight on `.41`. That release's internal
+  `skharness=0.0.0` package identity later invalidated package-level provenance; it is
+  historical evidence of the incident, not a qualified image for reuse.
 
 ## [0.3.28] - 2026-08-20
 

@@ -19,6 +19,32 @@ jobs:
         target: [pi-core, pi-polyglot, pi-python-test]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - id: release
+        name: Bind image provenance to the exact release tag and commit
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          if [[ "$GITHUB_REF" != refs/tags/* ]] ||
+             [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Pi release images require an exact vMAJOR.MINOR.PATCH tag ref."
+            exit 1
+          fi
+          version="${tag#v}"
+          if [ "$version" = "0.0.0" ]; then
+            echo "::error::Pi release images refuse the reserved 0.0.0 version."
+            exit 1
+          fi
+          tagged_commit="$(git rev-parse "${tag}^{commit}")"
+          if [ "$tagged_commit" != "$GITHUB_SHA" ]; then
+            echo "::error::$tag resolves to $tagged_commit, not workflow commit $GITHUB_SHA."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "revision=$tagged_commit" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -40,16 +66,23 @@ jobs:
           tags: ${{ steps.image.outputs.name }}:${{ github.ref_name }}
           provenance: mode=max
           sbom: true
+          build-args: |
+            SKHARNESS_BUILD_MODE=release
+            SKHARNESS_VERSION=${{ steps.release.outputs.version }}
+            SKHARNESS_RELEASE_TAG=${{ steps.release.outputs.tag }}
+            SKHARNESS_REVISION=${{ steps.release.outputs.revision }}
       - name: Qualify Python test capability
         if: matrix.target == 'pi-python-test'
         env:
           IMAGE: ${{ steps.image.outputs.name }}
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: >-
-          docker run --rm --read-only --user 10001:10001
-          --tmpfs /tmp:mode=1777,noexec,nosuid,nodev
-          --entrypoint /usr/local/bin/skharness-pi-python-test-preflight
-          "$IMAGE@$DIGEST"
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker run --rm --read-only --user 10001:10001 \
+            --tmpfs /tmp:mode=1777,noexec,nosuid,nodev \
+            --entrypoint /usr/local/bin/skharness-pi-python-test-preflight \
+            "$IMAGE@$DIGEST" --expected-version "$VERSION"
       - name: Keyless-sign immutable image digest
         env:
           IMAGE: ${{ steps.image.outputs.name }}

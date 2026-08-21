@@ -2,6 +2,13 @@
 # Build context is the repository root; targets are pi-core and pi-polyglot.
 ARG WOLFI_IMAGE=cgr.dev/chainguard/wolfi-base:latest@sha256:bfcffaf1336b26a3fd33c8cb31a86a09324d2048420d7f49b983f323b0d33e8d
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.9.27@sha256:143b40f4ab56a780f43377604702107b5a35f83a4453daf1e4be691358718a6a
+# Local builds are explicitly non-release. The release workflow overrides all
+# four values and asks the in-image validator to enforce an exact tag/version/
+# revision join before package installation begins.
+ARG SKHARNESS_BUILD_MODE=development
+ARG SKHARNESS_VERSION=0.0.0+local
+ARG SKHARNESS_RELEASE_TAG=local
+ARG SKHARNESS_REVISION=unknown
 FROM ${UV_IMAGE} AS uv-tools
 FROM ${WOLFI_IMAGE} AS pi-node-builder
 
@@ -18,9 +25,25 @@ RUN test "$(node -p "require('./package-lock.json').packages['node_modules/@eare
 FROM ${WOLFI_IMAGE} AS pi-python-builder
 RUN apk add --no-cache build-base=1-r9 python-3.13=3.13.15-r1 \
     python-3.13-dev=3.13.15-r1 py3.13-pip=26.2.1-r0
+ARG SKHARNESS_BUILD_MODE
+ARG SKHARNESS_VERSION
+ARG SKHARNESS_RELEASE_TAG
+ARG SKHARNESS_REVISION
+COPY docker/sandbox/pi/python-test-preflight /usr/local/libexec/skharness-image-preflight
+RUN python3 /usr/local/libexec/skharness-image-preflight \
+        --validate-build-contract \
+        --build-mode "${SKHARNESS_BUILD_MODE}" \
+        --expected-version "${SKHARNESS_VERSION}" \
+        --release-tag "${SKHARNESS_RELEASE_TAG}" \
+        --revision "${SKHARNESS_REVISION}" \
+    && install -d /opt/skharness/pi \
+    && printf '{"build_mode":"%s","version":"%s","tag":"%s","revision":"%s"}\n' \
+        "${SKHARNESS_BUILD_MODE}" "${SKHARNESS_VERSION}" \
+        "${SKHARNESS_RELEASE_TAG}" "${SKHARNESS_REVISION}" \
+        > /opt/skharness/pi/image-provenance.json
 RUN python3 -m venv /opt/skharness/venv
 ENV PATH="/opt/skharness/venv/bin:${PATH}" \
-    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SKHARNESS=0.0.0
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SKHARNESS=${SKHARNESS_VERSION}
 COPY pyproject.toml README.md /src/skharness/
 COPY src /src/skharness/src
 COPY docker/sandbox/pi/requirements.lock /opt/skharness/pi/requirements.lock
@@ -36,9 +59,17 @@ RUN pip install --no-cache-dir --require-hashes -r /opt/skharness/pi/test-requir
     && pip uninstall -y pip setuptools
 
 FROM ${WOLFI_IMAGE} AS pi-base
+ARG SKHARNESS_BUILD_MODE
+ARG SKHARNESS_VERSION
+ARG SKHARNESS_RELEASE_TAG
+ARG SKHARNESS_REVISION
 LABEL org.opencontainers.image.title="SKHarness Pi worker" \
       org.opencontainers.image.source="https://github.com/smilinTux/skharness" \
-      org.opencontainers.image.description="Pi worker routed through SKGateway with scoped SK tools"
+      org.opencontainers.image.description="Pi worker routed through SKGateway with scoped SK tools" \
+      org.opencontainers.image.version="${SKHARNESS_VERSION}" \
+      org.opencontainers.image.ref.name="${SKHARNESS_RELEASE_TAG}" \
+      org.opencontainers.image.revision="${SKHARNESS_REVISION}" \
+      io.skharness.image.build-mode="${SKHARNESS_BUILD_MODE}"
 
 RUN apk add --no-cache ca-certificates=20260413-r1 curl=8.21.0-r2 \
     fd=10.4.2-r5 git=2.55.0-r4 jq=1.8.2-r1 nodejs-24=24.19.0-r0 \
@@ -49,10 +80,11 @@ COPY --from=pi-node-builder /build/pi/node_modules /opt/skharness/pi/node_module
 RUN install -d /usr/local/bin \
     && ln -s /opt/skharness/pi/node_modules/.bin/pi /usr/local/bin/pi
 COPY --from=pi-python-runtime /opt/skharness/venv /opt/skharness/venv
+COPY --from=pi-python-runtime /opt/skharness/pi/image-provenance.json \
+    /opt/skharness/pi/image-provenance.json
 ENV PATH="/opt/skharness/venv/bin:${PATH}" \
     PI_CODING_AGENT_DIR=/agent \
-    PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
-    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SKHARNESS=0.0.0
+    PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
 COPY docker/sandbox/pi/requirements.lock /opt/skharness/pi/requirements.lock
 

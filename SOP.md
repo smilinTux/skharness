@@ -192,6 +192,14 @@ docker build --target pi-python-test -t skharness-pi-python-test:dev \
   -f docker/sandbox/pi/Dockerfile .
 ```
 
+Those local commands intentionally install `skharness==0.0.0+local` and label the
+image with tag `local`, revision `unknown`, and build mode `development`. This is an
+honest non-release fallback, not a releasable identity. The tag workflow is the only
+supported release path: it supplies `SKHARNESS_BUILD_MODE=release`, an exact
+`SKHARNESS_VERSION`, matching `SKHARNESS_RELEASE_TAG=v<version>`, and the full
+`SKHARNESS_REVISION`. The Docker build rejects empty, `0.0.0`, dev/local-qualified,
+tag-mismatched, and non-full-commit release inputs before installing the package.
+
 Use `pi-core` only for minimal runtime/qualification work. `pi-python-test` is the
 project-qualified SKHarness coding image: its hash lock includes the declared dev
 extras (`pytest-asyncio`, `pytest-mock`, and `httpx`) plus the released CapAuth,
@@ -359,14 +367,25 @@ immutable digest with BuildKit SBOM/provenance, keyless-signed using GitHub OIDC
 immediately signature-verified. A separate Anchore job consumes the reviewed OpenVEX
 document and fails on any remaining High or Critical;
 publication or signing success cannot turn a failed vulnerability gate green.
+The workflow accepts only an exact `vMAJOR.MINOR.PATCH` tag whose peeled commit equals
+`GITHUB_SHA`. It passes that version, tag, and commit into every image target. The same
+values drive installed Python metadata, the baked `image-provenance.json`, and OCI
+`version`, `ref.name`, and `revision` labels. Before signing `pi-python-test`, the
+preflight compares its externally supplied expected version with both the baked record
+and `importlib.metadata.version("skharness")`; any disagreement fails closed.
 
 Release `v0.3.36` exercised that path for all three targets, including
 `pi-python-test`. Registry digest
 `sha256:f8fbc2f8733aae10ebaf3c8f268c9d4e004ccf34db2e5f0458452548b3f3acd3`
 was built with SBOM/provenance attestations, capability-probed, keyless-signed,
 identity/issuer-verified, and passed the Grype High/Critical gate. `.41` then pulled
-that exact digest and passed the same preflight under the confined runtime contract.
-See `docs/evidence/7fe0fb6b-pi-python-test-v0.3.36.md`.
+that exact digest and passed the then-current capability-only preflight under the
+confined runtime contract. The probe also reported `skharness=0.0.0`; that broke the
+package-to-tag provenance join and invalidated the image for reuse despite the valid
+digest, signature, and scan. See
+`docs/evidence/7fe0fb6b-pi-python-test-v0.3.36.md`. A replacement tag must pass the
+version-aware workflow and be digest-pulled and requalified on `.41` before this
+incident can close.
 
 Arena admission CPU and RAM reservations become Docker `--cpus`, `--memory`, and
 no-extra-swap cgroup limits. Both worker and egress proxy use read-only root filesystems,

@@ -3,6 +3,12 @@
 Release `v0.3.36` published the `pi-python-test` target from SKHarness commit
 `3bfe5b4a82d25cbf02d1174fb5f0fd6ec530bead` on 2026-08-21.
 
+> **Superseded qualification:** this record preserves the successful digest,
+> signature, scan, and runtime checks, but the preflight exposed
+> `skharness=0.0.0`. That value cannot be joined to tag `v0.3.36`, so this image is
+> not package-provenance-qualified and must not be reused as a release image. Incident
+> `cd4bf7fb` requires a replacement tag and digest.
+
 ## Immutable identity
 
 - Registry reference:
@@ -51,7 +57,9 @@ read-only rootfs; network none; UID 10001:10001; cap-drop ALL;
 no-new-privileges; pids-limit 128; noexec/nosuid/nodev tmpfs
 ```
 
-The same preflight passed and Docker reported the exact registry digest in
-`RepoDigests`. This closes the publication/signature/scan/digest-pull acceptance gate.
-It does not claim that every future release digest is qualified; the workflow must
-re-run these checks for every tag.
+The same capability-only preflight passed and Docker reported the exact registry
+digest in `RepoDigests`. It closed the original card's
+publication/signature/scan/digest-pull gate, but not the subsequently discovered
+package-version provenance gate. Future releases must additionally prove that the
+expected release version, baked provenance, OCI labels, and installed distribution
+metadata all agree.
