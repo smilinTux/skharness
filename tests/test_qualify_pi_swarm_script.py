@@ -147,6 +147,14 @@ def test_remediation_profile_is_explicit_and_refuses_arbitrary_cards():
         QUALIFY.candidate_catalog(("unreviewed-card",))
 
 
+def test_scout_generation_budget_is_a_share_of_aggregate_ceiling():
+    small_scout = QUALIFY.REMEDIATION_CANDIDATES["c278b5c0"].workers[0]
+    medium_scout = QUALIFY.REMEDIATION_CANDIDATES["400bf174"].workers[0]
+    assert QUALIFY.scout_call_token_budget(small_scout) == 4_096
+    assert QUALIFY.scout_call_token_budget(medium_scout) == 8_000
+    assert QUALIFY.scout_call_token_budget(medium_scout) * medium_scout.tool_limit <= medium_scout.token_limit
+
+
 def test_remediation_snapshot_hashes_are_immutable_and_profile_is_narrow():
     assert {
         card_id: candidate.card_hash

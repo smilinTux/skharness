@@ -835,6 +835,18 @@ def _stop_process(process: subprocess.Popen[str]) -> tuple[str, str]:
         return process.communicate()
 
 
+def scout_call_token_budget(contract: SubagentContract) -> int:
+    """Bound per-request generation against the worker's aggregate budget."""
+    budget = getattr(contract, "budget", None)
+    token_limit = budget.token_limit if budget is not None else contract.token_limit
+    tool_limit = budget.tool_call_limit if budget is not None else contract.tool_limit
+    calls = max(1, tool_limit)
+    share = token_limit // calls
+    if contract.role is SwarmRole.SCOUT:
+        return min(8_192, max(2_048, share))
+    return min(32_768, max(2_048, share))
+
+
 def run_controller_command(
     argv: list[str],
     *,
@@ -1531,7 +1543,7 @@ def execute_candidate(
         adapter = PiAdapter(
             model=MODEL, base_url=GATEWAY, egress_hosts=[gateway_host],
             live_execution=True, image=image,
-            max_tokens=min(32_768, contract.budget.token_limit),
+            max_tokens=scout_call_token_budget(contract),
             run_timeout=worker.wall_seconds,
             session_id=identity.trajectory_id, card_id=candidate.card_id,
             capability_profile=profile,
