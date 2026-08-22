@@ -60,6 +60,15 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ### Fixed
 
+- Preserved Docker launch-failure diagnostics in Arena: exit `125` is now classified as
+  `docker_launch_error`, retained as failed partial evidence, and no longer replaced by
+  an OOM-inspection error when Docker never created the worker container.
+- Made the appended Pi scout terminal contract give literal valid final-message forms
+  and explicit `ACTIONABLE`, `NO_ACTION`, `BLOCKED`, and `NEEDS_INPUT` outcome mapping.
+  The last-assistant parser now enforces that whole normalized grammar, validates every
+  finding through the typed path/line/detail contract, and turns invalid worker text into
+  a closed negative result. Downstream prompts identify worker-authored finding details
+  as untrusted observation data, never instructions; phase authorization is unchanged.
 - Corrected the tagged editable `.41` deployment path after the `v0.3.39` Git
   fetch/fast-forward succeeded but its direct `--no-deps --no-build-isolation` install
   stopped safely before service restart because the operational Python 3.12 venv did

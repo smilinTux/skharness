@@ -3,6 +3,8 @@ from __future__ import annotations
 import threading
 from datetime import datetime, timezone
 
+import pytest
+
 from skharness.arena.models import canonical_digest
 from skharness.arena.swarm import (
     BudgetUsage,
@@ -99,7 +101,12 @@ def _contract(role: SwarmRole, plan: SwarmPlan, number: int = 1) -> SubagentCont
     )
 
 
-def _result(contract: SubagentContract, disposition=SubagentDisposition.COMPLETED):
+def _result(
+    contract: SubagentContract,
+    disposition=SubagentDisposition.COMPLETED,
+    *,
+    scout_assessment: ScoutAssessment | None = None,
+):
     finding = ScoutFinding.create(
         path="src/skharness/arena/swarm.py",
         line=129,
@@ -122,13 +129,16 @@ def _result(contract: SubagentContract, disposition=SubagentDisposition.COMPLETE
     else:
         fields["reason_codes"] = ("blocked_prerequisite",)
     if contract.role is SwarmRole.SCOUT:
-        fields["scout_assessment"] = (
+        assessment = scout_assessment or (
             ScoutAssessment.ACTIONABLE
             if disposition is SubagentDisposition.COMPLETED
             else ScoutAssessment.BLOCKED
         )
+        fields["scout_assessment"] = assessment
         fields["scout_findings"] = (
-            (finding,) if disposition is SubagentDisposition.COMPLETED else ()
+            (finding,)
+            if assessment in {ScoutAssessment.ACTIONABLE, ScoutAssessment.NO_ACTION}
+            else ()
         )
     return SubagentResult.from_contract(contract, **fields)
 
@@ -244,6 +254,56 @@ def test_noncompleted_scout_cancels_downstream_and_gate_denies(tmp_path):
     assert not report.completion.authorized
     assert "phase_not_completed:phase-scout" in report.failure_reasons
     assert "planned_result_set_mismatch" in report.completion.reasons
+
+
+@pytest.mark.parametrize(
+    ("assessment", "disposition", "phase_failure"),
+    (
+        (ScoutAssessment.NO_ACTION, SubagentDisposition.COMPLETED, None),
+        (
+            ScoutAssessment.NEEDS_INPUT,
+            SubagentDisposition.NEEDS_INPUT,
+            "phase_not_completed:phase-scout",
+        ),
+    ),
+)
+def test_nonactionable_scout_outcomes_never_admit_builder(
+    tmp_path, assessment, disposition, phase_failure
+):
+    plan = _plan(SwarmRole.SCOUT, SwarmRole.BUILDER)
+    scout, builder = _contract(SwarmRole.SCOUT, plan), _contract(SwarmRole.BUILDER, plan)
+    executed = []
+
+    def execute(contract):
+        executed.append(contract.contract_id)
+        return WorkerExecution(
+            _result(
+                contract,
+                disposition,
+                scout_assessment=assessment,
+            ),
+            BudgetUsage(wall_seconds=1),
+        )
+
+    report = TrustedSwarmOrchestrator(
+        _scheduler(tmp_path),
+        _gate(plan),
+        A2AJournal(tmp_path / "a2a.jsonl"),
+        plan,
+    ).run(
+        (scout, builder),
+        execute=execute,
+        stop=lambda lease_id: None,
+        attest=lambda results, receipts: None,
+    )
+
+    assert executed == ["scout-1"]
+    assert report.results[0].scout_assessment is assessment
+    assert report.results[0].disposition is disposition
+    assert "scout_not_actionable:phase-scout" in report.failure_reasons
+    if phase_failure is not None:
+        assert phase_failure in report.failure_reasons
+    assert not report.completion.authorized
 
 
 def test_hard_deadline_stops_worker_and_gate_fails_closed(tmp_path):

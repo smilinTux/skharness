@@ -22,7 +22,7 @@ import threading
 import time
 from dataclasses import dataclass, replace
 from enum import Enum
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable, Protocol
 
 from skharness.autocode.pi_events import (
@@ -35,8 +35,9 @@ from skharness.autocode.sandbox import AuthMount, InspectionScope, LaunchSpec, S
 from skharness.autocode.sandbox_lifecycle import SandboxOwnership
 
 from .controller import ArenaController
-from .models import ExperimentState, canonical_digest
+from .models import ExperimentState
 from .scheduler import Admission, AttemptRequest
+from .swarm import ScoutFinding
 from .trajectory import DEFAULT_PHASE_BUDGETS, CardSize, PhaseBudget, compact_pi_events
 
 if TYPE_CHECKING:
@@ -313,8 +314,15 @@ class SandboxProcessSupervisor:
                     )
             if classification not in {"timeout", "inspection_denied"}:
                 self._raise_if_cancelled()
-            if classification == "exit" and self._oom_killed(container_name):
-                classification = "oom"
+            if classification == "exit":
+                # Docker reserves 125 for a client/daemon launch failure: the
+                # workload was never invoked and a container may not exist to
+                # inspect.  Attempting OOM inspection in that case masks the
+                # primary stderr and return code as a supervisor failure.
+                if exit_code == 125:
+                    classification = "docker_launch_error"
+                elif self._oom_killed(container_name):
+                    classification = "oom"
             return exit_code, classification
         finally:
             with self._lock:
@@ -926,7 +934,7 @@ class PiExperimentRunner:
         raw trajectory; generic claims and placeholder text fail closed.
         """
 
-        final_text = ""
+        final_text: str | None = None
         for event in PiExperimentRunner._events(path) or ():
             if event.get("type") != "message_end":
                 continue
@@ -935,49 +943,62 @@ class PiExperimentRunner:
                 continue
             content = message.get("content")
             blocks = content if isinstance(content, list) else []
-            final_text = "\n".join(
-                block.get("text", "")
+            if not blocks or any(
+                not isinstance(block, dict)
+                or block.get("type") != "text"
+                or not isinstance(block.get("text"), str)
                 for block in blocks
-                if isinstance(block, dict) and block.get("type") == "text"
-            )
-        assessments = re.findall(
-            r"(?m)^SCOUT_ASSESSMENT: (ACTIONABLE|NO_ACTION|BLOCKED|NEEDS_INPUT)$",
-            final_text,
-        )
-        if len(assessments) != 1:
-            return None, ()
-        assessment = assessments[0].lower()
-        findings: list[dict[str, object]] = []
-        invalid = {"none", "n/a", "na", "unknown", "placeholder", "todo", "tbd"}
-        for line in final_text.splitlines():
-            if not line.startswith("SCOUT_FINDING: "):
+            ):
+                final_text = None
                 continue
-            finding = line.removeprefix("SCOUT_FINDING: ").strip()
+            final_text = "\n".join(str(block["text"]) for block in blocks)
+        if (
+            final_text is None
+            or not final_text
+            or final_text != final_text.strip()
+            or "\r" in final_text
+        ):
+            return None, ()
+        lines = final_text.split("\n")
+        assessment_match = re.fullmatch(
+            r"SCOUT_ASSESSMENT: (ACTIONABLE|NO_ACTION|BLOCKED|NEEDS_INPUT)",
+            lines[0],
+        )
+        if assessment_match is None:
+            return None, ()
+        assessment = assessment_match.group(1).lower()
+        if assessment in {"blocked", "needs_input"}:
+            return (assessment, ()) if len(lines) == 1 else (None, ())
+        if len(lines) < 2:
+            return None, ()
+
+        findings: list[dict[str, object]] = []
+        for line in lines[1:]:
             match = re.fullmatch(
-                r"([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)(?::([0-9]+))? - (.{12,})",
-                finding,
+                r"SCOUT_FINDING: "
+                r"([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)"
+                r"(?::([1-9][0-9]*))? - (.{12,500})",
+                line,
             )
             if match is None:
-                continue
-            candidate = PurePosixPath(match.group(1))
-            detail = match.group(3).strip()
-            lowered = detail.casefold()
-            if (
-                candidate.is_absolute()
-                or ".." in candidate.parts
-                or lowered in invalid
-                or any(
-                    token in lowered for token in ("placeholder", "fill this", "lorem ipsum")
+                return None, ()
+            raw_path = match.group(1)
+            raw_detail = match.group(3)
+            if raw_path != raw_path.strip() or raw_detail != raw_detail.strip():
+                return None, ()
+            try:
+                finding = ScoutFinding.create(
+                    path=raw_path,
+                    line=int(match.group(2)) if match.group(2) is not None else None,
+                    detail=raw_detail,
                 )
-            ):
-                continue
-            payload: dict[str, object] = {
-                "path": candidate.as_posix(),
-                "line": int(match.group(2)) if match.group(2) is not None else None,
-                "detail": detail,
-            }
-            findings.append(payload | {"digest": canonical_digest(payload)})
-        if assessment in {"actionable", "no_action"} and not findings:
+            except (TypeError, ValueError):
+                # Worker text is untrusted observation data. A syntactically
+                # plausible line that fails the typed contract is invalid output,
+                # never an exception that escapes controller terminalization.
+                return None, ()
+            findings.append(finding.model_dump(mode="json"))
+        if not findings:
             return None, ()
         unique = {str(item["digest"]): item for item in findings}
         return assessment, tuple(unique[key] for key in sorted(unique))

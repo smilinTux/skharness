@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import signal
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -165,6 +166,31 @@ def test_docker_control_plane_failure_has_explicit_terminal_classification(tmp_p
     assert b"OOM inspection timed out" in controller.store.get_artifact(
         outcome.stderr_digest
     )
+
+
+def test_docker_launch_error_propagates_exit_125_and_primary_diagnostics(tmp_path):
+    controller = _controller(tmp_path)
+    controller.propose("experiment")
+    supervisor = ScriptedSupervisor(
+        exit_code=125,
+        classification="docker_launch_error",
+        stderr=b"docker: invalid mount config for type bind\n",
+    )
+
+    outcome = PiExperimentRunner(
+        controller,
+        supervisor,
+        tmp_path / "runs",
+    ).execute(_request(), _spec(tmp_path))
+
+    assert not outcome.successful and outcome.partial
+    assert outcome.exit_code == 125
+    assert outcome.classification == "docker_launch_error"
+    assert controller.store.get_artifact(outcome.stderr_digest) == supervisor.stderr
+    event = controller.store.read_all_events()[-1]
+    assert event.to_state is ExperimentState.FAILED
+    assert event.payload["reason"] == "docker_launch_error"
+    assert event.payload["exit_code"] == 125
 
 
 def test_gateway_outage_is_classified_and_retains_diagnostics(tmp_path):
@@ -739,6 +765,44 @@ def test_real_supervisor_startup_and_oom_inspection_time_out_fail_closed(monkeyp
         supervisor._oom_killed("worker")
 
     assert [timeout for _argv, timeout in observed] == [3, 3]
+
+
+def test_worker_docker_launch_error_retains_exit_125_without_oom_inspection(
+    tmp_path, monkeypatch
+):
+    sandbox = Sandbox(live_execution=True)
+    supervisor = SandboxProcessSupervisor(sandbox)
+    monkeypatch.setattr(
+        sandbox,
+        "maybe_reconcile_orphans",
+        lambda **_kwargs: {"outcome": "ok"},
+    )
+    monkeypatch.setattr(sandbox, "_ensure_capable", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(supervisor, "_run_checked", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(supervisor, "_cleanup_resources", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        sandbox,
+        "_docker_run_argv",
+        lambda *_args, **_kwargs: [
+            sys.executable,
+            "--rm",
+            "-c",
+            "import sys; sys.stderr.write('docker: launch failed\\n'); raise SystemExit(125)",
+        ],
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_oom_killed",
+        lambda _name: pytest.fail("exit 125 must not inspect a nonexistent container"),
+    )
+
+    exit_code, classification = supervisor.run(
+        LaunchSpec("pi", ["pi"], "image", str(tmp_path)), tmp_path / "attempt", 5
+    )
+
+    assert exit_code == 125
+    assert classification == "docker_launch_error"
+    assert (tmp_path / "attempt" / "stderr.log").read_text() == "docker: launch failed\n"
 
 
 def test_real_supervisor_cancel_timeout_still_signals_and_reports_within_bound(monkeypatch):

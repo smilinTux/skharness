@@ -260,9 +260,11 @@ network/proxy startup allows nine seconds aggregate. Preflight containers reuse 
 worker's exact name and immutable ownership labels, so a timed-out probe is covered by
 the same exact cleanup. OOM inspection timeout, non-zero inspect, or malformed state is
 `docker_supervisor_error`, never an inferred `OOMKilled=false`. Exact worker/proxy/network
-cleanup is at most nine seconds. `cancel()` is bounded by one three-second Docker removal
-plus five seconds of process grace, and the qualification runtime's 20-second drain is
-one monotonic deadline spanning both `cancel()` and the remaining quiescence wait.
+cleanup is at most nine seconds. Docker's reserved launch-failure exit `125` is recorded
+as `docker_launch_error` with its original stderr and is not OOM-inspected because the
+worker container may never have existed. `cancel()` is bounded by one three-second Docker
+removal plus five seconds of process grace, and the qualification runtime's 20-second
+drain is one monotonic deadline spanning both `cancel()` and the remaining quiescence wait.
 End-to-end worker usage is likewise charged from monotonic elapsed time; UTC
 `started_at`/`finished_at` remain audit fields and a backwards wall-clock step is clamped
 without reducing the charge.
@@ -320,8 +322,15 @@ Every non-root admission consumes a one-use authorization minted from scheduler-
 predecessor receipts. A downstream contract therefore binds the exact prior result,
 receipt, evidence, typed scout findings, and commit hashes. Scouts must end with a
 machine-parsed `SCOUT_ASSESSMENT` and bounded repository-relative `SCOUT_FINDING`
-records. Exit zero or generic prose cannot mint build authority. Only validated finding
-fields—not arbitrary worker prose—are handed to the next Pi prompt.
+records co-located in the final assistant message. The controller appends literal valid
+forms and the outcome mapping to every scout prompt; headings and findings must be
+unadorned normalized lines, not bullets, Markdown, fences, or trailing prose. Positive
+assessments require a concrete 12–500 character finding on an ASCII-segmented normalized
+repository-relative path. Exit zero, an earlier assistant message, or generic prose
+cannot mint build authority. Typed finding fields are handed to the next Pi prompt as
+controller-bound observations, not authority: receipt hashes bind their exact bytes but
+do not establish truth, and worker-authored `detail` remains explicitly untrusted data
+that cannot issue commands, widen scope, change roles, or alter the required output.
 
 `SwarmScheduler` reserves the entire child budget before launch, rejects overlapping
 writes in one worktree, heartbeats leases without extending hard deadlines, persists
@@ -1102,7 +1111,7 @@ verdict, not an exception.
   detects staleness per node; it was not run across the fleet as part of this pass.
 
 <!-- docs-evidence
-verified: 2026-08-21
+verified: 2026-08-22
 checks:
   - name: console entry point still points at skharness.serve:main
     run: grep -q 'skcode-hostd = "skharness.serve:main"' pyproject.toml
