@@ -73,7 +73,18 @@ class RepoSpec:  # one entry of repo_map (autopilot.yaml)
     #   GitHub lint job is `continue-on-error` (advisory). A name matched here is
     #   dropped from the auto-merge core gate; security checks are NEVER advisory.
     #   Empty (default) preserves strict behavior: every core check must pass.
-    automerge: bool = False
+    automerge: bool = False   # POSITIVE autopilot opt-in: a passing PR on this repo
+    #   MAY be auto-merged by the EngineeringExecutor (engineering.py:907). It has
+    #   ONE meaning -- "the autopilot may merge this" -- and the bridge must never
+    #   read it as a refusal predicate. That overload is what card f9a63685 removes.
+    agentrun_refused: bool | None = None   # EXPLICIT, separately-named bridge predicate:
+    #   when True the agent_run execute bridge refuses to dispatch a run to this
+    #   repo (agentrun_bridge.py:execute_dispatch). It is NOT RepoSpec.automerge;
+    #   it keeps the two systems' coupling in one named place instead of smuggling
+    #   "the bridge forbids this" into a field whose only other meaning is
+    #   "the autopilot may merge this." None preserves legacy refusal during
+    #   migration; False explicitly opts into review-only dispatch. The structural
+    #   never-merge guarantee remains unchanged.
     auto_revert: bool = False
     min_diff_coverage: float = 0.8
     sandbox_image: str | None = None

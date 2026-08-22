@@ -186,10 +186,29 @@ def execute_dispatch(context: dict) -> dict:
             return _refuse(
                 f"live_execution is not enabled in autopilot.yaml (repo:{repo.name})",
                 activity)
-        if repo.automerge or repo.name in cfg.automerge_repos:
+        # The bridge NEVER merges: DirectExecutor._merge raises unconditionally and
+        # AgentRunDirectExecutor overrides nothing that changes that (structural,
+        # not policy). Refusing a repo here would be a SECOND refusal predicate on
+        # top of the structural one -- but it must NOT reuse RepoSpec.automerge, whose
+        # only meaning in engineering.py is "the autopilot MAY merge this" (a positive
+        # opt-in). Reading repo.automerge as "forbid the bridge" would overload that
+        # field with an opposite semantic. The refusal is expressed on its own named
+        # predicate, RepoSpec.agentrun_refused, so the two systems' coupling lives in
+        # one explicit place instead of smuggled into a positively-meaning field.
+        # Default False keeps every repo dispatchable in review-only direct mode while
+        # the structural never-merge guarantee still holds -- fail-closed: nothing
+        # auto-merges. (A repo listed in cfg.automerge_repos is still refused below;
+        # that list is a separate, unambiguous "autopilot auto-merges this" predicate,
+        # not RepoSpec.automerge.)
+        legacy_refused = repo.automerge or repo.name in cfg.automerge_repos
+        if repo.agentrun_refused is True or (
+            repo.agentrun_refused is None and legacy_refused
+        ):
             return _refuse(
-                f"repo:{repo.name} is automerge-enabled; the bridge refuses "
-                "automerge repos in P1 even though it structurally cannot merge",
+                f"repo:{repo.name} is agentrun_refused; the bridge refuses to dispatch "
+                "this repo in P1. It structurally cannot merge (DirectExecutor._merge "
+                "raises) and, if you want the autopilot to auto-merge it, set "
+                f"repo_map.{repo.name}.automerge and add it to automerge_repos.",
                 activity)
         if coerce_quality(repo.min_quality) == QualityMode.GATED:
             return _refuse(
