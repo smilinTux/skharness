@@ -25,6 +25,8 @@ behind a merge gate.
   adapter), one bound tailnet address on port **9394**.
 - The **session plane**: session descriptors, the append-only `SessionEvent` store, and
   the merged view of interactive sessions plus autocode orchestrator runs.
+- The **live activity plane**: a process-safe cursor journal consumed by the built-in
+  Activity view and Atlas, plus a distinct receipt-driven Atlas command mailbox.
 - The **authorization enforcement point (PEP)** for that surface: bearer check, scope
   split, and a `capauth.authz.decide` call for the two RCE-class capabilities.
 - The **autocode engine** (`src/skharness/autocode/`): work-item routing, the sandboxed
@@ -120,6 +122,8 @@ flowchart TD
 |---|---|
 | `src/skharness/serve.py` | The `skcode-hostd` entry point. `resolve_bind()` refuses a wildcard bind, `select_verifier()` picks real capauth or the fail-closed deny-all, `_serve()` wires every provider into the app. Read this first. |
 | `src/skharness/daemon.py` | Every HTTP/WS route, plus `PUBLIC_ROUTES` and `ROUTE_SCOPES`: the authoritative statement of which route needs which scope. |
+| `src/skharness/activity.py` | The read-only `ActivityEvent` contract and process-safe replay journal used by Pi, interactive sessions, the webapp, and Atlas. |
+| `src/skharness/control.py` | Expiring idempotent Atlas commands and controller receipts. A queued receipt is never presented as applied. |
 | `src/skharness/harnesses/claude_code.py` | The one harness the daemon owns. `parse_repo_allowlist()` and the `spawn()` guard are where dispatch is actually permitted or refused. |
 | `src/skharness/autocode/orchestrator.py` | The engine's phase loop, caps, and kill switch. `skos.autopilot` delegates here by object identity. |
 | `src/skharness/autocode/engineering.py` | The merge choke point: worktree, sandbox, grade, twin gate, `finalize()`. Nothing merges without passing through it. |
@@ -134,6 +138,10 @@ artifact lineage, and phased release gates are specified in
 [`docs/architecture/evolution-arena.md`](./docs/architecture/evolution-arena.md). It is
 design-only until its named cards and evidence gates pass; this SOP does not claim an
 operational arena.
+
+The live observation/control trust boundary and the exact Atlas integration model are
+defined in
+[`docs/architecture/live-agent-observation-and-control.md`](./docs/architecture/live-agent-observation-and-control.md).
 
 ---
 
@@ -873,6 +881,8 @@ restart: every caller is then denied and nothing actuates.
 | `SKCODE_FORCE_DENY_ALL` | no | The escape hatch. Truthy forces the deny-all verifier: every caller denied. The only way to turn the real verifier off, and it still fails closed. |
 | `SKCODE_FULL_PROFILE_SUBJECTS` | no | Comma-separated subjects allowed to dispatch the `full` profile (real identity, real `HOME`, MCP). Default `lumina@chef.skworld.io`. Everyone else is sandbox-only. |
 | `SKCODE_STATE_DIR` | no | Root for audit log, worktrees, and session events. Default `~/.skcapstone/skcode`. |
+| `$SKCODE_STATE_DIR/activity` | derived | Fsync'd bounded `ActivityEvent` cursor journal. Directory and files are created by hostd; do not place it on shared NFS. |
+| `$SKCODE_STATE_DIR/control` | derived | Mode-0700/0600 Atlas command/receipt mailbox. Command payloads are operational secrets and must stay node-local. |
 | `SKCODE_CRON_LEDGER_PATH` | no | Overrides the ledger `GET /api/v1/jobs` reads. Default `~/.skcapstone/logs/cron-ledger.jsonl`. |
 | `SKCODE_WATCHDOG_DIGEST_PATH` | no | Overrides the artifact `GET /api/v1/watchdog/digest` reads. Default `~/.skcapstone/watchdog/digests/latest/digest.json`. |
 | `SKHARNESS_ARENA_ENABLED` | no | Truthy makes SKGateway and verifier health required readiness signals. |
@@ -954,6 +964,8 @@ mapping, and `tests/test_route_coverage.py` fails if a live route is missing fro
 | GET | `/api/v1/sessions` | `skcode.stream` | Live and historical sessions, harness plus autocode runs merged. |
 | GET | `/api/v1/sessions/{sid}` | `skcode.stream` | One session, or 404. |
 | GET | `/api/v1/sessions/{sid}/events` | `skcode.stream` | Replay from the append-only event store. |
+| GET | `/api/v1/activity` | `skcode.stream` | Bounded global cursor replay, filterable by session/run/agent/job/card/contract/lease/role/kind. |
+| GET | `/api/v1/control/{command_id}` | `skcode.stream` | One Atlas command and its latest controller receipt. |
 | GET | `/api/v1/jobs` | `skcode.stream` | A read-through view of the cron ledger. Never a store. |
 | GET | `/api/v1/watchdog/digest` | `skcode.stream` | The published skwatchdog digest bytes, served unparsed. |
 | GET | `/api/v1/dispatch/targets` | `skcode.dispatch` | Advisory list of dispatchable repos. |
@@ -962,7 +974,55 @@ mapping, and `tests/test_route_coverage.py` fails if a live route is missing fro
 | POST | `/api/v1/sessions/{sid}/deny` | `skcode.inject` | Records an operator denial for a pending decision. |
 | POST | `/api/v1/dispatch` | `skcode.dispatch` | Spawns a NEW agent session. The RCE surface. |
 | POST | `/api/v1/sessions/{sid}/cancel` | `skcode.dispatch` | Cancels a dispatched session. |
+| POST | `/api/v1/control` | `skcode.inject` for message/needs-input; `skcode.dispatch` for cancel/pause/resume/retry | Submit an expiring idempotent Atlas command. Session message/cancel may apply synchronously; run/agent/job targets queue for their owner. |
 | WS | `/api/v1/sessions/{sid}/stream` | `skcode.stream` | Typed `SessionEvent` stream. Token rides `?token=` because browsers cannot set headers on a WebSocket. |
+| WS | `/api/v1/activity/stream` | `skcode.stream` | Cursor-resumable global activity tail with gap and heartbeat envelopes. |
+
+### Atlas live monitor and steering
+
+The browser's **Activity** button and Atlas use the same read rail. Save the latest
+cursor and reconnect with `after`; never infer continuity across a `gap` envelope.
+Activity is observation-only and cannot complete, authorize, or steer work.
+
+Atlas steering uses `POST /api/v1/control` with a unique stable idempotency key. Example
+(this message token must carry `skcode.inject` and pass the PDP; cancellation and
+other lifecycle actions require `skcode.dispatch`):
+
+```bash
+curl -sS -X POST "http://$SKCODE_HOSTD_TAILSCALE_IP:9394/api/v1/control" \
+  -H "Authorization: Bearer $SKCODE_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "idempotency_key":"atlas-session-note-20260821-001",
+    "target_kind":"session",
+    "target_id":"lumina-abc12345",
+    "action":"message",
+    "expected_state":"running",
+    "payload":{"text":"Focus on the failing acceptance test"},
+    "ttl_s":300
+  }'
+```
+
+Persist the returned `command_id`; read its receipt with
+`GET /api/v1/control/{command_id}`. `queued` means only that durable intent exists.
+Only `applied` means the owner acted. Run/agent/job commands remain queued until their
+long-lived owner composes `control_handler` or consumes `ControlJournal.pending()` and
+records a receipt. Do not mark a
+job or swarm intervention successful from HTTP 202, model prose, or an activity line.
+
+For provenance, retain the returned activity lineage fields and artifact refs together:
+`card_id/card_hash`, `trajectory_id`, `team_id`, `parent_agent_id`,
+`agent_id`, `plan_hash`, `contract_id/contract_hash`, `lease_id`, `attempt_id`,
+`base_commit`, and `evidence_id`. The browser exposes the same envelope under
+**structured evidence** and can filter card/contract/lease. The live journal is bounded;
+the Arena terminal event and content-addressed attempt artifacts retain this linkage after
+the visible window rolls forward.
+
+The checked-in Pi swarm qualifier composes `SwarmAtlasControlOwner`, so Atlas `cancel`
+for its exact trajectory or child-agent ID is claimed by the scheduler owner, stopped
+through the bounded runtime, and acknowledged only after quiescence. Other Pi child
+actions are explicitly unsupported until a controller-owned turn boundary exists. Job
+commands remain queued until the scheduler-owner adapter is deployed.
 
 ### The write surface is real, and how it is gated
 

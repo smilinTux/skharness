@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import signal
 import subprocess
 import sys
@@ -9,6 +11,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from skharness.activity import ActivityContext, ActivityJournal
 from skharness.arena.controller import ArenaController
 from skharness.arena.models import ExperimentState
 from skharness.arena.runner import (
@@ -98,6 +101,107 @@ def test_success_runs_pi_attempt_and_persists_artifacts_before_terminal_event(tm
     assert controller.state("experiment") is ExperimentState.PROVISIONAL
     assert controller.store.get_artifact(outcome.stdout_digest) == VALID_PI_STDOUT
     assert controller.scheduler.snapshot()["active_leases"] == 0
+
+
+def test_pi_activity_is_replayable_live_and_never_publishes_tool_arguments(tmp_path):
+    controller = _controller(tmp_path)
+    controller.propose("experiment")
+    journal = ActivityJournal(root=tmp_path / "activity")
+    stream = (
+        b'{"type":"agent_start"}\n'
+        b'{"type":"tool_execution_start","toolName":"bash",'
+        b'"args":{"command":"echo token=do-not-publish"}}\n'
+        b'{"type":"tool_execution_end","toolName":"bash","isError":false,'
+        b'"result":"Bearer do-not-publish"}\n'
+        b'{"type":"message_end","message":{"role":"assistant",'
+        b'"responseModel":"served-model","content":[{"type":"text",'
+        b'"text":"Working now; token=do-not-publish"}]}}\n'
+    )
+    runner = PiExperimentRunner(
+        controller,
+        ScriptedSupervisor(stdout=stream),
+        tmp_path / "runs",
+        activity_journal=journal,
+    )
+    context = ActivityContext(
+        session_id="trajectory-1",
+        run_id="card-1",
+        agent_id="scout-1",
+        role="scout",
+        phase="inspect",
+        source="swarm",
+    )
+
+    outcome = runner.execute(_request(), _spec(tmp_path), activity_context=context)
+
+    assert outcome.successful
+    events = journal.read_after()
+    assert [event.kind.value for event in events] == [
+        "status",
+        "phase",
+        "status",
+        "tool_call",
+        "tool_result",
+        "assistant_text",
+        "disposition",
+    ]
+    assert all(event.agent_id == "scout-1" for event in events)
+    serialized = "\n".join(str(event.to_dict()) for event in events)
+    assert "echo" not in serialized
+    assert "do-not-publish" not in serialized
+    terminal = events[-1]
+    assert terminal.artifact_refs == (outcome.stdout_digest, outcome.stderr_digest)
+    run_record_path = (
+        tmp_path
+        / "runs"
+        / hashlib.sha256(b"experiment").hexdigest()
+        / "1"
+        / "run.json"
+    )
+    run_record = json.loads(run_record_path.read_text())
+    assert run_record["activity_context"]["agent_id"] == "scout-1"
+
+
+def test_malformed_pi_line_publishes_controller_error_without_raw_bytes(tmp_path):
+    controller = _controller(tmp_path)
+    controller.propose("experiment")
+    journal = ActivityJournal(root=tmp_path / "activity")
+    stream = b'{"type":"agent_end"}\nBearer secret-value\n'
+    outcome = PiExperimentRunner(
+        controller,
+        ScriptedSupervisor(stdout=stream),
+        tmp_path / "runs",
+        activity_journal=journal,
+    ).execute(_request(), _spec(tmp_path))
+
+    assert outcome.classification == "pi_event_stream_incomplete"
+    events = journal.read_after()
+    errors = [event for event in events if event.kind.value == "error"]
+    assert errors[0].summary == "Pi emitted an invalid structured event"
+    assert "secret-value" not in str(errors[0].to_dict())
+
+
+def test_pi_activity_reports_bounded_usage_and_file_change_signals(tmp_path):
+    controller = _controller(tmp_path)
+    controller.propose("experiment")
+    journal = ActivityJournal(root=tmp_path / "activity")
+    stream = (
+        b'{"type":"tool_execution_end","toolName":"edit","isError":false}\n'
+        b'{"type":"message_end","message":{"role":"assistant",'
+        b'"usage":{"totalTokens":42,"cost":{"total":0.1}},"content":[]}}\n'
+    )
+    outcome = PiExperimentRunner(
+        controller,
+        ScriptedSupervisor(stdout=stream),
+        tmp_path / "runs",
+        activity_journal=journal,
+    ).execute(_request(), _spec(tmp_path))
+
+    assert outcome.successful
+    kinds = [event.kind.value for event in journal.read_after()]
+    assert "file_change" in kinds and "budget" in kinds
+    budget = next(event for event in journal.read_after() if event.kind.value == "budget")
+    assert budget.data == {"total_tokens": 42, "cost": 0.1}
 
 
 def test_admitted_resources_become_container_cpu_and_memory_limits(tmp_path):
@@ -671,6 +775,7 @@ def test_production_factory_can_only_construct_real_sandbox_supervisor(tmp_path)
     assert isinstance(runner.supervisor, SandboxProcessSupervisor)
     assert not isinstance(runner.supervisor, FakeSpawner)
     assert runner.supervisor.sandbox.live_execution is True
+    assert isinstance(runner.activity_journal, ActivityJournal)
 
 
 def test_production_supervisor_preserves_every_active_scheduler_lease(tmp_path):

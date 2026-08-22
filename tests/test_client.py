@@ -20,6 +20,8 @@ def test_real_client_page_is_served():
     # The read-only WS tail route (no manual ?token= paste field: the client
     # follows the pairing model and shows an honest empty-state on 401).
     assert "/stream" in body
+    assert "/api/v1/activity/stream" in body
+    assert 'id="activity-toggle"' in body
 
 
 def test_client_view_paths_stay_read_only():
@@ -52,6 +54,21 @@ def test_client_page_has_no_external_asset_fetch():
     body = _client().get("/").text.lower()
     assert "http://" not in body
     assert "https://" not in body
+
+
+def test_client_activity_window_is_cursor_resumable_and_read_only():
+    body = _client().get("/").text
+    assert "activityCursor" in body
+    assert '"/api/v1/activity/stream"' in body
+    assert "retained_from_cursor" in body
+    assert "structured evidence" in body
+    assert 'id="activity-session"' in body
+    assert 'id="activity-agent"' in body
+    assert 'id="activity-job"' in body
+    assert 'id="activity-card"' in body
+    assert 'id="activity-contract"' in body
+    assert 'id="activity-lease"' in body
+    assert "parent_agent_id" in body and "contract_hash" in body
 
 
 def test_client_reads_wire_token_from_url_and_injects_it():

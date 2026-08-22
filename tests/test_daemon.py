@@ -1,16 +1,20 @@
-"""skcode-hostd read-only daemon: 3 data routes, capauth-gated, zero write surface.
+"""skcode-hostd authenticated read, activity, and control surfaces.
 
 Driven by FakeHarness + FastAPI TestClient (no real tmux, no real bind).
 """
 import dataclasses as _dc
+import hashlib
+import time
 import types as _t
 
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from skharness.activity import ActivityContext, ActivityJournal, ActivityKind
 from skharness.auth import AuthContext
 from skharness.autocode.types import GateResult, RepoSpec
+from skharness.control import ControlJournal
 from skharness.daemon import build_daemon_app
 from skharness.events import EventType, SessionEvent
 from skharness.harness import FakeHarness, SessionDescriptor
@@ -240,6 +244,337 @@ def test_sessions_events_route_empty_without_a_persisting_store():
     assert r.json() == {"sid": "lumina-abc12345", "events": []}
 
 
+# ---- Global ActivityEvent replay + tail for Atlas and the hostd webapp -------
+
+def _activity_journal(tmp_path):
+    journal = ActivityJournal(root=tmp_path / "activity")
+    context = ActivityContext(
+        session_id="trajectory-1",
+        run_id="trajectory-1",
+        agent_id="pi-scout-1",
+        role="scout",
+        phase="inspect",
+        source="swarm",
+        card_id="card-1",
+        card_hash="sha256:" + "1" * 64,
+        trajectory_id="trajectory-1",
+        contract_id="contract-1",
+        contract_hash="sha256:" + "2" * 64,
+        plan_hash="sha256:" + "3" * 64,
+        lease_id="lease-1",
+        attempt_id="1",
+        base_commit="a" * 40,
+        evidence_id="sha256:" + "4" * 64,
+    )
+    journal.publish(context, ActivityKind.STATUS, summary="worker admitted")
+    journal.publish(context, ActivityKind.TOOL_CALL, summary="tool read started")
+    return journal
+
+
+def test_activity_replay_requires_read_scope_and_filters_by_cursor(tmp_path):
+    journal = _activity_journal(tmp_path)
+    app = build_daemon_app(
+        harness=_harness(),
+        verify_caller=lambda token: token == "good",
+        activity_journal=journal,
+    )
+    client = TestClient(app)
+    assert client.get("/api/v1/activity").status_code == 401
+    assert client.get(
+        "/api/v1/activity", headers={"authorization": "Bearer bad"}
+    ).status_code == 403
+
+    response = client.get(
+        "/api/v1/activity?after=1&agent_id=pi-scout-1&card_id=card-1"
+        "&contract_id=contract-1&lease_id=lease-1&kind=tool_call",
+        headers={"authorization": "Bearer good"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert [event["cursor"] for event in body["events"]] == [2]
+    assert body["events"][0]["authority"] == "observation"
+    assert body["events"][0]["base_commit"] == "a" * 40
+    assert body["next_cursor"] == 2
+    assert body["window"]["head_cursor"] == 2
+
+
+def test_activity_stream_replays_structured_events_and_rejects_bad_token(tmp_path):
+    journal = _activity_journal(tmp_path)
+    client = TestClient(
+        build_daemon_app(
+            harness=_harness(),
+            verify_caller=lambda token: token == "good",
+            activity_journal=journal,
+        )
+    )
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect("/api/v1/activity/stream?token=bad"):
+            pass
+
+    with client.websocket_connect(
+        "/api/v1/activity/stream?token=good&after=1&role=scout"
+    ) as websocket:
+        envelope = websocket.receive_json()
+        assert envelope["type"] == "activity"
+        assert envelope["event"]["cursor"] == 2
+        assert envelope["event"]["kind"] == "tool_call"
+
+
+def test_interactive_session_activity_is_pumped_without_an_attached_viewer(tmp_path):
+    journal = ActivityJournal(root=tmp_path / "activity")
+    app = build_daemon_app(
+        harness=_harness(),
+        verify_caller=lambda token: token == "good",
+        activity_journal=journal,
+    )
+    with TestClient(app):
+        deadline = time.monotonic() + 2
+        while journal.window()["head_cursor"] < 2 and time.monotonic() < deadline:
+            time.sleep(0.02)
+    events = journal.read_after(session_id="lumina-abc12345")
+    assert [event.kind.value for event in events] == ["status", "assistant_text"]
+    assert {event.agent_id for event in events} == {
+        "session-agent-" + hashlib.sha256(b"lumina-abc12345").hexdigest()
+    }
+    assert events[-1].summary == "hello world"
+
+
+def test_job_state_changes_publish_first_class_job_activity(tmp_path):
+    from skharness.jobs import JobRun
+
+    journal = ActivityJournal(root=tmp_path / "activity")
+    app = build_daemon_app(
+        harness=_harness(),
+        verify_caller=lambda token: token == "good",
+        activity_journal=journal,
+        list_jobs=lambda: [
+            JobRun(job="nightly-test", status="failed", host="node41", stale=False)
+        ],
+    )
+    with TestClient(app):
+        deadline = time.monotonic() + 2
+        while not journal.read_after(job_id="nightly-test") and time.monotonic() < deadline:
+            time.sleep(0.02)
+    event = journal.read_after(job_id="nightly-test")[0]
+    assert event.kind.value == "error"
+    assert event.summary == "job state: failed"
+    assert event.data["host"] == "node41"
+
+
+def test_job_activity_does_not_republish_only_because_staleness_age_changes(tmp_path):
+    from skharness.jobs import JobRun
+
+    journal = ActivityJournal(root=tmp_path / "activity")
+    calls = 0
+
+    def jobs():
+        nonlocal calls
+        calls += 1
+        return [
+            JobRun(
+                job="nightly-test",
+                status="ok",
+                host="node41",
+                stale=False,
+                staleness_s=float(calls),
+            )
+        ]
+
+    app = build_daemon_app(
+        harness=_harness(),
+        verify_caller=lambda token: token == "good",
+        activity_journal=journal,
+        list_jobs=jobs,
+    )
+    with TestClient(app):
+        deadline = time.monotonic() + 3
+        while calls < 2 and time.monotonic() < deadline:
+            time.sleep(0.02)
+    assert calls >= 2
+    assert len(journal.read_after(job_id="nightly-test")) == 1
+
+
+def test_activity_replay_is_empty_when_no_journal_is_composed():
+    client = _client()
+    response = client.get(
+        "/api/v1/activity?after=9",
+        headers={"authorization": "Bearer good"},
+    )
+    assert response.status_code == 200
+    assert response.json()["events"] == []
+    assert response.json()["next_cursor"] == 9
+
+
+# ---- Atlas steering commands: distinct authenticated control plane ---------
+
+def test_atlas_session_message_is_audited_idempotent_and_activity_visible(tmp_path):
+    harness = _inject_harness()
+    activity = ActivityJournal(root=tmp_path / "activity")
+    control = ControlJournal(tmp_path / "control")
+    audits = []
+    app = build_daemon_app(
+        harness=harness,
+        verify_caller=_ctx_verifier("skcode.stream", "skcode.inject"),
+        authorize_inject=_allow_inject(),
+        audit_log=audits.append,
+        activity_journal=activity,
+        control_journal=control,
+    )
+    client = TestClient(app)
+    body = {
+        "idempotency_key": "atlas-message-1",
+        "target_kind": "session",
+        "target_id": "lumina-abc12345",
+        "action": "message",
+        "payload": {"text": "focus on the failing test"},
+    }
+
+    first = client.post("/api/v1/control", json=body, headers=_H)
+    second = client.post("/api/v1/control", json=body, headers=_H)
+
+    assert first.status_code == second.status_code == 200
+    assert first.json()["receipt"]["status"] == "applied"
+    assert "payload" not in first.json()["command"]
+    assert second.json()["replayed"] is True
+    assert harness.injected == [("lumina-abc12345", "focus on the failing test")]
+    command_id = first.json()["command"]["command_id"]
+    status = client.get(f"/api/v1/control/{command_id}", headers=_H)
+    assert status.json()["receipt"]["status"] == "applied"
+    assert activity.read_after()[-1].summary == "Atlas control applied: message"
+    assert "focus on" not in str(activity.read_after()[-1].to_dict())
+    assert any("skcode.atlas.control" in row for row in audits)
+    assert all("focus on the failing test" not in row for row in audits)
+
+
+def test_atlas_agent_command_is_honestly_queued_for_owning_controller(tmp_path):
+    activity = ActivityJournal(root=tmp_path / "activity")
+    control = ControlJournal(tmp_path / "control")
+    client = TestClient(
+        build_daemon_app(
+            harness=_harness(),
+            verify_caller=_ctx_verifier("skcode.dispatch"),
+            authorize_dispatch=_allow_inject(),
+            audit_log=lambda row: None,
+            activity_journal=activity,
+            control_journal=control,
+        )
+    )
+    response = client.post(
+        "/api/v1/control",
+        json={
+            "idempotency_key": "atlas-cancel-1",
+            "target_kind": "agent",
+            "target_id": "scout-1",
+            "action": "cancel",
+            "payload": {"reason": "operator stop"},
+        },
+        headers=_H,
+    )
+    assert response.status_code == 202
+    assert response.json()["receipt"]["status"] == "queued"
+    assert control.pending(target_id="scout-1")[0].action.value == "cancel"
+    assert activity.read_after()[-1].summary == "Atlas control queued: cancel"
+
+
+def test_atlas_agent_command_can_be_applied_by_composed_owner_handler(tmp_path):
+    control = ControlJournal(tmp_path / "control")
+    received = []
+    client = TestClient(
+        build_daemon_app(
+            harness=_harness(),
+            verify_caller=_ctx_verifier("skcode.dispatch"),
+            authorize_dispatch=_allow_inject(),
+            audit_log=lambda row: None,
+            control_journal=control,
+            control_handler=lambda command: received.append(command)
+            or {"status": "applied", "detail": "lease stopped and quiescent"},
+        )
+    )
+    response = client.post(
+        "/api/v1/control",
+        json={
+            "idempotency_key": "atlas-owner-cancel-1",
+            "target_kind": "agent",
+            "target_id": "scout-1",
+            "action": "cancel",
+            "payload": {"reason": "operator stop"},
+        },
+        headers=_H,
+    )
+    assert response.status_code == 200
+    assert response.json()["receipt"]["status"] == "applied"
+    assert response.json()["receipt"]["detail"] == "lease stopped and quiescent"
+    assert received[0].target_id == "scout-1"
+
+
+def test_atlas_control_fails_closed_without_dispatch_scope_or_runtime(tmp_path):
+    body = {
+        "idempotency_key": "atlas-message-2",
+        "target_kind": "session",
+        "target_id": "lumina-abc12345",
+        "action": "message",
+        "payload": {"text": "continue"},
+    }
+    read_only = TestClient(
+        build_daemon_app(
+            harness=_inject_harness(),
+            verify_caller=_ctx_verifier("skcode.stream"),
+            control_journal=ControlJournal(tmp_path / "control"),
+        )
+    )
+    assert read_only.post("/api/v1/control", json=body, headers=_H).status_code == 403
+    inject_only = TestClient(
+        build_daemon_app(
+            harness=_inject_harness(),
+            verify_caller=_ctx_verifier("skcode.inject"),
+            authorize_inject=_allow_inject(),
+            audit_log=lambda row: None,
+            control_journal=ControlJournal(tmp_path / "control-dispatch"),
+        )
+    )
+    cancel_body = dict(body, action="cancel", idempotency_key="atlas-cancel-2")
+    assert inject_only.post(
+        "/api/v1/control", json=cancel_body, headers=_H
+    ).status_code == 403
+    uncomposed = TestClient(
+        build_daemon_app(
+            harness=_inject_harness(),
+            verify_caller=_ctx_verifier("skcode.inject"),
+            authorize_inject=_allow_inject(),
+            audit_log=lambda row: None,
+        )
+    )
+    assert uncomposed.post("/api/v1/control", json=body, headers=_H).status_code == 501
+
+
+def test_atlas_control_expected_state_conflict_never_actuates(tmp_path):
+    harness = _inject_harness()
+    client = TestClient(
+        build_daemon_app(
+            harness=harness,
+            verify_caller=_ctx_verifier("skcode.inject"),
+            authorize_inject=_allow_inject(),
+            audit_log=lambda row: None,
+            control_journal=ControlJournal(tmp_path / "control"),
+        )
+    )
+    response = client.post(
+        "/api/v1/control",
+        json={
+            "idempotency_key": "atlas-state-1",
+            "target_kind": "session",
+            "target_id": "lumina-abc12345",
+            "action": "message",
+            "expected_state": "idle",
+            "payload": {"text": "continue"},
+        },
+        headers=_H,
+    )
+    assert response.status_code == 409
+    assert response.json()["receipt"]["status"] == "conflict"
+    assert harness.injected == []
+
+
 # ---- GET /jobs : cron ledger view (spec section 8, card C-8) -----------------
 
 def test_jobs_route_requires_read_scope():
@@ -415,6 +750,8 @@ def test_app_serves_real_client_not_placeholder():
     # It consumes the read routes (sessions list + WS tail).
     assert "/api/v1/sessions" in html
     assert "/stream" in html
+    assert "/api/v1/activity/stream" in html
+    assert 'id="activity-toggle"' in html
 
 
 def test_served_client_has_no_write_control_affordances():

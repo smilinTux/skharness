@@ -1,33 +1,45 @@
-"""skcode-hostd daemon (skcode remote-control, spec 8.1).
+"""Tailnet-only skcode host daemon and Atlas observation/control boundary.
 
-One host daemon owning ONE Harness (its session plane). Exposes the three
-capauth-gated read data routes (list sessions, get one, stream one over WS), one
-grade-only write-ish route (POST /sessions/{sid}/ratify), and the P1 session
-INJECT write surface (POST /sessions/{sid}/inject: send operator text into a
-running session as keystrokes). Ratify runs the autocode twin gate over the
-session's existing worktree diff and NEVER merges, commits, or pushes; inject
-only sends keystrokes into the session's PTY. There is still NO
-spawn/kill/dispatch route. Every gated route fails closed on the shared
-skharness.auth bearer: with the P0 deny-all verifier still in force, every caller
-is 401/403 and NOTHING actuates, so inject is inert in prod until the real
-verifier lands (R2.4). Bind a Tailscale IP only (serve.py enforces this).
+The read plane exposes sessions, jobs, Arena status, and a replayable live activity
+journal. The write plane exposes separately scoped inject, dispatch/cancel, and
+receipt-driven Atlas commands. Every actuator is bearer/PDP/audit gated and fails
+closed when its production dependency is absent. Activity remains observation-only.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import inspect
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
+from skharness.activity import (
+    ActivityContext,
+    ActivityCorruptionError,
+    ActivityJournal,
+    ActivityKind,
+)
 from skharness.arena.models import ExperimentState
 from skharness.arena.status import ArenaStatusService, objectives_from_query
 from skharness.auth import Verifier, check_token, require_bearer
 from skharness.autocode import ratify as _ratify
 from skharness.autocode.types import RepoSpec
+from skharness.control import (
+    TERMINAL_CONTROL_STATUSES,
+    ControlAction,
+    ControlCommand,
+    ControlConflictError,
+    ControlCorruptionError,
+    ControlJournal,
+    ControlStatus,
+    ControlTargetKind,
+)
 from skharness.events import EventType, SessionEvent
 from skharness.harness import Harness, SessionDescriptor, SpawnRejected
 from skharness.jobs import JobRun
@@ -40,6 +52,7 @@ from skharness.session_events import SessionEventStore
 # ``capauth.authz.decide(...)``'s Decision; serve.py wires the real PDP. The daemon
 # NEVER decides policy itself: no authorizer configured => dispatch is denied.
 Authorizer = Callable[[str, dict, dict], Any]
+ControlHandler = Callable[[ControlCommand], Any]
 
 # Advisory targets provider for GET /dispatch/targets: returns the repos/harnesses/
 # hosts/profiles a device MAY target here. Advisory only; /dispatch re-enforces.
@@ -123,6 +136,8 @@ ROUTE_SCOPES: dict[tuple[str, str], str] = {
     ("GET", "/api/v1/sessions"): SCOPE_READ,
     ("GET", "/api/v1/sessions/{sid}"): SCOPE_READ,
     ("GET", "/api/v1/sessions/{sid}/events"): SCOPE_READ,
+    ("GET", "/api/v1/activity"): SCOPE_READ,
+    ("GET", "/api/v1/control/{command_id}"): SCOPE_READ,
     ("GET", "/api/v1/jobs"): SCOPE_READ,
     ("GET", "/api/v1/watchdog/digest"): SCOPE_READ,
     ("GET", "/api/v1/arena/status"): SCOPE_READ,
@@ -142,7 +157,11 @@ ROUTE_SCOPES: dict[tuple[str, str], str] = {
     ("POST", "/api/v1/sessions/{sid}/deny"): SCOPE_WRITE,
     ("POST", "/api/v1/dispatch"): SCOPE_DISPATCH,
     ("POST", "/api/v1/sessions/{sid}/cancel"): SCOPE_DISPATCH,
+    # The route's minimum scope is inject. Action-level enforcement below raises
+    # cancel/pause/resume/retry to dispatch before policy evaluation.
+    ("POST", "/api/v1/control"): SCOPE_WRITE,
     ("WS", "/api/v1/sessions/{sid}/stream"): SCOPE_READ,
+    ("WS", "/api/v1/activity/stream"): SCOPE_READ,
 }
 
 #: Scopes that route through the capauth PDP (decide) and so REQUIRE a rule row in
@@ -210,6 +229,9 @@ def build_daemon_app(
     list_jobs: JobsProvider | None = None,
     read_digest: DigestProvider | None = None,
     arena_status: ArenaStatusService | None = None,
+    activity_journal: ActivityJournal | None = None,
+    control_journal: ControlJournal | None = None,
+    control_handler: ControlHandler | None = None,
 ) -> FastAPI:
     app = FastAPI(title="skcode-hostd")
     # SessionEvent v2 (spec 5.1, card C-1): assigns seq/sid/source at append and
@@ -235,6 +257,167 @@ def build_daemon_app(
         if list_autocode_sessions is not None:
             rows = rows + list(list_autocode_sessions())
         return rows
+
+    activity_pumps: dict[str, asyncio.Task] = {}
+    activity_supervisor: asyncio.Task | None = None
+    job_activity_state: dict[str, tuple] = {}
+
+    async def _pump_session_activity(sid: str) -> None:
+        """Fan one harness session into the durable activity rail without a viewer."""
+
+        if activity_journal is None:
+            return
+        source = _session_source(sid)
+        session_agent_id = "session-agent-" + _content_hash(sid)
+        try:
+            context = ActivityContext(
+                session_id=sid, agent_id=session_agent_id, source=source
+            )
+        except ValueError:
+            context = ActivityContext(
+                session_id="session-" + _content_hash(sid),
+                agent_id=session_agent_id,
+                source=source,
+            )
+        kinds = {
+            EventType.STATUS: ActivityKind.STATUS,
+            EventType.ASSISTANT_TEXT: ActivityKind.ASSISTANT_TEXT,
+            EventType.TOOL_CALL: ActivityKind.TOOL_CALL,
+            EventType.TOOL_RESULT: ActivityKind.TOOL_RESULT,
+            EventType.DIFF: ActivityKind.FILE_CHANGE,
+            EventType.NEEDS_INPUT: ActivityKind.DISPOSITION,
+        }
+        try:
+            async for event in harness.stream(sid):
+                data: dict[str, Any] = {}
+                if event.type in {EventType.TOOL_CALL, EventType.TOOL_RESULT}:
+                    data = {
+                        "tool": event.data.get("name"),
+                        "is_error": bool(event.data.get("is_error", False)),
+                    }
+                summary = event.text
+                if event.type is EventType.TOOL_CALL:
+                    summary = f"{data.get('tool') or 'tool'} started"
+                elif event.type is EventType.TOOL_RESULT:
+                    summary = f"{data.get('tool') or 'tool'} finished"
+                elif event.type is EventType.DIFF:
+                    summary = "worktree change observed"
+                await asyncio.to_thread(
+                    activity_journal.publish,
+                    context,
+                    kinds[event.type],
+                    summary=summary,
+                    data=data,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - one producer cannot kill hostd
+            try:
+                await asyncio.to_thread(
+                    activity_journal.publish,
+                    context,
+                    ActivityKind.ERROR,
+                    summary="interactive session activity pump failed",
+                    data={"error_type": type(exc).__name__},
+                )
+            except Exception:  # noqa: BLE001 - journal failure is surfaced by readiness/docs
+                pass
+
+    async def _supervise_session_activity() -> None:
+        while True:
+            try:
+                rows = await _all_sessions()
+                live_rows = {
+                    row.sid: row
+                    for row in rows
+                    if row.state in {"running", "spawning"}
+                    and (row.source or "interactive") in {"interactive", "attach"}
+                }
+                stale = [
+                    activity_pumps.pop(sid)
+                    for sid in set(activity_pumps) - set(live_rows)
+                ]
+                for task in stale:
+                    task.cancel()
+                if stale:
+                    await asyncio.gather(*stale, return_exceptions=True)
+                for row in live_rows.values():
+                    existing = activity_pumps.get(row.sid)
+                    if existing is None or existing.done():
+                        activity_pumps[row.sid] = asyncio.create_task(
+                            _pump_session_activity(row.sid),
+                            name=f"skcode-activity-{row.sid}",
+                        )
+                if activity_journal is not None and list_jobs is not None:
+                    for job in await asyncio.to_thread(list_jobs):
+                        signature = (
+                            job.status,
+                            job.last_start,
+                            job.dur_s,
+                            job.stale,
+                            job.host,
+                        )
+                        if job_activity_state.get(job.job) == signature:
+                            continue
+                        job_activity_state[job.job] = signature
+                        try:
+                            context = ActivityContext(
+                                session_id="job-" + _content_hash(job.job),
+                                job_id=job.job,
+                                source="scheduler",
+                            )
+                        except ValueError:
+                            context = ActivityContext(
+                                session_id="job-" + _content_hash(job.job),
+                                job_id="job-" + _content_hash(job.job),
+                                source="scheduler",
+                            )
+                        await asyncio.to_thread(
+                            activity_journal.publish,
+                            context,
+                            ActivityKind.ERROR
+                            if job.status == "failed"
+                            else ActivityKind.STATUS,
+                            summary=f"job state: {job.status}",
+                            data={
+                                "job": job.job,
+                                "status": job.status,
+                                "host": job.host,
+                                "last_start": job.last_start,
+                                "duration_s": job.dur_s,
+                                "stale": job.stale,
+                                "staleness_s": job.staleness_s,
+                            },
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - retry bounded discovery on next interval
+                pass
+            await asyncio.sleep(2)
+
+    async def _start_activity_supervisor() -> None:
+        nonlocal activity_supervisor
+        if activity_journal is not None:
+            activity_supervisor = asyncio.create_task(
+                _supervise_session_activity(), name="skcode-activity-supervisor"
+            )
+
+    async def _stop_activity_supervisor() -> None:
+        tasks = [task for task in [activity_supervisor, *activity_pumps.values()] if task]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    @asynccontextmanager
+    async def _lifespan(_app):
+        await _start_activity_supervisor()
+        try:
+            yield
+        finally:
+            await _stop_activity_supervisor()
+
+    app.router.lifespan_context = _lifespan
 
     def _auth(authorization: str | None, required_scope: str | None = None) -> None:
         require_bearer(authorization, verify_caller, required_scope)
@@ -266,6 +449,56 @@ def build_daemon_app(
             if data is None and hasattr(ob, "model_dump"):
                 data = ob.model_dump()
             _emit_audit({"kind": getattr(ob, "kind", "audit"), "data": data or {}})
+
+    def _activity_context_for_control(target_kind: ControlTargetKind, target_id: str):
+        values = {
+            "session_id": target_id if target_kind is ControlTargetKind.SESSION else "",
+            "run_id": target_id if target_kind is ControlTargetKind.RUN else "",
+            "agent_id": target_id if target_kind is ControlTargetKind.AGENT else "",
+            "job_id": target_id if target_kind is ControlTargetKind.JOB else "",
+        }
+        if target_kind is ControlTargetKind.SESSION:
+            values["agent_id"] = "session-agent-" + _content_hash(target_id)
+        if not values["session_id"]:
+            identity = f"control-{target_kind.value}-{target_id}"
+            try:
+                values["session_id"] = identity
+                return ActivityContext(**values, source="atlas-control")
+            except ValueError:
+                values["session_id"] = "control-" + _content_hash(identity)
+        try:
+            return ActivityContext(**values, source="atlas-control")
+        except ValueError:
+            digest = _content_hash(target_id)
+            return ActivityContext(
+                session_id=values["session_id"] or f"control-{digest}",
+                run_id=f"run-{digest}" if values["run_id"] else "",
+                agent_id=f"agent-{digest}" if values["agent_id"] else "",
+                job_id=f"job-{digest}" if values["job_id"] else "",
+                source="atlas-control",
+            )
+
+    def _publish_control_activity(command, status: ControlStatus, detail: str = ""):
+        if activity_journal is None:
+            return None
+        try:
+            event = activity_journal.publish(
+                _activity_context_for_control(command.target_kind, command.target_id),
+                ActivityKind.STATUS if status is ControlStatus.APPLIED else ActivityKind.DISPOSITION,
+                summary=f"Atlas control {status.value}: {command.action.value}",
+                data={
+                    "command_id": command.command_id,
+                    "target_kind": command.target_kind.value,
+                    "target_id": command.target_id,
+                    "action": command.action.value,
+                    "status": status.value,
+                    "payload_digest": command.payload_digest,
+                    "detail": detail,
+                },
+            )
+            return event.cursor
+        except Exception:  # noqa: BLE001 - control receipt remains authoritative
+            return None
 
     def _enforce_inject_floor(subject: str, resource: dict) -> None:
         """CR-6.2 C2/C8: the PDP enrollment-mode floor for the write surface.
@@ -427,13 +660,299 @@ def build_daemon_app(
         rows = store.read_page(sid, before_seq=before_seq, limit=limit)
         return JSONResponse({"sid": sid, "events": rows})
 
+    @app.get("/api/v1/activity")
+    async def activity_replay(
+        after: int = 0,
+        limit: int = 200,
+        session_id: str = "",
+        run_id: str = "",
+        agent_id: str = "",
+        job_id: str = "",
+        card_id: str = "",
+        contract_id: str = "",
+        lease_id: str = "",
+        role: str = "",
+        kind: str = "",
+        authorization: str | None = Header(default=None),
+    ):
+        """Bounded cursor replay for Atlas and the built-in activity window."""
+
+        _auth(authorization, SCOPE_READ)
+        if activity_journal is None:
+            return JSONResponse(
+                {
+                    "events": [],
+                    "window": {
+                        "retained_from_cursor": 1,
+                        "head_cursor": 0,
+                        "retained_events": 0,
+                    },
+                    "next_cursor": after,
+                }
+            )
+        try:
+            rows = await asyncio.to_thread(
+                activity_journal.read_after,
+                after,
+                limit=limit,
+                session_id=session_id,
+                run_id=run_id,
+                agent_id=agent_id,
+                job_id=job_id,
+                card_id=card_id,
+                contract_id=contract_id,
+                lease_id=lease_id,
+                role=role,
+                kind=kind,
+            )
+            window = await asyncio.to_thread(activity_journal.window)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        except ActivityCorruptionError as exc:
+            raise HTTPException(503, "activity journal failed integrity validation") from exc
+        return JSONResponse(
+            {
+                "events": [event.to_dict() for event in rows],
+                "window": window,
+                "next_cursor": rows[-1].cursor if rows else after,
+            }
+        )
+
+    @app.get("/api/v1/control/{command_id}")
+    async def control_status(
+        command_id: str, authorization: str | None = Header(default=None)
+    ):
+        """Read one Atlas command and its latest controller receipt."""
+
+        _auth(authorization, SCOPE_READ)
+        if control_journal is None:
+            raise HTTPException(501, "control journal is not configured")
+        try:
+            command, receipt = await asyncio.to_thread(control_journal.get, command_id)
+        except KeyError as exc:
+            raise HTTPException(404, "control command not found") from exc
+        except ControlCorruptionError as exc:
+            raise HTTPException(503, "control journal failed integrity validation") from exc
+        return JSONResponse({"command": command.to_public_dict(), "receipt": receipt.to_dict()})
+
+    @app.post("/api/v1/control")
+    async def atlas_control(
+        request: Request, authorization: str | None = Header(default=None)
+    ):
+        """Submit an authenticated Atlas steering command.
+
+        Session message/cancel commands are applied synchronously through the
+        existing harness seams. Run/agent/job commands remain durably queued for
+        their owning controller; a queued receipt never claims actuation.
+        """
+
+        try:
+            body = await request.json()
+            target_kind = ControlTargetKind(body["target_kind"])
+            target_id = str(body["target_id"])
+            action = ControlAction(body["action"])
+            idempotency_key = str(body["idempotency_key"])
+            expected_state = str(body.get("expected_state") or "")
+            payload = dict(body.get("payload") or {})
+            ttl_s = float(body.get("ttl_s", 300))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise HTTPException(422, "invalid control command") from exc
+        message_action = action in {
+            ControlAction.MESSAGE,
+            ControlAction.NEEDS_INPUT_RESPONSE,
+        }
+        required_scope = SCOPE_WRITE if message_action else SCOPE_DISPATCH
+        auth = _authed_context(authorization, required_scope)
+        if audit_log is None:
+            raise HTTPException(501, "audit sink not configured; control denied")
+        authorizer = authorize_inject if message_action else authorize_dispatch
+        if authorizer is None:
+            raise HTTPException(501, "authz PDP not configured; control denied")
+        if control_journal is None:
+            raise HTTPException(501, "control journal is not configured")
+        subject = _subject(auth)
+        resource = {
+            "host": host_id,
+            "target_kind": target_kind.value,
+            "target_id": target_id,
+            "action": action.value,
+        }
+        decision = authorizer(subject, resource, {})
+        _emit_decision_obligations(decision)
+        allow = bool(getattr(decision, "allow", False))
+        _emit_audit(
+            {
+                "event": "skcode.atlas.control",
+                "subject": subject,
+                "resource": resource,
+                "decision": "allow" if allow else "deny",
+                "reason": getattr(decision, "reason", ""),
+                "payload_sha256": _content_hash(
+                    json.dumps(payload, sort_keys=True, default=str)
+                ),
+            }
+        )
+        if not allow:
+            raise HTTPException(403, "control not authorized")
+        actor = subject
+        try:
+            ActivityContext(session_id=actor)
+        except ValueError:
+            actor = "actor-" + _content_hash(subject)
+        try:
+            command, receipt, replayed = await asyncio.to_thread(
+                control_journal.submit,
+                actor=actor,
+                idempotency_key=idempotency_key,
+                target_kind=target_kind,
+                target_id=target_id,
+                action=action,
+                payload=payload,
+                expected_state=expected_state,
+                ttl_s=ttl_s,
+            )
+        except ControlConflictError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except (ControlCorruptionError, OSError) as exc:
+            raise HTTPException(503, "control journal unavailable") from exc
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+        if replayed:
+            return JSONResponse(
+                {"command": command.to_public_dict(), "receipt": receipt.to_dict(), "replayed": replayed},
+                status_code=200 if receipt.status in TERMINAL_CONTROL_STATUSES else 202,
+            )
+        if target_kind is not ControlTargetKind.SESSION:
+            if control_handler is None:
+                cursor = _publish_control_activity(command, ControlStatus.QUEUED)
+                receipt = await asyncio.to_thread(
+                    control_journal.record,
+                    command.command_id,
+                    ControlStatus.QUEUED,
+                    controller="skcode-hostd",
+                    detail="awaiting owning controller",
+                    activity_cursor=cursor,
+                )
+                return JSONResponse(
+                    {"command": command.to_public_dict(), "receipt": receipt.to_dict(), "replayed": False},
+                    status_code=202,
+                )
+            await asyncio.to_thread(
+                control_journal.record,
+                command.command_id,
+                ControlStatus.APPLYING,
+                controller="skcode-hostd",
+            )
+            try:
+                if inspect.iscoroutinefunction(control_handler):
+                    result = control_handler(command)
+                else:
+                    result = await asyncio.to_thread(control_handler, command)
+                if inspect.isawaitable(result):
+                    result = await result
+                if not isinstance(result, dict):
+                    raise TypeError("control handler must return a mapping")
+                status = ControlStatus(result.get("status", "rejected"))
+                if status not in TERMINAL_CONTROL_STATUSES:
+                    raise ValueError("control handler must return a terminal status")
+                detail = str(result.get("detail") or "")[:1_024]
+            except Exception as exc:  # noqa: BLE001 - handler failure becomes a receipt
+                status = ControlStatus.REJECTED
+                detail = type(exc).__name__
+            cursor = _publish_control_activity(command, status, detail)
+            receipt = await asyncio.to_thread(
+                control_journal.record,
+                command.command_id,
+                status,
+                controller="target-owner",
+                detail=detail,
+                activity_cursor=cursor,
+            )
+            return JSONResponse(
+                {"command": command.to_public_dict(), "receipt": receipt.to_dict(), "replayed": False}
+            )
+
+        if command.expected_state:
+            session = next(
+                (item for item in await harness.list_sessions() if item.sid == target_id),
+                None,
+            )
+            actual_state = session.state if session is not None else "missing"
+            if actual_state != command.expected_state:
+                detail = (
+                    f"expected state {command.expected_state}; observed {actual_state}"
+                )
+                cursor = _publish_control_activity(command, ControlStatus.CONFLICT, detail)
+                receipt = await asyncio.to_thread(
+                    control_journal.record,
+                    command.command_id,
+                    ControlStatus.CONFLICT,
+                    controller="skcode-hostd",
+                    detail=detail,
+                    activity_cursor=cursor,
+                )
+                return JSONResponse(
+                    {"command": command.to_public_dict(), "receipt": receipt.to_dict()},
+                    status_code=409,
+                )
+
+        supported = {
+            ControlAction.MESSAGE,
+            ControlAction.NEEDS_INPUT_RESPONSE,
+            ControlAction.CANCEL,
+        }
+        if action not in supported:
+            cursor = _publish_control_activity(command, ControlStatus.UNSUPPORTED)
+            receipt = await asyncio.to_thread(
+                control_journal.record,
+                command.command_id,
+                ControlStatus.UNSUPPORTED,
+                controller="skcode-hostd",
+                detail="interactive harness does not implement this action",
+                activity_cursor=cursor,
+            )
+            return JSONResponse({"command": command.to_public_dict(), "receipt": receipt.to_dict()})
+
+        receipt = await asyncio.to_thread(
+            control_journal.record,
+            command.command_id,
+            ControlStatus.APPLYING,
+            controller="skcode-hostd",
+        )
+        try:
+            if action in {ControlAction.MESSAGE, ControlAction.NEEDS_INPUT_RESPONSE}:
+                text = command.payload.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    raise ValueError("session message requires nonblank payload.text")
+                result = await harness.inject(target_id, text)
+                applied = bool(result.get("injected"))
+            else:
+                result = await harness.cancel(target_id)
+                applied = bool(result.get("cancelled"))
+            status = ControlStatus.APPLIED if applied else ControlStatus.REJECTED
+            detail = str(result.get("reason") or "")[:1_024]
+        except Exception as exc:  # noqa: BLE001 - receipt must record target failure
+            status = ControlStatus.REJECTED
+            detail = type(exc).__name__
+        cursor = _publish_control_activity(command, status, detail)
+        receipt = await asyncio.to_thread(
+            control_journal.record,
+            command.command_id,
+            status,
+            controller="skcode-hostd",
+            detail=detail,
+            activity_cursor=cursor,
+        )
+        return JSONResponse({"command": command.to_public_dict(), "receipt": receipt.to_dict()})
+
     @app.get("/api/v1/jobs")
     async def list_jobs_route(authorization: str | None = Header(default=None)):
         # Read-only view over the cron/scheduler ledger (spec section 8, card
         # C-8). Same read scope as sessions/events: it is a VIEW, never a store,
         # so it needs no write scope and no PDP decision. hostd owns none of this
-        # data -- the scheduler does -- and no run-now/cancel/retry action exists
-        # here or anywhere else in this daemon (deliberately deferred). When no
+        # data -- the scheduler does. Atlas job controls use the separate durable
+        # command mailbox and remain queued until the scheduler owner consumes them. When no
         # jobs provider is wired (bare test doubles, or a host with no cron
         # ledger yet), this reports an empty list rather than 404/500: "no jobs
         # known yet" is a valid, unremarkable state.
@@ -775,6 +1294,97 @@ def build_daemon_app(
         except WebSocketDisconnect:
             return
         await websocket.close()
+
+    @app.websocket("/api/v1/activity/stream")
+    async def activity_stream(websocket: WebSocket):
+        """Cursor-resumable activity tail with bounded batches and heartbeats."""
+
+        token = websocket.query_params.get("token")
+        if not check_token(token, verify_caller, SCOPE_READ):
+            await websocket.close(code=1008)
+            return
+        try:
+            cursor = int(websocket.query_params.get("after", "0"))
+            if cursor < 0:
+                raise ValueError
+        except ValueError:
+            await websocket.close(code=1008)
+            return
+        filters = {
+            "session_id": websocket.query_params.get("session_id", ""),
+            "run_id": websocket.query_params.get("run_id", ""),
+            "agent_id": websocket.query_params.get("agent_id", ""),
+            "job_id": websocket.query_params.get("job_id", ""),
+            "card_id": websocket.query_params.get("card_id", ""),
+            "contract_id": websocket.query_params.get("contract_id", ""),
+            "lease_id": websocket.query_params.get("lease_id", ""),
+            "role": websocket.query_params.get("role", ""),
+            "kind": websocket.query_params.get("kind", ""),
+        }
+        await websocket.accept()
+        heartbeat_at = asyncio.get_running_loop().time()
+        try:
+            while True:
+                if activity_journal is None:
+                    rows = []
+                    window = {
+                        "retained_from_cursor": 1,
+                        "head_cursor": 0,
+                        "retained_events": 0,
+                    }
+                else:
+                    try:
+                        rows = await asyncio.to_thread(
+                            activity_journal.read_after,
+                            cursor,
+                            limit=100,
+                            **filters,
+                        )
+                        window = await asyncio.to_thread(activity_journal.window)
+                    except ValueError:
+                        await websocket.close(code=1008)
+                        return
+                    except ActivityCorruptionError:
+                        await websocket.send_json(
+                            {
+                                "type": "error",
+                                "code": "activity_integrity_failure",
+                            }
+                        )
+                        await websocket.close(code=1011)
+                        return
+                retained = int(window["retained_from_cursor"])
+                if cursor and cursor < retained - 1:
+                    await websocket.send_json(
+                        {
+                            "type": "gap",
+                            "requested_after": cursor,
+                            **window,
+                        }
+                    )
+                    cursor = retained - 1
+                    continue
+                if rows:
+                    for event in rows:
+                        await websocket.send_json(
+                            {"type": "activity", "event": event.to_dict()}
+                        )
+                        cursor = event.cursor
+                    heartbeat_at = asyncio.get_running_loop().time()
+                    continue
+                now = asyncio.get_running_loop().time()
+                if now - heartbeat_at >= 10:
+                    await websocket.send_json(
+                        {
+                            "type": "heartbeat",
+                            "cursor": cursor,
+                            **window,
+                        }
+                    )
+                    heartbeat_at = now
+                await asyncio.sleep(0.25)
+        except WebSocketDisconnect:
+            return
 
     @app.get("/", response_class=HTMLResponse)
     @app.get("/app", response_class=HTMLResponse)

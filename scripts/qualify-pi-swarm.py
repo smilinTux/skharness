@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from skharness.activity import ActivityJournal
+from skharness.arena.atlas_control import SwarmAtlasControlOwner
 from skharness.arena.controller import ArenaController
 from skharness.arena.models import canonical_digest
 from skharness.arena.runner import PiExperimentRunner, SandboxProcessSupervisor, pi_launch_spec
@@ -71,6 +73,7 @@ from skharness.autocode.sandbox_lifecycle import (
     SCHEMA_LABEL,
     SandboxOwnership,
 )
+from skharness.control import ControlJournal
 
 SCHEMA = "skharness.pi-swarm.sml.v2"
 QUALIFIED_HOST = "cbrd21-laptop12thgenintelcore"
@@ -104,6 +107,9 @@ MODEL = "ornith-1.5-9b"
 COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
 CONTROLLER_MODULES = (
     "skharness",
+    "skharness.activity",
+    "skharness.control",
+    "skharness.arena.atlas_control",
     "skharness.arena.runner",
     "skharness.arena.swarm",
     "skharness.arena.swarm_control",
@@ -1347,6 +1353,7 @@ def execute_candidate(
     gateway_host = urlsplit(GATEWAY).hostname
     if not gateway_host:
         raise RuntimeError("frozen gateway has no hostname")
+    activity_journal = ActivityJournal()
 
     def runner_factory(contract: SubagentContract) -> PiExperimentRunner:
         worker = worker_by_id[contract.contract_id]
@@ -1368,6 +1375,7 @@ def execute_candidate(
             ),
             card_root / "attempts" / contract.contract_id,
             phase_budget=worker.phase_budget,
+            activity_journal=activity_journal,
         )
 
     def launch_factory(contract: SubagentContract) -> PiSwarmLaunch:
@@ -1431,15 +1439,27 @@ def execute_candidate(
             }
         return replace(execution, usage=usage)
 
-    report = TrustedSwarmOrchestrator(
-        scheduler, gate, A2AJournal(card_root / "a2a.jsonl"), plan,
-        shutdown_grace_s=15,
-    ).run(
-        contracts, execute=execute, stop=runtime.stop,
-        # This qualification deliberately cannot complete a board card. An
-        # independent signed verifier may evaluate the retained lineage later.
-        attest=lambda _results, _receipts: None,
+    atlas_owner = SwarmAtlasControlOwner(
+        scheduler=scheduler,
+        contracts=contracts,
+        stop_worker=runtime.stop,
+        control_journal=ControlJournal(),
+        activity_journal=activity_journal,
     )
+    atlas_owner.start()
+    try:
+        report = TrustedSwarmOrchestrator(
+            scheduler, gate, A2AJournal(card_root / "a2a.jsonl"), plan,
+            shutdown_grace_s=15,
+            activity_journal=activity_journal,
+        ).run(
+            contracts, execute=execute, stop=runtime.stop,
+            # This qualification deliberately cannot complete a board card. An
+            # independent signed verifier may evaluate the retained lineage later.
+            attest=lambda _results, _receipts: None,
+        )
+    finally:
+        atlas_owner.stop()
     try:
         runtime.assert_idle()
     except RuntimeError as exc:

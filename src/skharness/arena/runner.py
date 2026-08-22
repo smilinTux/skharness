@@ -20,16 +20,23 @@ import subprocess
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterable, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Protocol
 
+from skharness.activity import (
+    ActivityContext,
+    ActivityJournal,
+    ActivityKind,
+    sanitize_activity_text,
+)
 from skharness.autocode.pi_events import (
     PiEventScan,
     assistant_message_events,
     scan_pi_events,
     served_model_evidence,
+    valid_pi_event_envelope,
 )
 from skharness.autocode.sandbox import AuthMount, InspectionScope, LaunchSpec, Sandbox
 from skharness.autocode.sandbox_lifecycle import SandboxOwnership
@@ -74,6 +81,162 @@ class AttemptSupervisor(Protocol):
 
 class DockerSupervisorError(RuntimeError):
     """A bounded Docker control-plane operation failed closed."""
+
+
+class _PiActivityTailer:
+    """Publish bounded Pi envelopes while stdout is still being written."""
+
+    def __init__(
+        self,
+        journal: ActivityJournal,
+        context: ActivityContext,
+        path: Path,
+    ) -> None:
+        self.journal = journal
+        self.context = context
+        self.path = path
+        self.stop_event = threading.Event()
+        self.errors = 0
+        self._offset = 0
+        self._buffer = b""
+        self._thread = threading.Thread(
+            target=self._run,
+            name="arena-pi-activity-tail",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop_and_drain(self) -> None:
+        self.stop_event.set()
+        self._thread.join(timeout=2)
+        if self._thread.is_alive():
+            self.errors += 1
+
+    def _publish(
+        self,
+        kind: ActivityKind,
+        summary: str,
+        *,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        try:
+            self.journal.publish(self.context, kind, summary=summary, data=data)
+        except Exception:  # noqa: BLE001 - observability cannot change worker outcome
+            self.errors += 1
+
+    @staticmethod
+    def _assistant_text(message: dict[str, Any]) -> str:
+        content = message.get("content")
+        if not isinstance(content, list):
+            return ""
+        chunks = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text")
+                if isinstance(text, str) and text:
+                    chunks.append(text)
+        return sanitize_activity_text("\n".join(chunks))
+
+    def _event(self, event: dict[str, Any]) -> None:
+        event_type = str(event["type"])
+        if event_type == "message_end":
+            message = event.get("message")
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                text = self._assistant_text(message)
+                self._publish(
+                    ActivityKind.ASSISTANT_TEXT,
+                    text or "assistant message completed",
+                    data={
+                        "stop_reason": message.get("stopReason"),
+                        "response_model": message.get("responseModel"),
+                    },
+                )
+                usage = message.get("usage")
+                if isinstance(usage, dict):
+                    cost = usage.get("cost")
+                    self._publish(
+                        ActivityKind.BUDGET,
+                        "provider usage observed",
+                        data={
+                            "total_tokens": usage.get("totalTokens"),
+                            "cost": cost.get("total") if isinstance(cost, dict) else None,
+                        },
+                    )
+            return
+        if event_type == "tool_execution_start":
+            tool = event.get("toolName")
+            self._publish(
+                ActivityKind.TOOL_CALL,
+                f"{tool or 'unknown'} started",
+                data={"tool": tool},
+            )
+            return
+        if event_type == "tool_execution_end":
+            tool = event.get("toolName")
+            self._publish(
+                ActivityKind.TOOL_RESULT,
+                f"{tool or 'unknown'} finished",
+                data={"tool": tool, "is_error": bool(event.get("isError", False))},
+            )
+            if (
+                isinstance(tool, str)
+                and tool.lower() in {"edit", "write", "apply_patch"}
+                and not bool(event.get("isError", False))
+            ):
+                self._publish(
+                    ActivityKind.FILE_CHANGE,
+                    "worktree edit completed",
+                    data={"tool": tool},
+                )
+            return
+        kind = (
+            ActivityKind.PHASE
+            if event_type.startswith(("turn_", "compaction_", "auto_retry_"))
+            else ActivityKind.STATUS
+        )
+        self._publish(kind, event_type.replace("_", " "), data={"event": event_type})
+
+    def _read_available(self, *, final: bool = False) -> None:
+        if self.path.exists():
+            try:
+                with self.path.open("rb") as stream:
+                    stream.seek(self._offset)
+                    chunk = stream.read()
+            except OSError:
+                self.errors += 1
+                return
+            self._offset += len(chunk)
+            self._buffer += chunk
+        while b"\n" in self._buffer:
+            line, self._buffer = self._buffer.split(b"\n", 1)
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                event = None
+            if not valid_pi_event_envelope(event):
+                self._publish(
+                    ActivityKind.ERROR,
+                    "Pi emitted an invalid structured event",
+                    data={"stream_integrity": "incomplete"},
+                )
+                continue
+            self._event(event)
+        if final and self._buffer.strip():
+            self._publish(
+                ActivityKind.ERROR,
+                "Pi event stream ended with an incomplete record",
+                data={"stream_integrity": "incomplete"},
+            )
+            self._buffer = b""
+
+    def _run(self) -> None:
+        while not self.stop_event.wait(0.05):
+            self._read_available()
+        self._read_available(final=True)
 
 
 class SandboxProcessSupervisor:
@@ -567,12 +730,62 @@ def pi_launch_spec(
 
 class PiExperimentRunner:
     def __init__(
-        self, controller: ArenaController, supervisor: AttemptSupervisor, artifact_root: str | Path
+        self,
+        controller: ArenaController,
+        supervisor: AttemptSupervisor,
+        artifact_root: str | Path,
+        *,
+        activity_journal: ActivityJournal | None = None,
     ) -> None:
         self.controller = controller
         self.supervisor = supervisor
         self.artifact_root = Path(artifact_root)
+        self.activity_journal = activity_journal
         self.artifact_root.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _safe_activity_id(value: object, prefix: str) -> str:
+        candidate = str(value)
+        try:
+            ActivityContext(session_id=candidate)
+        except ValueError:
+            return f"{prefix}-{hashlib.sha256(candidate.encode()).hexdigest()}"
+        return candidate
+
+    def _default_activity_context(self, request: AttemptRequest) -> ActivityContext:
+        return ActivityContext(
+            session_id=self._safe_activity_id(self.controller.session_id, "session"),
+            run_id=self._safe_activity_id(request.experiment_id, "run"),
+            agent_id=self._safe_activity_id(self.controller.actor, "agent"),
+            role="worker",
+            phase="run",
+            source="arena",
+            trajectory_id=self._safe_activity_id(self.controller.session_id, "trajectory"),
+            attempt_id=self._safe_activity_id(request.attempt_id, "attempt"),
+        )
+
+    def _publish_activity(
+        self,
+        context: ActivityContext,
+        kind: ActivityKind,
+        summary: str,
+        *,
+        data: dict[str, Any] | None = None,
+        artifact_refs: tuple[str, ...] = (),
+    ) -> int:
+        if self.activity_journal is None:
+            return 0
+        try:
+            self.activity_journal.publish(
+                context,
+                kind,
+                summary=summary,
+                data=data,
+                artifact_refs=artifact_refs,
+            )
+        except Exception:  # noqa: BLE001 - activity never decides worker state
+            return 1
+        return 0
 
     def _attempt_dir(self, experiment_id: str, attempt: int) -> Path:
         # Experiment identities are external structured data, never path syntax.
@@ -589,10 +802,31 @@ class PiExperimentRunner:
         card_size: CardSize = CardSize.MEDIUM,
         requested_model: str | None = None,
         phase_budget: PhaseBudget | None = None,
+        activity_context: ActivityContext | None = None,
     ) -> RunOutcome | Admission:
+        context = activity_context or self._default_activity_context(request)
+        activity_errors = 0
         admission = self.controller.admit(request, attempt_number=attempt)
         if not admission.admitted or admission.duplicate:
+            activity_errors += self._publish_activity(
+                context,
+                ActivityKind.DISPOSITION,
+                "worker admission refused",
+                data={
+                    "admitted": admission.admitted,
+                    "duplicate": admission.duplicate,
+                    "reason": admission.reason.value if admission.reason else None,
+                },
+            )
             return admission
+        if not context.lease_id and admission.lease is not None:
+            context = replace(context, lease_id=admission.lease.lease_id)
+        activity_errors += self._publish_activity(
+            context,
+            ActivityKind.STATUS,
+            "worker admitted",
+            data={"attempt": attempt, "lease_id": admission.lease.lease_id},
+        )
         heartbeat_stop = threading.Event()
         lease_lost = threading.Event()
 
@@ -638,6 +872,12 @@ class PiExperimentRunner:
                 encoding="utf-8",
             )
             self.controller.running(request.experiment_id, attempt)
+            activity_errors += self._publish_activity(
+                context,
+                ActivityKind.PHASE,
+                "Pi worker running",
+                data={"attempt": attempt},
+            )
         except Exception:
             heartbeat_stop.set()
             heartbeat.join(timeout=1)
@@ -651,6 +891,13 @@ class PiExperimentRunner:
         budget = phase_budget or DEFAULT_PHASE_BUDGETS[card_size]
         timeout_s = min(timeout_s, budget.total_s)
         started_at = time.monotonic()
+        tailer = (
+            _PiActivityTailer(self.activity_journal, context, directory / "stdout.log")
+            if self.activity_journal is not None
+            else None
+        )
+        if tailer is not None:
+            tailer.start()
         try:
             exit_code, classification = self.supervisor.run(spec, directory, timeout_s)
         except DockerSupervisorError as exc:
@@ -662,6 +909,9 @@ class PiExperimentRunner:
             with (directory / "stderr.log").open("ab") as stream:
                 stream.write(f"\n{type(exc).__name__}: {exc}\n".encode())
         finally:
+            if tailer is not None:
+                tailer.stop_and_drain()
+                activity_errors += tailer.errors
             heartbeat_stop.set()
             heartbeat.join(timeout=1)
         if lease_lost.is_set():
@@ -697,6 +947,7 @@ class PiExperimentRunner:
             ),
             "pi_event_stream_complete": not event_scan.incomplete,
             "pi_terminal_event_observed": terminal_event_observed,
+            "activity_publication_errors": activity_errors,
             "card_size": card_size.value,
             "phase_budget_s": {
                 "assess": budget.assess_s,
@@ -743,6 +994,18 @@ class PiExperimentRunner:
         if cancelled:
             successful = False
             classification = "cancelled"
+        activity_errors += self._publish_activity(
+            context,
+            ActivityKind.DISPOSITION if successful else ActivityKind.ERROR,
+            "Pi worker completed" if successful else f"Pi worker failed: {classification}",
+            data={
+                "classification": classification,
+                "exit_code": exit_code,
+                "successful": successful,
+            },
+            artifact_refs=(stdout_digest, stderr_digest),
+        )
+        metrics["activity_publication_errors"] = activity_errors
         payload = {
             "classification": classification,
             "reason": classification if not successful else None,
@@ -751,6 +1014,9 @@ class PiExperimentRunner:
             "stderr_digest": stderr_digest,
             "partial": not successful,
             "metrics": metrics,
+            # Retain controller-owned lineage in the durable attempt record even
+            # after the bounded live activity window has trimmed older events.
+            "activity_context": asdict(context),
         }
         if terminal_error is not None:
             payload["terminal_error"] = terminal_error
@@ -1046,8 +1312,10 @@ def build_production_pi_runner(
     *,
     artifact_root: str | Path,
     docker: str = "docker",
+    activity_journal: ActivityJournal | None = None,
 ) -> PiExperimentRunner:
     """Production composition is always real Sandbox+Docker, never FakeSpawner."""
+    activity_journal = activity_journal or ActivityJournal()
     sandbox = Sandbox(live_execution=True, docker=docker)
 
     def active_run_ids() -> Iterable[str]:
@@ -1057,4 +1325,9 @@ def build_production_pi_runner(
         )
 
     supervisor = SandboxProcessSupervisor(sandbox, active_run_ids=active_run_ids)
-    return PiExperimentRunner(controller, supervisor, artifact_root)
+    return PiExperimentRunner(
+        controller,
+        supervisor,
+        artifact_root,
+        activity_journal=activity_journal,
+    )

@@ -19,10 +19,12 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from skharness.activity import ActivityJournal
 from skharness.arena import ArenaJobService, ArenaStatusService, ArenaStore, ProbeResult
 from skharness.arena.collaboration import RefinementJournal
 from skharness.auth import AuthContext, Verifier
 from skharness.autocode.sessions import AutocodeSessionRegistry
+from skharness.control import ControlJournal
 from skharness.daemon import build_daemon_app
 from skharness.digest import read_latest_digest
 from skharness.harnesses.claude_code import ClaudeCodeHarness, parse_repo_allowlist
@@ -477,6 +479,8 @@ def _serve(argv: list[str]) -> None:
     sessions_dir = skcode_state_dir() / "sessions"
     event_store = SessionEventStore(root=sessions_dir)
     autocode_registry = AutocodeSessionRegistry(root=sessions_dir)
+    activity_journal = ActivityJournal(root=skcode_state_dir() / "activity")
+    control_journal = ControlJournal(skcode_state_dir() / "control")
 
     app = build_daemon_app(
         harness=harness,
@@ -492,5 +496,7 @@ def _serve(argv: list[str]) -> None:
         list_jobs=build_jobs_provider(),
         read_digest=build_digest_provider(),
         arena_status=build_arena_status_service(),
+        activity_journal=activity_journal,
+        control_journal=control_journal,
     )
     uvicorn.run(app, host=host, port=args.port)

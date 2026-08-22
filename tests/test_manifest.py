@@ -47,4 +47,29 @@ def test_operator_facet_matches_the_skcode_adapter_contract():
         "RegistryConsistent",
         "AuthEnforced",
     ]
+    assert op["activity"] == {
+        "scope": "skcode.stream",
+        "replay": "/api/v1/activity",
+        "stream": "/api/v1/activity/stream",
+        "cursorVersion": 1,
+        "lineageVersion": 1,
+        "lineageFields": [
+            "card_id",
+            "card_hash",
+            "trajectory_id",
+            "team_id",
+            "parent_agent_id",
+            "contract_id",
+            "contract_hash",
+            "plan_hash",
+            "lease_id",
+            "attempt_id",
+            "base_commit",
+            "evidence_id",
+        ],
+    }
+    assert op["control"]["messageScope"] == "skcode.inject"
+    assert op["control"]["actionScope"] == "skcode.dispatch"
+    assert op["control"]["submit"] == "/api/v1/control"
+    assert op["control"]["receipt"] == "/api/v1/control/{command_id}"
     assert op["proposedStandardActions"] == ["restart-hostd", "archive-stale-session"]

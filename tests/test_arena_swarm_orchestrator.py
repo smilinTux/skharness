@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from skharness.activity import ActivityJournal
 from skharness.arena.models import canonical_digest
 from skharness.arena.swarm import (
     BudgetUsage,
@@ -211,6 +212,7 @@ def test_orchestrator_orders_roles_records_a2a_and_requires_verifier(tmp_path):
         for role in (SwarmRole.SCOUT, SwarmRole.BUILDER, SwarmRole.TESTER)
     )
     observed = []
+    activity = ActivityJournal(root=tmp_path / "activity")
 
     def execute(contract):
         observed.append(contract.role)
@@ -221,12 +223,19 @@ def test_orchestrator_orders_roles_records_a2a_and_requires_verifier(tmp_path):
         _gate(plan),
         A2AJournal(tmp_path / "a2a.jsonl"),
         plan,
+        activity_journal=activity,
     ).run(contracts, execute=execute, stop=lambda lease_id: None, attest=_attestation)
 
     assert observed == [SwarmRole.SCOUT, SwarmRole.BUILDER, SwarmRole.TESTER]
     assert report.completion.authorized
     assert len(report.a2a_event_digests) == 6
     assert len((tmp_path / "a2a.jsonl").read_text().splitlines()) == 6
+    a2a_activity = activity.read_after()
+    assert len(a2a_activity) == 6
+    assert {item.source for item in a2a_activity} == {"swarm-a2a"}
+    assert {item.parent_agent_id for item in a2a_activity} == {"orchestrator"}
+    assert all(item.contract_hash and item.plan_hash for item in a2a_activity)
+    assert all("Perform bounded" not in str(item.to_dict()) for item in a2a_activity)
 
 
 def test_noncompleted_scout_cancels_downstream_and_gate_denies(tmp_path):

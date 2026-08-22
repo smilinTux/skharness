@@ -10,6 +10,7 @@ from skharness.arena.access import (
     AttemptOwnership,
     CollaborationAccess,
 )
+from skharness.arena.atlas_control import SwarmAtlasControlOwner
 from skharness.arena.collaboration import (
     CollaborationError,
     ExperimentCatalog,
@@ -204,6 +205,7 @@ __all__ = [
     "SubagentDisposition",
     "SubagentResult",
     "SwarmAdmission",
+    "SwarmAtlasControlOwner",
     "SwarmAdmissionReason",
     "SwarmContractError",
     "SwarmCompletionGate",

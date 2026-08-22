@@ -16,6 +16,20 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ### Added
 
+- Added a process-safe, cursor-resumable live `ActivityEvent` journal for Atlas and the
+  built-in skcode webapp. Interactive sessions publish independently of viewers and Pi
+  Arena workers publish bounded phase/tool/assistant/disposition events while running,
+  with stable swarm identities, credential redaction, no raw tool arguments/results,
+  explicit retention gaps, and terminal artifact digests. Added separate expiring,
+  idempotent Atlas `ControlCommand`/`ControlReceipt` storage: CapAuth/PDP/audit-gated
+  session message/cancel commands apply through existing harness seams, while run,
+  agent, and job commands remain honestly queued for their owning controller.
+  Activity now retains the immutable card/trajectory/team/parent-child/plan/contract/
+  lease/attempt/base-commit/evidence lineage and copies it into durable Arena terminal
+  records. Added the trusted swarm-owner consumer: Atlas cancellation reaches only an
+  exact planned trajectory or child lease, uses scheduler cancellation plus bounded
+  runtime quiescence, and returns explicit unsupported receipts for unsafe mid-turn
+  Pi controls.
 - Added immutable run/role/schema ownership labels to every managed sandbox worker,
   egress proxy, and internal network. Live admissions now perform fail-closed startup
   and rate-limited orphan reconciliation, with an explicit callable/status seam,

@@ -110,7 +110,8 @@ def test_pi_runtime_maps_success_to_evidence_not_completion_authority():
         launch_factory=_launch,
         observe_commit=lambda contract, cancellation: COMMIT,
     )
-    execution = runtime.execute(_contract())
+    contract = _contract()
+    execution = runtime.execute(contract)
 
     assert execution.result.disposition is SubagentDisposition.COMPLETED
     assert execution.result.evidence_refs == (DIGEST, "sha256:" + "2" * 64)
@@ -123,6 +124,25 @@ def test_pi_runtime_maps_success_to_evidence_not_completion_authority():
     assert runner.spec.scoped_readable_paths == ["src"]
     assert runner.spec.scoped_writable_paths == ["src"]
     assert runner.spec.inspection_scope.max_calls == 10
+    activity = runner.kwargs["activity_context"]
+    assert activity.session_id == "trajectory-1"
+    assert activity.run_id == "trajectory-1"
+    assert activity.card_id == "card-1"
+    assert activity.card_hash == contract.identity.card_hash
+    assert activity.trajectory_id == "trajectory-1"
+    assert activity.team_id == "team-1"
+    assert activity.parent_agent_id == "orchestrator"
+    assert activity.contract_id == contract.contract_id
+    assert activity.contract_hash == contract.content_hash
+    assert activity.plan_hash == contract.plan_hash
+    assert activity.lease_id == contract.lease_id
+    assert activity.attempt_id == "1"
+    assert activity.base_commit == contract.identity.base_commit
+    assert activity.evidence_id == contract.identity.evidence_id
+    assert activity.agent_id == "worker"
+    assert activity.role == "builder"
+    assert activity.phase == "phase-builder"
+    assert activity.source == "swarm"
 
 
 def test_pi_runtime_charges_monotonic_elapsed_time_across_wall_clock_rollback():

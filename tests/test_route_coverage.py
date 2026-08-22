@@ -104,6 +104,9 @@ def test_stream_scope_is_read_not_pdp():
     from capauth.authz import DEFAULT_RULES
 
     assert ROUTE_SCOPES[("WS", "/api/v1/sessions/{sid}/stream")] == "skcode.stream"
+    assert ROUTE_SCOPES[("GET", "/api/v1/activity")] == "skcode.stream"
+    assert ROUTE_SCOPES[("WS", "/api/v1/activity/stream")] == "skcode.stream"
+    assert ROUTE_SCOPES[("GET", "/api/v1/control/{command_id}")] == "skcode.stream"
     assert "skcode.stream" not in PDP_SCOPES
     assert "skcode.stream" not in DEFAULT_RULES
 
@@ -113,6 +116,7 @@ def test_the_three_write_and_rce_routes_are_gated_on_the_right_scopes():
     assert classify_route("POST", "/api/v1/sessions/{sid}/inject") == ("gated", "skcode.inject")
     assert classify_route("POST", "/api/v1/sessions/{sid}/ratify") == ("gated", "skcode.inject")
     assert classify_route("POST", "/api/v1/dispatch") == ("gated", "skcode.dispatch")
+    assert classify_route("POST", "/api/v1/control") == ("gated", "skcode.inject")
     assert classify_route("GET", "/api/v1/dispatch/targets") == ("gated", "skcode.dispatch")
     # discovery + client are public (no bearer)
     assert classify_route("GET", "/.well-known/skworld-module.json") == ("public", None)

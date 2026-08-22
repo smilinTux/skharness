@@ -17,6 +17,9 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
+from skharness.activity import ActivityContext, ActivityJournal, ActivityKind
+
+from .models import canonical_digest
 from .swarm import (
     A2AEvent,
     A2AEventKind,
@@ -143,11 +146,13 @@ class TrustedSwarmOrchestrator:
         journal: A2AJournal,
         plan: SwarmPlan,
         shutdown_grace_s: float = 2.0,
+        activity_journal: ActivityJournal | None = None,
     ) -> None:
         self.scheduler = scheduler
         self.completion_gate = completion_gate
         self.journal = journal
         self.plan = plan
+        self.activity_journal = activity_journal
         if shutdown_grace_s <= 0:
             raise ValueError("shutdown_grace_s must be positive")
         self.shutdown_grace_s = shutdown_grace_s
@@ -327,10 +332,11 @@ class TrustedSwarmOrchestrator:
                 break
             admitted.append(contract)
             event_digests.append(
-                self.journal.append(
+                self._record_a2a(
+                    contract,
                     self._assignment_event(
                         contract, authorizations.get(contract.contract_id)
-                    )
+                    ),
                 )
             )
 
@@ -416,7 +422,9 @@ class TrustedSwarmOrchestrator:
                         )
                         continue
                     results.append(result)
-                    event_digests.append(self.journal.append(self._result_event(contract, result)))
+                    event_digests.append(
+                        self._record_a2a(contract, self._result_event(contract, result))
+                    )
             if late_futures:
                 self._drain_late_futures(
                     late_futures,
@@ -444,7 +452,9 @@ class TrustedSwarmOrchestrator:
                 failures.append(f"late_worker_result_invalid:{contract.contract_id}")
                 continue
             results.append(result)
-            event_digests.append(self.journal.append(self._result_event(contract, result)))
+            event_digests.append(
+                self._record_a2a(contract, self._result_event(contract, result))
+            )
         for future in hung:
             contract = futures[future]
             failures.append(f"worker_shutdown_grace_exceeded:{contract.contract_id}")
@@ -560,6 +570,54 @@ class TrustedSwarmOrchestrator:
             },
             created_at=datetime.now(timezone.utc),
         )
+
+    def _record_a2a(self, contract: SubagentContract, event: A2AEvent) -> str:
+        digest = self.journal.append(event)
+        if self.activity_journal is not None:
+            try:
+                self.activity_journal.publish(
+                    ActivityContext(
+                        session_id=contract.identity.trajectory_id,
+                        run_id=contract.identity.trajectory_id,
+                        agent_id=event.sender_agent_id,
+                        role=contract.role.value,
+                        phase=contract.phase_id,
+                        source="swarm-a2a",
+                        card_id=contract.identity.card_id,
+                        card_hash=contract.identity.card_hash,
+                        trajectory_id=contract.identity.trajectory_id,
+                        team_id=contract.team_id,
+                        parent_agent_id=contract.parent_agent_id,
+                        contract_id=contract.contract_id,
+                        contract_hash=contract.content_hash,
+                        plan_hash=contract.plan_hash,
+                        lease_id=contract.lease_id,
+                        base_commit=contract.identity.base_commit,
+                        evidence_id=contract.identity.evidence_id,
+                    ),
+                    (
+                        ActivityKind.DISPOSITION
+                        if event.kind in {A2AEventKind.RESULT, A2AEventKind.CANCELLATION}
+                        else ActivityKind.PHASE
+                    ),
+                    summary=(
+                        f"A2A {event.kind.value}: "
+                        f"{event.sender_agent_id} to {event.recipient_agent_id}"
+                    ),
+                    data={
+                        "a2a_event_id": event.event_id,
+                        "a2a_event_hash": digest,
+                        "kind": event.kind.value,
+                        "sender_agent_id": event.sender_agent_id,
+                        "recipient_agent_id": event.recipient_agent_id,
+                        "sequence": event.sequence,
+                        "prior_event_id": event.prior_event_id,
+                        "body_digest": canonical_digest(event.body),
+                    },
+                )
+            except Exception:  # noqa: BLE001 - A2A durable journal remains authoritative
+                pass
+        return digest
 
     @staticmethod
     def _result_event(contract: SubagentContract, result: SubagentResult) -> A2AEvent:

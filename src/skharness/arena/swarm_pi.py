@@ -10,6 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
+from skharness.activity import ActivityContext
 from skharness.autocode.sandbox import LaunchSpec
 
 from .runner import PiExperimentRunner, RunOutcome
@@ -189,6 +190,26 @@ class PiSwarmWorkerRuntime:
                 timeout_s=worker_timeout,
                 card_size=launch.card_size,
                 requested_model=launch.requested_model,
+                activity_context=ActivityContext(
+                    session_id=contract.identity.trajectory_id,
+                    run_id=contract.identity.trajectory_id,
+                    agent_id=contract.child_agent_id,
+                    role=contract.role.value,
+                    phase=contract.phase_id,
+                    source="swarm",
+                    card_id=contract.identity.card_id,
+                    card_hash=contract.identity.card_hash,
+                    trajectory_id=contract.identity.trajectory_id,
+                    team_id=contract.team_id,
+                    parent_agent_id=contract.parent_agent_id,
+                    contract_id=contract.contract_id,
+                    contract_hash=contract.content_hash,
+                    plan_hash=contract.plan_hash,
+                    lease_id=contract.lease_id,
+                    attempt_id=launch.request.attempt_id,
+                    base_commit=contract.identity.base_commit,
+                    evidence_id=contract.identity.evidence_id,
+                ),
             )
             if isinstance(raw, Admission):
                 disposition = SubagentDisposition.FAILED

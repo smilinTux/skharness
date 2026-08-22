@@ -52,6 +52,21 @@
   #transcript { flex: 1; overflow-y: auto; padding: 12px;
                 white-space: pre-wrap; word-break: break-word; }
   #transcript .placeholder { color: var(--muted); }
+  #activity-bar { display: none; gap: 6px; flex-wrap: wrap; align-items: center;
+                  padding: 8px 12px; border-bottom: 1px solid var(--line);
+                  background: var(--panel); }
+  #activity-bar.open { display: flex; }
+  #activity-bar input, #activity-bar select { background: #151515; color: var(--fg);
+                  border: 1px solid var(--line); border-radius: 4px;
+                  padding: 5px 7px; font: inherit; min-width: 90px; }
+  #activity-state { color: var(--muted); font-size: var(--fs-caption); }
+  #activity-state.live { color: var(--good); }
+  #activity-state.err { color: var(--warn); }
+  .activity { border-bottom: 1px solid var(--line2); padding: 7px 2px; }
+  .activity .activity-head { color: var(--accent); }
+  .activity .activity-meta { color: var(--muted); font-size: var(--fs-caption); }
+  .activity details { margin-top: 4px; color: var(--muted); }
+  .activity pre { white-space: pre-wrap; margin: 4px 0 0; color: var(--fg); }
   /* Inject bar: send a follow-up into the active session. This is a gated WRITE
      (POST /api/v1/sessions/<sid>/inject, skcode.inject scope), the second and
      last write this client issues (dispatch is the other). Disabled until a
@@ -134,6 +149,7 @@
   <strong>skcode</strong>
   <span class="tag">read-only</span>
   <button id="compose-toggle" type="button">New session</button>
+  <button id="activity-toggle" type="button">Activity</button>
   <button id="refresh" type="button">Refresh</button>
   <span class="host" id="host"></span>
 </header>
@@ -187,6 +203,31 @@
 <main>
   <div id="list"></div>
   <div id="convo">
+    <div id="activity-bar" aria-label="Activity filters">
+      <input id="activity-session" placeholder="session id">
+      <input id="activity-run" placeholder="run/card id">
+      <input id="activity-agent" placeholder="agent id">
+      <input id="activity-job" placeholder="job id">
+      <input id="activity-card" placeholder="card id">
+      <input id="activity-contract" placeholder="contract id">
+      <input id="activity-lease" placeholder="lease id">
+      <input id="activity-role" placeholder="role">
+      <select id="activity-kind">
+        <option value="">all kinds</option>
+        <option value="status">status</option>
+        <option value="phase">phase</option>
+        <option value="assistant_text">assistant text</option>
+        <option value="tool_call">tool call</option>
+        <option value="tool_result">tool result</option>
+        <option value="file_change">file change</option>
+        <option value="test">test</option>
+        <option value="budget">budget</option>
+        <option value="disposition">disposition</option>
+        <option value="error">error</option>
+      </select>
+      <button id="activity-apply" type="button">Apply</button>
+      <span id="activity-state">offline</span>
+    </div>
     <div id="transcript"><div class="placeholder">Select a session to tail its output.</div></div>
     <div id="inject-bar">
       <input id="inject-text" type="text" placeholder="Send a follow-up to this session..." disabled>
@@ -209,8 +250,13 @@ var hostEl = document.getElementById("host");
 var injectText = document.getElementById("inject-text");
 var injectBtn = document.getElementById("inject-btn");
 var injectMsg = document.getElementById("inject-msg");
+var activityBar = document.getElementById("activity-bar");
+var activityState = document.getElementById("activity-state");
 var ws = null;
 var activeSid = null;
+var activityMode = false;
+var activityCursor = 0;
+var activityReconnect = null;
 
 // The parent shell (skchat) mints a capauth wire token scoped to audience
 // "skcode" and hands it to this read-only client through the iframe URL as
@@ -257,12 +303,140 @@ function wsUrl(path) {
 
 function clearTranscript(msg) {
   if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+  if (activityReconnect) { clearTimeout(activityReconnect); activityReconnect = null; }
   _lastRenderedText = "";
   transcriptEl.textContent = "";
   var d = document.createElement("div");
   d.className = "placeholder";
   d.textContent = msg || "Select a session to tail its output.";
   transcriptEl.appendChild(d);
+}
+
+function setActivityState(text, cls) {
+  activityState.textContent = text;
+  activityState.className = cls || "";
+}
+
+function activityFilters() {
+  return {
+    session_id: document.getElementById("activity-session").value.trim(),
+    run_id: document.getElementById("activity-run").value.trim(),
+    agent_id: document.getElementById("activity-agent").value.trim(),
+    job_id: document.getElementById("activity-job").value.trim(),
+    card_id: document.getElementById("activity-card").value.trim(),
+    contract_id: document.getElementById("activity-contract").value.trim(),
+    lease_id: document.getElementById("activity-lease").value.trim(),
+    role: document.getElementById("activity-role").value.trim(),
+    kind: document.getElementById("activity-kind").value
+  };
+}
+
+function activityQuery(after) {
+  var params = ["after=" + encodeURIComponent(String(after || 0))];
+  var filters = activityFilters();
+  Object.keys(filters).forEach(function (key) {
+    if (filters[key]) { params.push(key + "=" + encodeURIComponent(filters[key])); }
+  });
+  return "?" + params.join("&");
+}
+
+function renderActivity(event) {
+  if (!event || !event.cursor) { return; }
+  activityCursor = Math.max(activityCursor, Number(event.cursor) || 0);
+  if (transcriptEl.firstChild && transcriptEl.firstChild.className === "placeholder") {
+    transcriptEl.textContent = "";
+  }
+  var item = document.createElement("div");
+  item.className = "activity";
+  var head = document.createElement("div");
+  head.className = "activity-head";
+  var when = event.published_at ? new Date(event.published_at * 1000).toLocaleTimeString() : "";
+  head.textContent = when + "  " + (event.agent_id || event.source || "agent")
+    + (event.role ? "/" + event.role : "") + "  " + event.kind + "  "
+    + (event.summary || "");
+  var meta = document.createElement("div");
+  meta.className = "activity-meta";
+  meta.textContent = "cursor " + event.cursor
+    + (event.phase ? " · " + event.phase : "")
+    + (event.run_id ? " · run " + event.run_id : "")
+    + (event.card_id ? " · card " + event.card_id : "")
+    + (event.contract_id ? " · contract " + event.contract_id : "")
+    + (event.job_id ? " · job " + event.job_id : "")
+    + (event.session_id ? " · session " + event.session_id : "");
+  item.appendChild(head);
+  item.appendChild(meta);
+  var hasDetails = (event.data && Object.keys(event.data).length)
+    || (event.artifact_refs && event.artifact_refs.length)
+    || event.card_id || event.contract_id || event.lease_id || event.evidence_id;
+  if (hasDetails) {
+    var details = document.createElement("details");
+    var summary = document.createElement("summary");
+    summary.textContent = "structured evidence";
+    var pre = document.createElement("pre");
+    pre.textContent = JSON.stringify({
+      lineage: {
+        card_id: event.card_id || null,
+        card_hash: event.card_hash || null,
+        trajectory_id: event.trajectory_id || null,
+        team_id: event.team_id || null,
+        parent_agent_id: event.parent_agent_id || null,
+        contract_id: event.contract_id || null,
+        contract_hash: event.contract_hash || null,
+        plan_hash: event.plan_hash || null,
+        lease_id: event.lease_id || null,
+        attempt_id: event.attempt_id || null,
+        base_commit: event.base_commit || null,
+        evidence_id: event.evidence_id || null
+      },
+      data: event.data || {}, artifact_refs: event.artifact_refs || []
+    }, null, 2);
+    details.appendChild(summary); details.appendChild(pre); item.appendChild(details);
+  }
+  transcriptEl.appendChild(item);
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+function openActivityStream(reset) {
+  activityMode = true;
+  activeSid = null;
+  if (reset) { activityCursor = 0; transcriptEl.textContent = ""; }
+  if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+  if (activityReconnect) { clearTimeout(activityReconnect); activityReconnect = null; }
+  activityBar.classList.add("open");
+  injectText.disabled = true; injectBtn.disabled = true; injectMsg.textContent = "";
+  if (!transcriptEl.firstChild) {
+    var placeholder = document.createElement("div");
+    placeholder.className = "placeholder";
+    placeholder.textContent = "Waiting for agent activity…";
+    transcriptEl.appendChild(placeholder);
+  }
+  setActivityState("connecting", "");
+  try {
+    ws = new WebSocket(wsUrl("/api/v1/activity/stream" + activityQuery(activityCursor)));
+  } catch (e) {
+    setActivityState("connection failed", "err");
+    return;
+  }
+  ws.onopen = function () { if (activityMode) { setActivityState("live", "live"); } };
+  ws.onmessage = function (message) {
+    var envelope; try { envelope = JSON.parse(message.data); } catch (e) { return; }
+    if (envelope.type === "activity") { renderActivity(envelope.event); }
+    else if (envelope.type === "gap") {
+      activityCursor = Math.max(0, Number(envelope.retained_from_cursor || 1) - 1);
+      appendEvDiv("ev needs_input", "Older activity expired; resumed at retained cursor.");
+    } else if (envelope.type === "error") {
+      setActivityState("journal integrity error", "err");
+    }
+  };
+  ws.onclose = function (event) {
+    ws = null;
+    if (!activityMode) { return; }
+    setActivityState(event && event.code === 1008 ? "access refused" : "reconnecting", "err");
+    if (!event || event.code !== 1008) {
+      activityReconnect = setTimeout(function () { openActivityStream(false); }, 1000);
+    }
+  };
+  ws.onerror = function () { if (activityMode) { setActivityState("stream error", "err"); } };
 }
 
 // The stream is a raw capture of claude's full-screen TUI, so it carries terminal
@@ -356,6 +530,9 @@ function openStream(sid) {
   // that produced POST /api/v1/sessions//inject -> 404. Defense in depth on top
   // of the injectSubmit guard.
   if (!sid) { return; }
+  activityMode = false;
+  activityBar.classList.remove("open");
+  if (activityReconnect) { clearTimeout(activityReconnect); activityReconnect = null; }
   if (ws) { try { ws.close(); } catch (e) {} ws = null; }
   activeSid = sid;
   // A session is selected: enable the follow-up input (gated inject write).
@@ -468,6 +645,12 @@ function refresh() {
 }
 
 document.getElementById("refresh").addEventListener("click", refresh);
+document.getElementById("activity-toggle").addEventListener("click", function () {
+  openActivityStream(true);
+});
+document.getElementById("activity-apply").addEventListener("click", function () {
+  openActivityStream(true);
+});
 
 // --- New session (compose) --------------------------------------------------
 // The ONLY write this client issues is the gated POST /api/v1/dispatch below.
