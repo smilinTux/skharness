@@ -375,7 +375,7 @@ REMEDIATION_CANDIDATES = {
         workers=(WorkerTemplate(
             "c278b5c0-preflight", "phase-preflight", SwarmRole.SCOUT,
             """Read only these exact mounted paths for card c278b5c0:
-            src/skharness/autocode/sandbox.py, src/skharness/autocode/sandbox_lifecycle.py,
+            src/skharness/autocode/sandbox.py,
             tests/test_sandbox_spawn.py, and tests/test_qualify_pi_swarm_script.py.
             Locate the supervisor cleanup seam and the existing already-absent
             regression coverage. Do not edit, run Docker, inspect host state, secrets,
@@ -384,7 +384,6 @@ REMEDIATION_CANDIDATES = {
             Do not propose changes outside the declared paths.""",
             (
                 "src/skharness/autocode/sandbox.py",
-                "src/skharness/autocode/sandbox_lifecycle.py",
                 "tests/test_sandbox_spawn.py",
                 "tests/test_qualify_pi_swarm_script.py",
             ), (), (), READ_TOOLS,
@@ -400,14 +399,12 @@ REMEDIATION_CANDIDATES = {
             preflight evidence does not support a safe narrow change, emit STATUS:
             BLOCKED with exact paths.""",
             (".git", "src/skharness/autocode/sandbox.py",
-             "src/skharness/autocode/sandbox_lifecycle.py",
              "tests/test_sandbox_spawn.py", "tests/test_qualify_pi_swarm_script.py"),
-            ("src/skharness/autocode/sandbox.py", "src/skharness/autocode/sandbox_lifecycle.py",
+            ("src/skharness/autocode/sandbox.py",
              "tests/test_sandbox_spawn.py", "tests/test_qualify_pi_swarm_script.py"), (), BUILD_TOOLS,
             360, 240, 120, 65_536, 24, PhaseBudget(20, 50, 130, 40),
         ),),
         allowed_changes=frozenset({"src/skharness/autocode/sandbox.py",
-                                   "src/skharness/autocode/sandbox_lifecycle.py",
                                    "tests/test_sandbox_spawn.py",
                                    "tests/test_qualify_pi_swarm_script.py"}),
         required_changes=frozenset({"tests/test_sandbox_spawn.py"}),
