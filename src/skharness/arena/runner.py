@@ -443,12 +443,21 @@ class SandboxProcessSupervisor:
                     self._container_name = container_name
                 inspection_denial = threading.Event()
                 inspection_detail: dict[str, object] = {}
+                inspection_observation: dict[str, object] = {
+                    "root": spec.inspection_scope.root if spec.inspection_scope else None,
+                    "max_calls": spec.inspection_scope.max_calls if spec.inspection_scope else None,
+                    "observed_calls": 0,
+                    "remaining_calls": spec.inspection_scope.max_calls if spec.inspection_scope else None,
+                    "denial_reason": None,
+                    "stream_status": "running",
+                }
                 monitor = None
                 if spec.inspection_scope is not None:
                     monitor = threading.Thread(
                         target=self._monitor_inspection,
                         args=(attempt_dir / "stdout.log", spec.inspection_scope,
-                              process, inspection_denial, inspection_detail),
+                              process, inspection_denial, inspection_detail,
+                              inspection_observation),
                         daemon=True,
                         name="arena-inspection-scope",
                     )
@@ -470,6 +479,13 @@ class SandboxProcessSupervisor:
                     exit_code = process.wait(timeout=self.shutdown_grace_s)
                 if monitor is not None:
                     monitor.join(timeout=1)
+                    inspection_observation["stream_status"] = (
+                        "denied" if inspection_denial.is_set() else "complete"
+                    )
+                    (attempt_dir / "inspection-observation.json").write_text(
+                        json.dumps(inspection_observation, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
                 if inspection_denial.is_set():
                     classification = "inspection_denied"
                     (attempt_dir / "inspection-denial.json").write_text(
@@ -509,6 +525,7 @@ class SandboxProcessSupervisor:
         process: subprocess.Popen,
         denied: threading.Event,
         detail: dict[str, object],
+        observation: dict[str, object] | None = None,
     ) -> None:
         """Tail Pi tool-start envelopes and terminate out-of-scope discovery."""
         offset = 0
@@ -524,9 +541,16 @@ class SandboxProcessSupervisor:
             for raw in lines:
                 violation, inspected = inspect_pi_tool_event(raw, scope)
                 calls += inspected
+                if observation is not None:
+                    observation.update({
+                        "observed_calls": calls,
+                        "remaining_calls": max(0, scope.max_calls - calls),
+                    })
                 if violation is None and calls <= scope.max_calls:
                     continue
                 reason = violation or "inspection_call_budget_exceeded"
+                if observation is not None:
+                    observation["denial_reason"] = reason
                 detail.update(
                     {
                         "type": "inspection_denial",
@@ -677,8 +701,48 @@ def inspect_pi_tool_event(raw: bytes, scope: InspectionScope) -> tuple[str | Non
     relevant_commands = discovery_commands + [
         argv for argv in commands if argv and os.path.basename(argv[0]) == "cd"
     ]
+    def path_operands(argv: list[str]) -> list[str]:
+        """Extract filesystem operands, excluding grep patterns/regex syntax."""
+        name = os.path.basename(argv[0])
+        args = argv[1:]
+        if name == "find":
+            return [next((token for token in args if not token.startswith("-")), ".")]
+        if name in {"grep", "rg"}:
+            # grep's first non-option operand is the pattern; paths follow it.
+            # Options with separate values are skipped, and -- makes the split
+            # explicit. This prevents regexes such as ``/foo|bar`` being treated
+            # as paths while retaining fail-closed validation of real operands.
+            option_values = {"-e", "--regexp", "-f", "--file", "-m", "--max-count"}
+            positional: list[str] = []
+            index = 0
+            while index < len(args):
+                token = args[index]
+                if token == "--":
+                    positional.extend(args[index + 1:])
+                    break
+                if token in option_values:
+                    index += 2
+                    continue
+                if token.startswith("-"):
+                    index += 1
+                    continue
+                positional.append(token)
+                index += 1
+            return positional[1:] if positional else []
+        return [token for token in args if token != "--" and not token.startswith("-")]
+
     for argv in relevant_commands:
-        for token in argv[1:]:
+        if direct_discovery and isinstance(args, dict):
+            # Structured Pi tools identify path fields; never reinterpret a
+            # pattern/regex field as a filesystem operand.
+            direct_paths = [args[key] for key in ("path", "paths", "directory")
+                            if isinstance(args.get(key), str)]
+            tokens_to_validate = direct_paths
+        else:
+            tokens_to_validate = path_operands(argv) if argv and os.path.basename(argv[0]) in {
+            "find", "grep", "rg", "ls"
+            } else argv[1:]
+        for token in tokens_to_validate:
             if token == ".." or token.startswith("../"):
                 return "inspection_parent_escape", discovery
             if token.startswith("/") and token != root and not token.startswith(root + "/"):
@@ -925,6 +989,9 @@ class PiExperimentRunner:
         negative_disposition = self._pi_negative_disposition(stdout_path)
         scout_assessment, scout_findings = self._pi_scout_terminal(stdout_path)
         inspection_denial = self._inspection_denial(directory / "inspection-denial.json")
+        inspection_observation = self._inspection_observation(
+            directory / "inspection-observation.json"
+        )
         served_model, served_model_reason = served_model_evidence(event_scan)
         time_to_first_edit_s = self._time_to_first_edit(stdout_path)
         event_usage = self._usage_metrics(stdout_path)
@@ -948,6 +1015,10 @@ class PiExperimentRunner:
             "pi_event_stream_complete": not event_scan.incomplete,
             "pi_terminal_event_observed": terminal_event_observed,
             "activity_publication_errors": activity_errors,
+            "inspection_calls": inspection_observation.get("observed_calls"),
+            "inspection_calls_remaining": inspection_observation.get("remaining_calls"),
+            "inspection_denial_reason": inspection_observation.get("denial_reason"),
+            "inspection_stream_status": inspection_observation.get("stream_status"),
             "card_size": card_size.value,
             "phase_budget_s": {
                 "assess": budget.assess_s,
@@ -1002,6 +1073,10 @@ class PiExperimentRunner:
                 "classification": classification,
                 "exit_code": exit_code,
                 "successful": successful,
+                "inspection_calls": metrics["inspection_calls"],
+                "inspection_calls_remaining": metrics["inspection_calls_remaining"],
+                "inspection_denial_reason": metrics["inspection_denial_reason"],
+                "inspection_stream_status": metrics["inspection_stream_status"],
             },
             artifact_refs=(stdout_digest, stderr_digest),
         )
@@ -1090,6 +1165,16 @@ class PiExperimentRunner:
         except (json.JSONDecodeError, OSError):
             return {"type": "inspection_denial", "reason": "invalid_denial_evidence"}
         return value if isinstance(value, dict) else None
+
+    @staticmethod
+    def _inspection_observation(path: Path) -> dict[str, object]:
+        if not path.exists():
+            return {}
+        try:
+            value = json.loads(path.read_text(encoding="utf-8")[:4096])
+        except (json.JSONDecodeError, OSError):
+            return {}
+        return value if isinstance(value, dict) else {}
 
     @classmethod
     def _time_to_first_edit(cls, path: Path) -> float | None:

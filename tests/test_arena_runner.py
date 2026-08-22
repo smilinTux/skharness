@@ -687,6 +687,16 @@ def test_inspection_scope_allows_bounded_worktree_discovery(tool, args):
     assert inspect_pi_tool_event(_tool_start(tool, args), InspectionScope()) == (None, 1)
 
 
+def test_inspection_scope_does_not_treat_regex_as_grep_path():
+    raw = _tool_start("bash", {"command": "grep -E 'foo|/etc/passwd' src/a.py"})
+    assert inspect_pi_tool_event(raw, InspectionScope()) == (None, 1)
+
+
+def test_structured_grep_validates_only_path_field_not_pattern():
+    raw = _tool_start("grep", {"path": "/work/src", "pattern": "/etc/passwd|token"})
+    assert inspect_pi_tool_event(raw, InspectionScope()) == (None, 1)
+
+
 def test_arena_build_launch_enables_executable_inspection_scope(tmp_path):
     adapter = PiAdapter(
         Sandbox(), model="build", base_url="http://gateway/v1", capability_profile="arena-build"
