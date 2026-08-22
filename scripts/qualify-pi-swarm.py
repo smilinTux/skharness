@@ -420,11 +420,12 @@ REMEDIATION_CANDIDATES = {
             WorkerTemplate(
                 "400bf174-scout", "phase-scout", SwarmRole.SCOUT,
                 """Read the mounted checkout and identify the existing inspection budget,
-                command-aware path parser, and activity/A2A telemetry seams. Return
+                command-aware path parser, and activity/A2A telemetry seams. Use no
+                more than 8 tool calls, then emit the canonical terminal block. Return
                 ACTIONABLE only with exact paths and safe compatibility constraints;
                 otherwise SCOUT_ASSESSMENT: BLOCKED. Do not edit or use network.""",
                 COMMON_READ + ("src/skharness/arena",), (), (), READ_TOOLS,
-                266, 266, 0, 160_000, 20, PhaseBudget(20, 240, 5, 1),
+                206, 206, 0, 160_000, 8, PhaseBudget(20, 180, 5, 1),
             ),
             WorkerTemplate(
                 "400bf174-builder", "phase-build", SwarmRole.BUILDER,

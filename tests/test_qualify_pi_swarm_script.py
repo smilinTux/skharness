@@ -151,7 +151,7 @@ def test_scout_generation_budget_is_a_share_of_aggregate_ceiling():
     small_scout = QUALIFY.REMEDIATION_CANDIDATES["c278b5c0"].workers[0]
     medium_scout = QUALIFY.REMEDIATION_CANDIDATES["400bf174"].workers[0]
     assert QUALIFY.scout_call_token_budget(small_scout) == 4_096
-    assert QUALIFY.scout_call_token_budget(medium_scout) == 8_000
+    assert QUALIFY.scout_call_token_budget(medium_scout) == 8_192
     assert QUALIFY.scout_call_token_budget(medium_scout) * medium_scout.tool_limit <= medium_scout.token_limit
 
 
