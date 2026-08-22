@@ -725,6 +725,34 @@ def test_runner_scout_parser_accepts_untrusted_preamble_before_terminal_block(tm
     assert len(findings) == 1
 
 
+def test_runner_scout_parser_ignores_pi_thinking_block(tmp_path):
+    path = tmp_path / "stdout.log"
+    path.write_text(
+        json.dumps(
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "I will report the evidence."},
+                        {
+                            "type": "text",
+                            "text": (
+                                "SCOUT_ASSESSMENT: ACTIONABLE\n"
+                                "SCOUT_FINDING: src/a.py:1 - concrete verified evidence"
+                            ),
+                        },
+                    ],
+                },
+            }
+        )
+        + "\n"
+    )
+    assessment, findings = PiExperimentRunner._pi_scout_terminal(path)
+    assert assessment == "actionable"
+    assert len(findings) == 1
+
+
 @pytest.mark.parametrize("detail", ("short text!", "x" * 501))
 def test_runner_scout_parser_enforces_typed_detail_bounds(tmp_path, detail):
     path = tmp_path / "stdout.log"

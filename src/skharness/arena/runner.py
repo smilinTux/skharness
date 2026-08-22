@@ -1294,15 +1294,28 @@ class PiExperimentRunner:
                 continue
             content = message.get("content")
             blocks = content if isinstance(content, list) else []
-            if not blocks or any(
-                not isinstance(block, dict)
-                or block.get("type") != "text"
-                or not isinstance(block.get("text"), str)
+            text_blocks = [
+                block
                 for block in blocks
+                if isinstance(block, dict) and block.get("type") == "text"
+            ]
+            # Pi emits reasoning as a ``thinking`` block alongside the final
+            # text.  It is not part of the disposition contract and must never
+            # be parsed as evidence; tool calls, however, mean this is not a
+            # terminal assistant message.
+            if (
+                not blocks
+                or any(
+                    not isinstance(block, dict)
+                    or block.get("type") not in {"thinking", "text"}
+                    or (block.get("type") == "text" and not isinstance(block.get("text"), str))
+                    for block in blocks
+                )
+                or not text_blocks
             ):
                 final_text = None
                 continue
-            final_text = "\n".join(str(block["text"]) for block in blocks)
+            final_text = "\n".join(str(block["text"]) for block in text_blocks)
         if (
             final_text is None
             or not final_text
