@@ -376,7 +376,7 @@ REMEDIATION_CANDIDATES = {
             "c278b5c0-preflight", "phase-preflight", SwarmRole.SCOUT,
             """Read only these exact mounted paths for card c278b5c0:
             src/skharness/autocode/sandbox.py,
-            tests/test_sandbox_spawn.py, and tests/test_qualify_pi_swarm_script.py.
+            tests/test_sandbox_spawn.py.
             Locate the supervisor cleanup seam and the existing already-absent
             regression coverage. Do not edit, run Docker, inspect host state, secrets,
             environment, or network. Return ACTIONABLE only when those exact paths
@@ -385,7 +385,6 @@ REMEDIATION_CANDIDATES = {
             (
                 "src/skharness/autocode/sandbox.py",
                 "tests/test_sandbox_spawn.py",
-                "tests/test_qualify_pi_swarm_script.py",
             ), (), (), READ_TOOLS,
             90, 57, 0, 16_384, 8, PhaseBudget(15, 35, 5, 2),
         ), WorkerTemplate(
@@ -398,15 +397,12 @@ REMEDIATION_CANDIDATES = {
             network, commit, push, or mutate the board. Run only focused tests. If the
             preflight evidence does not support a safe narrow change, emit STATUS:
             BLOCKED with exact paths.""",
-            (".git", "src/skharness/autocode/sandbox.py",
-             "tests/test_sandbox_spawn.py", "tests/test_qualify_pi_swarm_script.py"),
-            ("src/skharness/autocode/sandbox.py",
-             "tests/test_sandbox_spawn.py", "tests/test_qualify_pi_swarm_script.py"), (), BUILD_TOOLS,
+            (".git", "src/skharness/autocode/sandbox.py", "tests/test_sandbox_spawn.py"),
+            ("src/skharness/autocode/sandbox.py", "tests/test_sandbox_spawn.py"), (), BUILD_TOOLS,
             360, 240, 120, 65_536, 24, PhaseBudget(20, 50, 130, 40),
         ),),
         allowed_changes=frozenset({"src/skharness/autocode/sandbox.py",
-                                   "tests/test_sandbox_spawn.py",
-                                   "tests/test_qualify_pi_swarm_script.py"}),
+                                   "tests/test_sandbox_spawn.py"}),
         required_changes=frozenset({"tests/test_sandbox_spawn.py"}),
         controller_tests=("tests/test_sandbox_spawn.py", "tests/test_qualify_pi_swarm_script.py"),
         max_concurrency=1,
