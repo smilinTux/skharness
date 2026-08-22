@@ -11,6 +11,12 @@ or worker admission. The profile remains preflight-only unless `--execute` is
 explicitly supplied, never mutates the coordination board, and retains the
 same host, image, source, clean-worktree, and cleanup gates as S/M/L.
 
+Run-scoped Docker inventory is ownership-aware: valid resources from a different
+run (including an existing `sbxproxy`/`sbxnet`) do not block admission, while
+exact current-run IDs or run IDs still block cleanup sealing. Duplicate IDs with
+conflicting ownership labels, malformed labels, and inspection failures remain
+fail-closed.
+
 Example (safe plan generation):
 
 ```bash
