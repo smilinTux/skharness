@@ -404,6 +404,36 @@ def test_managed_inventory_command_error_never_becomes_empty(monkeypatch):
         QUALIFY.managed_docker_inventory()
 
 
+def test_run_scoped_inventory_ignores_foreign_resources_but_blocks_exact_ids():
+    labels = {
+        QUALIFY.MANAGED_LABEL: "true",
+        QUALIFY.RUN_ID_LABEL: "foreign-run",
+        QUALIFY.RESOURCE_ROLE_LABEL: "network",
+        QUALIFY.OWNERSHIP_AUTHORITY_LABEL: "ephemeral",
+        QUALIFY.SCHEMA_LABEL: QUALIFY.LIFECYCLE_SCHEMA,
+    }
+    inventory = {"resources": [{"id": "foreign-net", "type": "network", "labels": labels}]}
+    QUALIFY.require_no_managed_resources(inventory, ignore_foreign=True)
+    with pytest.raises(RuntimeError, match="remain after cleanup"):
+        QUALIFY.require_no_managed_resources(inventory, exact_ids={"foreign-net"})
+
+
+def test_run_scoped_inventory_rejects_ambiguous_duplicate_ownership():
+    base = {
+        "id": "same-id", "type": "network",
+        "labels": {
+            QUALIFY.MANAGED_LABEL: "true", QUALIFY.RUN_ID_LABEL: "run-a",
+            QUALIFY.RESOURCE_ROLE_LABEL: "network",
+            QUALIFY.OWNERSHIP_AUTHORITY_LABEL: "ephemeral",
+            QUALIFY.SCHEMA_LABEL: QUALIFY.LIFECYCLE_SCHEMA,
+        },
+    }
+    other = json.loads(json.dumps(base))
+    other["labels"][QUALIFY.RUN_ID_LABEL] = "run-b"
+    with pytest.raises(RuntimeError, match="ambiguous ownership"):
+        QUALIFY.require_no_managed_resources({"resources": [base, other]}, ignore_foreign=True)
+
+
 def _message_end(model=None, *, tokens=3, cost=0.25):
     message = {
         "role": "assistant",
