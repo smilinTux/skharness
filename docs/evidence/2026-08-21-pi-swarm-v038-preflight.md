@@ -1,5 +1,25 @@
 # Pi S/M/L v0.3.38 qualification preflight
 
+## Reviewed remediation profile
+
+The checked-in qualifier also accepts `--card-id c278b5c0 --card-id 400bf174`
+for the two follow-up remediations from the 2026-08-22 run. This is a bounded
+profile, not arbitrary CardStore execution: each ID has a reviewed phase
+topology, path ownership, budget, and canonical `core.json` content hash in
+`scripts/qualify-pi-swarm.py`. Unknown IDs are refused before Docker, worktree,
+or worker admission. The profile remains preflight-only unless `--execute` is
+explicitly supplied, never mutates the coordination board, and retains the
+same host, image, source, clean-worktree, and cleanup gates as S/M/L.
+
+Example (safe plan generation):
+
+```bash
+python scripts/qualify-pi-swarm.py \
+  --card-id c278b5c0 --card-id 400bf174 \
+  --image "$SKHARNESS_PI_SWARM_IMAGE" \
+  --controller-commit "$SKHARNESS_PI_SWARM_CONTROLLER_COMMIT"
+```
+
 Date: 2026-08-21
 Status: design and focused tests passed; final immutable-controller preflight and live
 execution remain pending; no live worker was started by this evidence

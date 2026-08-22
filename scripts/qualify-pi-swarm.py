@@ -708,13 +708,48 @@ def _managed_resource_record(
     }
 
 
-def require_no_managed_resources(inventory: dict[str, Any]) -> None:
+def require_no_managed_resources(
+    inventory: dict[str, Any], *, run_ids: set[str] | frozenset[str] | None = None,
+    run_id_prefixes: tuple[str, ...] = (), exact_ids: set[str] | frozenset[str] | None = None,
+    ignore_foreign: bool = False,
+) -> None:
+    """Reject only resources belonging to this run; foreign valid resources are inert.
+
+    Inventory parsing remains strict for every managed object.  Filtering happens
+    only after ownership labels are validated, and duplicate IDs with conflicting
+    ownership are always ambiguous and therefore fail closed.
+    """
     resources = inventory.get("resources")
     if not isinstance(resources, list):
         raise RuntimeError("managed Docker inventory is malformed")
-    if resources:
+    seen: dict[str, tuple[str, str]] = {}
+    for item in resources:
+        if not isinstance(item, dict) or not isinstance(item.get("labels"), dict):
+            raise RuntimeError("managed Docker inventory contains ambiguous ownership")
+        resource_id = str(item.get("id") or "")
+        labels = item["labels"]
+        ownership = (str(labels.get(RUN_ID_LABEL) or ""), str(labels.get(RESOURCE_ROLE_LABEL) or ""))
+        prior = seen.get(resource_id)
+        if prior is not None and prior != ownership:
+            raise RuntimeError(f"managed Docker resource has ambiguous ownership: {resource_id[:12]}")
+        seen[resource_id] = ownership
+    if ignore_foreign or run_ids is not None or run_id_prefixes or exact_ids is not None:
+        selected_ids = exact_ids or frozenset()
+        selected_runs = run_ids or frozenset()
+        relevant = [
+            item for item in resources
+            if str(item.get("id") or "") in selected_ids
+            or str((item.get("labels") or {}).get(RUN_ID_LABEL) or "") in selected_runs
+            or any(
+                str((item.get("labels") or {}).get(RUN_ID_LABEL) or "").startswith(prefix)
+                for prefix in run_id_prefixes
+            )
+        ]
+    else:
+        relevant = resources
+    if relevant:
         identities = ", ".join(
-            f"{item.get('type')}:{str(item.get('id'))[:12]}" for item in resources[:8]
+            f"{item.get('type')}:{str(item.get('id'))[:12]}" for item in relevant[:8]
         )
         raise RuntimeError(f"managed Docker resources remain after cleanup: {identities}")
 
@@ -1621,12 +1656,14 @@ def execute_all(
         raise RuntimeError(f"refusing existing evidence root: {args.evidence_root}")
     args.evidence_root.mkdir(parents=True, exist_ok=False)
     args.worktree_root.mkdir(parents=True, exist_ok=True)
+    run_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     pre_inventory = managed_docker_inventory()
     (args.evidence_root / "pre-run-docker-inventory.json").write_text(
         json.dumps(pre_inventory, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    require_no_managed_resources(pre_inventory)
-    run_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    # Valid resources from another qualification are not this run's blockers;
+    # every managed record was already label-validated by inventory collection.
+    require_no_managed_resources(pre_inventory, ignore_foreign=True)
     manifest = build_manifest(image, snapshots, controller_provenance, candidates) | {
         "mode": "execute",
         "run_stamp": run_stamp,
@@ -1659,7 +1696,10 @@ def execute_all(
                 json.dumps(cleanup_inventory, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
-            require_no_managed_resources(cleanup_inventory)
+            run_prefix = f"pi-swarm-v038-{card_id}-{run_stamp}"
+            require_no_managed_resources(
+                cleanup_inventory, run_id_prefixes=(run_prefix,),
+            )
             if validate_controller_source(source, args.controller_commit) != controller_provenance:
                 raise RuntimeError("controller provenance changed during card execution")
         except Exception as exc:
