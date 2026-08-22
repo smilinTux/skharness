@@ -1311,6 +1311,21 @@ class PiExperimentRunner:
         ):
             return None, ()
         lines = final_text.split("\n")
+        # Pi commonly explains that it is about to emit the controller
+        # disposition, then places the exact contract block on the following
+        # lines.  Treat that prose as untrusted commentary: only a single
+        # canonical block, anchored at the end of the message, is parsed.
+        headings = [
+            index
+            for index, line in enumerate(lines)
+            if re.fullmatch(
+                r"SCOUT_ASSESSMENT: (ACTIONABLE|NO_ACTION|BLOCKED|NEEDS_INPUT)",
+                line,
+            )
+        ]
+        if len(headings) != 1:
+            return None, ()
+        lines = lines[headings[0] :]
         assessment_match = re.fullmatch(
             r"SCOUT_ASSESSMENT: (ACTIONABLE|NO_ACTION|BLOCKED|NEEDS_INPUT)",
             lines[0],

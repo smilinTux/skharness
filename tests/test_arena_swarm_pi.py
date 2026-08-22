@@ -336,8 +336,8 @@ def test_scout_prompt_provides_literal_final_forms_and_exact_output_rules():
         "SCOUT_FINDING: src/example.py:1 - Concrete evidence that no downstream work "
         "should run" in prompt
     )
-    assert "entire final assistant message is:\nSCOUT_ASSESSMENT: BLOCKED" in prompt
-    assert "entire final assistant message is:\nSCOUT_ASSESSMENT: NEEDS_INPUT" in prompt
+    assert "final line of the final assistant message is:\nSCOUT_ASSESSMENT: BLOCKED" in prompt
+    assert "final line of the final assistant message is:\nSCOUT_ASSESSMENT: NEEDS_INPUT" in prompt
     assert "co-located in the final assistant message" in prompt
     assert "Do not use bullets, Markdown, code fences" in prompt
     assert "segments contain only ASCII letters, digits" in prompt
@@ -662,10 +662,6 @@ def test_runner_scout_parser_accepts_canonical_nonactionable_forms(
             "SCOUT_FINDING: src/skharness/arena/swarm.py:129 - placeholder evidence"
         ),
         (
-            "Preface.\nSCOUT_ASSESSMENT: ACTIONABLE\n"
-            "SCOUT_FINDING: src/skharness/arena/swarm.py:129 - contract lineage is missing"
-        ),
-        (
             "SCOUT_ASSESSMENT: ACTIONABLE\n"
             "SCOUT_FINDING: src/skharness/arena/swarm.py:129 - contract lineage is missing\n"
             "Trailing prose."
@@ -703,6 +699,30 @@ def test_runner_scout_parser_rejects_noncanonical_or_nonconcrete_output(tmp_path
     )
 
     assert PiExperimentRunner._pi_scout_terminal(path) == (None, ())
+
+
+def test_runner_scout_parser_accepts_untrusted_preamble_before_terminal_block(tmp_path):
+    path = tmp_path / "stdout.log"
+    text = (
+        "All seams verified; emitting the controller disposition now.\n\n"
+        "SCOUT_ASSESSMENT: ACTIONABLE\n"
+        "SCOUT_FINDING: src/skharness/arena/swarm.py:129 - contract lineage is missing"
+    )
+    path.write_text(
+        json.dumps(
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": text}],
+                },
+            }
+        )
+        + "\n"
+    )
+    assessment, findings = PiExperimentRunner._pi_scout_terminal(path)
+    assert assessment == "actionable"
+    assert len(findings) == 1
 
 
 @pytest.mark.parametrize("detail", ("short text!", "x" * 501))

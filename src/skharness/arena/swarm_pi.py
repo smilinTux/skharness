@@ -74,32 +74,33 @@ class _LeaseActivity:
     cancellation: CancellationToken = field(default_factory=CancellationToken)
     done: threading.Event = field(default_factory=threading.Event)
 
-SCOUT_TERMINAL_CONTRACT = """Scout terminal contract (exact final form required).
+SCOUT_TERMINAL_CONTRACT = """Scout terminal contract (canonical terminal block required).
 Choose ACTIONABLE only when repository evidence proves downstream work is appropriate.
 Choose NO_ACTION when repository evidence proves the work is already satisfied or
 superseded and downstream work must not run. Choose BLOCKED when prerequisites are
 missing, contradictory, ambiguous, or cannot be resolved by bounded inspection. Choose
 NEEDS_INPUT only when an external user decision or input is required.
 
-For ACTIONABLE, the entire final assistant message has this shape (repeat the
+For ACTIONABLE, the final lines of the final assistant message have this shape (repeat the
 SCOUT_FINDING line for additional findings):
 SCOUT_ASSESSMENT: ACTIONABLE
 SCOUT_FINDING: src/example.py:1 - Concrete verified prerequisite evidence
 
-For NO_ACTION, the entire final assistant message has this shape (repeat the
+For NO_ACTION, the final lines of the final assistant message have this shape (repeat the
 SCOUT_FINDING line for additional findings):
 SCOUT_ASSESSMENT: NO_ACTION
 SCOUT_FINDING: src/example.py:1 - Concrete evidence that no downstream work should run
 
-For BLOCKED, the entire final assistant message is:
+For BLOCKED, the final line of the final assistant message is:
 SCOUT_ASSESSMENT: BLOCKED
 
-For NEEDS_INPUT, the entire final assistant message is:
+For NEEDS_INPUT, the final line of the final assistant message is:
 SCOUT_ASSESSMENT: NEEDS_INPUT
 
 The assessment and every finding must be co-located in the final assistant message.
-Do not use bullets, Markdown, code fences, indentation, trailing prose, or trailing
-whitespace. Use exactly one assessment heading. A finding path must be a normalized,
+You may briefly explain your work before the block, but the block must be the final
+lines with no trailing prose. Do not use bullets, Markdown, code fences, indentation,
+or trailing whitespace in the block. Use exactly one assessment heading. A finding path must be a normalized,
 non-empty repository-relative path: segments contain only ASCII letters, digits,
 underscore, dot, or hyphen and are separated by '/'; absolute paths, '.' and '..' are
 invalid. The optional :LINE is a positive integer. Finding detail must be one normalized
