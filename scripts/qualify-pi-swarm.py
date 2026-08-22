@@ -386,7 +386,7 @@ REMEDIATION_CANDIDATES = {
                 "src/skharness/autocode/sandbox.py",
                 "tests/test_sandbox_spawn.py",
             ), (), (), READ_TOOLS,
-            90, 57, 0, 16_384, 8, PhaseBudget(15, 35, 5, 2),
+            120, 90, 0, 32_768, 8, PhaseBudget(15, 68, 5, 2),
         ), WorkerTemplate(
             "c278b5c0-builder", "phase-build", SwarmRole.BUILDER,
             """Implement card c278b5c0 only in the declared cleanup seam and tests,
@@ -424,7 +424,7 @@ REMEDIATION_CANDIDATES = {
                 ACTIONABLE only with exact paths and safe compatibility constraints;
                 otherwise SCOUT_ASSESSMENT: BLOCKED. Do not edit or use network.""",
                 COMMON_READ + ("src/skharness/arena",), (), (), READ_TOOLS,
-                180, 180, 0, 32_768, 16, PhaseBudget(20, 154, 5, 1),
+                266, 266, 0, 160_000, 20, PhaseBudget(20, 240, 5, 1),
             ),
             WorkerTemplate(
                 "400bf174-builder", "phase-build", SwarmRole.BUILDER,

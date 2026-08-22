@@ -170,7 +170,7 @@ def test_small_cleanup_remediation_has_bounded_read_only_preflight():
     assert preflight.writable_paths == ()
     assert preflight.tool_limit == 8
     assert preflight.phase_budget.total_s == preflight.pi_wall_seconds
-    assert preflight.phase_budget.inspect_s == 35
+    assert preflight.phase_budget.inspect_s == 68
     assert builder.phase_id == "phase-build"
     assert set(builder.writable_paths) == set(candidate.allowed_changes)
     assert "ACTIONABLE" in preflight.task and "BLOCKED" in preflight.task
