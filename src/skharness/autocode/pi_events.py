@@ -18,6 +18,7 @@ from .types import HarnessProvenanceReason
 # New Pi versions must update this pin deliberately.
 PI_0842_EVENT_TYPES = frozenset(
     {
+        "session",
         "agent_start",
         "agent_end",
         "agent_settled",
