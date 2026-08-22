@@ -138,6 +138,27 @@ def test_frozen_candidates_pin_hash_route_topology_and_budget():
             assert worker.token_limit > 0
 
 
+def test_remediation_profile_is_explicit_and_refuses_arbitrary_cards():
+    selected = QUALIFY.candidate_catalog(("c278b5c0", "400bf174"))
+    assert tuple(selected) == ("c278b5c0", "400bf174")
+    assert selected["c278b5c0"].size.value == "S"
+    assert selected["400bf174"].size.value == "M"
+    with pytest.raises(ValueError, match="reviewed qualification topology"):
+        QUALIFY.candidate_catalog(("unreviewed-card",))
+
+
+def test_remediation_snapshot_hashes_are_immutable_and_profile_is_narrow():
+    assert {
+        card_id: candidate.card_hash
+        for card_id, candidate in QUALIFY.REMEDIATION_CANDIDATES.items()
+    } == {
+        "c278b5c0": "sha256:37cc7a375db5e6ba63c7593ffe13d37ab540d97594ece8bf47046016a753548f",
+        "400bf174": "sha256:236fe4ffa7dc2b5d45f522646307e2d493416190f65ca01aea71e2c1e0f3a3f7",
+    }
+    # A selected profile does not silently include the frozen S/M/L cards.
+    assert set(QUALIFY.candidate_catalog(("c278b5c0",))) == {"c278b5c0"}
+
+
 def test_every_writable_scope_is_an_exact_readable_mount(tmp_path):
     all_paths = {
         path

@@ -358,6 +358,78 @@ CANDIDATES = {
     ),
 }
 
+# Remediation cards are deliberately explicit rather than accepting arbitrary
+# CardStore prompts.  A card must have a reviewed topology, path allowlist,
+# budget, and immutable content hash before a worker can be admitted.
+REMEDIATION_CANDIDATES = {
+    "c278b5c0": Candidate(
+        card_id="c278b5c0", size=CardSize.SMALL,
+        card_hash="sha256:37cc7a375db5e6ba63c7593ffe13d37ab540d97594ece8bf47046016a753548f",
+        suitability="safe_single_builder_provisional",
+        phases=(("phase-build", SwarmRole.BUILDER, ("c278b5c0-builder",), ()),),
+        workers=(WorkerTemplate(
+            "c278b5c0-builder", "phase-build", SwarmRole.BUILDER,
+            """Implement card c278b5c0 in the mounted /work checkout. Make cleanup
+            idempotent only for exact already-absent managed containers, proxies, or
+            networks; preserve real cleanup failures and original worker errors.
+            Add focused supervisor and qualifier regression tests. Do not broaden
+            resource matching, inspect secrets or network, commit, push, or mutate
+            the board. If already satisfied emit STATUS: BLOCKED with paths.""",
+            (".git", "src/skharness", "tests", "docs", "pyproject.toml", "SOP.md"),
+            ("src/skharness", "tests", "docs", "SOP.md"), (), BUILD_TOOLS,
+            360, 240, 120, 65_536, 24, PhaseBudget(20, 50, 130, 40),
+        ),),
+        allowed_changes=frozenset({"src/skharness", "tests", "docs", "SOP.md"}),
+        required_changes=frozenset({"src/skharness", "tests"}),
+        controller_tests=("tests/test_sandbox_spawn.py", "tests/test_qualify_pi_swarm_script.py"),
+        max_concurrency=1,
+    ),
+    "400bf174": Candidate(
+        card_id="400bf174", size=CardSize.MEDIUM,
+        card_hash="sha256:236fe4ffa7dc2b5d45f522646307e2d493416190f65ca01aea71e2c1e0f3a3f7",
+        suitability="conditional_on_actionable_prerequisite_scout",
+        phases=(
+            ("phase-scout", SwarmRole.SCOUT, ("400bf174-scout",), ()),
+            ("phase-build", SwarmRole.BUILDER, ("400bf174-builder",), ("phase-scout",)),
+            ("phase-test", SwarmRole.TESTER, ("400bf174-tester",), ("phase-build",)),
+        ),
+        workers=(
+            WorkerTemplate(
+                "400bf174-scout", "phase-scout", SwarmRole.SCOUT,
+                """Read the mounted checkout and identify the existing inspection budget,
+                command-aware path parser, and activity/A2A telemetry seams. Return
+                ACTIONABLE only with exact paths and safe compatibility constraints;
+                otherwise SCOUT_ASSESSMENT: BLOCKED. Do not edit or use network.""",
+                COMMON_READ + ("src/skharness/arena",), (), (), READ_TOOLS,
+                180, 180, 0, 32_768, 16, PhaseBudget(20, 154, 5, 1),
+            ),
+            WorkerTemplate(
+                "400bf174-builder", "phase-build", SwarmRole.BUILDER,
+                """Implement card 400bf174 only from the typed scout evidence. Make
+                S/M/L inspection budgets explicit and expose remaining calls, denial
+                reason, stream completeness, and terminal status in trusted activity
+                records. Preserve fail-closed admission and path isolation. Add tests;
+                do not commit, push, or mutate the board.""",
+                (".git", "src/skharness", "tests", "docs", "pyproject.toml", "SOP.md"),
+                ("src/skharness", "tests", "docs", "SOP.md"), (), BUILD_TOOLS,
+                480, 300, 180, 98_304, 40, PhaseBudget(20, 55, 185, 40),
+            ),
+            WorkerTemplate(
+                "400bf174-tester", "phase-test", SwarmRole.TESTER,
+                """Independently test the exact builder work for card 400bf174. Verify
+                budget scaling, telemetry completeness, malformed/truncated output
+                blocking, and cleanup. Do not edit or claim completion.""",
+                COMMON_READ + ("src/skharness/arena",), (), (), READ_TOOLS,
+                240, 240, 0, 32_768, 20, PhaseBudget(20, 40, 1, 179),
+            ),
+        ),
+        allowed_changes=frozenset({"src/skharness", "tests", "docs", "SOP.md"}),
+        required_changes=frozenset({"src/skharness", "tests"}),
+        controller_tests=("tests/test_qualify_pi_swarm_script.py", "tests/test_swarm_orchestrator.py"),
+        max_concurrency=1,
+    ),
+}
+
 
 def run(
     argv: list[str],
@@ -398,7 +470,21 @@ def normalized_card(card: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def load_card_snapshots(card_root: Path) -> dict[str, dict[str, Any]]:
+def candidate_catalog(card_ids: tuple[str, ...] | None = None) -> dict[str, Candidate]:
+    """Return only reviewed topologies; arbitrary CardStore prompts are refused."""
+    if not card_ids:
+        return CANDIDATES
+    unknown = set(card_ids) - set(REMEDIATION_CANDIDATES)
+    if unknown:
+        raise ValueError(
+            "card lacks a reviewed qualification topology: " + ", ".join(sorted(unknown))
+        )
+    return {card_id: REMEDIATION_CANDIDATES[card_id] for card_id in card_ids}
+
+
+def load_card_snapshots(
+    card_root: Path, card_ids: tuple[str, ...] | None = None,
+) -> dict[str, dict[str, Any]]:
     """Load immutable card content from canonical CardStore core snapshots.
 
     The folded kanban JSON intentionally omits acceptance criteria and is therefore
@@ -407,7 +493,8 @@ def load_card_snapshots(card_root: Path) -> dict[str, dict[str, Any]]:
     """
     resolved_root = card_root.resolve(strict=True)
     found: dict[str, dict[str, Any]] = {}
-    for card_id in CANDIDATES:
+    candidates = candidate_catalog(card_ids)
+    for card_id in candidates:
         core_path = (resolved_root / card_id / "core.json").resolve(strict=True)
         if core_path.parent.parent != resolved_root or core_path.parent.name != card_id:
             raise RuntimeError(f"canonical card path escaped card root for {card_id}")
@@ -417,7 +504,7 @@ def load_card_snapshots(card_root: Path) -> dict[str, dict[str, Any]]:
         found[card_id] = normalized_card(card)
     for card_id, snapshot in found.items():
         observed = canonical_digest(snapshot)
-        expected = CANDIDATES[card_id].card_hash
+        expected = candidates[card_id].card_hash
         if observed != expected:
             raise RuntimeError(f"card content drift for {card_id}: {observed} != {expected}")
     return found
@@ -1078,8 +1165,10 @@ def build_manifest(
     image: str,
     snapshots: dict[str, dict[str, Any]],
     controller_provenance: dict[str, Any],
+    candidates: dict[str, Candidate] | None = None,
 ) -> dict[str, Any]:
     require_image_digest(image)
+    candidates = candidates or CANDIDATES
     return {
         "schema": SCHEMA,
         "mode": "preflight_only",
@@ -1101,7 +1190,7 @@ def build_manifest(
             "builder_reserve_seconds": BUILDER_POST_RUN_RESERVE_S,
             "stop_drain_seconds": CONTROLLER_STOP_DRAIN_TIMEOUT_S,
         },
-        "cards": [candidate_manifest(CANDIDATES[item], snapshots[item]) for item in CANDIDATES],
+        "cards": [candidate_manifest(candidates[item], snapshots[item]) for item in candidates],
         "completion_authority": "none; independent verifier attestation required",
         "board_mutation": "forbidden",
     }
@@ -1517,7 +1606,9 @@ def execute_all(
     args: argparse.Namespace,
     snapshots: dict[str, dict[str, Any]],
     controller_provenance: dict[str, Any],
+    candidates: dict[str, Candidate] | None = None,
 ) -> dict[str, Any]:
+    candidates = candidates or CANDIDATES
     image = require_image_digest(args.image)
     if socket.gethostname() != QUALIFIED_HOST:
         raise RuntimeError(f"live execution is pinned to {QUALIFIED_HOST}")
@@ -1536,7 +1627,7 @@ def execute_all(
     )
     require_no_managed_resources(pre_inventory)
     run_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    manifest = build_manifest(image, snapshots, controller_provenance) | {
+    manifest = build_manifest(image, snapshots, controller_provenance, candidates) | {
         "mode": "execute",
         "run_stamp": run_stamp,
         "controller_source_commit": controller_provenance["commit"],
@@ -1546,14 +1637,14 @@ def execute_all(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     outcomes = []
-    for card_id in CANDIDATES:
+    for card_id in candidates:
         candidate_outcome: dict[str, Any] | None = None
         candidate_error: Exception | None = None
         try:
             if validate_controller_source(source, args.controller_commit) != controller_provenance:
                 raise RuntimeError("controller provenance changed before card admission")
             candidate_outcome = execute_candidate(
-                CANDIDATES[card_id], snapshots[card_id], source=source,
+                candidates[card_id], snapshots[card_id], source=source,
                 worktree_root=args.worktree_root, evidence_root=args.evidence_root,
                 image=image, run_stamp=run_stamp,
             )
@@ -1633,6 +1724,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--execute", action="store_true", help="start the frozen live workers")
     parser.add_argument(
+        "--card-id", action="append", dest="card_ids", metavar="ID",
+        help=("run a reviewed remediation topology (repeatable): c278b5c0 or "
+              "400bf174; arbitrary CardStore cards are refused"),
+    )
+    parser.add_argument(
         "--image", default=os.environ.get("SKHARNESS_PI_SWARM_IMAGE"),
         help="required equality-pinned v0.3.38 pi-python-test image",
     )
@@ -1667,11 +1763,17 @@ def main(argv: list[str] | None = None) -> int:
         image = require_image_digest(args.image)
         controller_commit = require_controller_commit(args.controller_commit)
         controller_provenance = validate_controller_source(args.source, controller_commit)
-        snapshots = load_card_snapshots(args.card_root)
+        card_ids = tuple(args.card_ids) if args.card_ids else None
+        candidates = candidate_catalog(card_ids)
+        snapshots = (
+            load_card_snapshots(args.card_root)
+            if card_ids is None
+            else load_card_snapshots(args.card_root, card_ids)
+        )
         if args.execute:
-            result = execute_all(args, snapshots, controller_provenance)
+            result = execute_all(args, snapshots, controller_provenance, candidates)
         else:
-            result = build_manifest(image, snapshots, controller_provenance)
+            result = build_manifest(image, snapshots, controller_provenance, candidates)
         encoded = json.dumps(result, indent=2, sort_keys=True) + "\n"
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)
