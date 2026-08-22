@@ -764,6 +764,7 @@ def pi_launch_spec(
     model: str | None = None,
     card_size: CardSize | None = None,
     phase_budget: PhaseBudget | None = None,
+    inspection_max_calls: int | None = None,
 ) -> LaunchSpec:
     """Build the same pinned Pi argv/config/profile contract used by PiAdapter."""
     if phase_budget is not None and card_size is None:
@@ -784,8 +785,9 @@ def pi_launch_spec(
         required_commands=adapter._required_commands(),
         required_checks=adapter._required_checks(),
         inspection_scope=(
-            InspectionScope(max_calls={CardSize.SMALL: 24, CardSize.MEDIUM: 48,
-                                       CardSize.LARGE: 80}.get(card_size, 24))
+            InspectionScope(max_calls=inspection_max_calls or {
+                CardSize.SMALL: 24, CardSize.MEDIUM: 48, CardSize.LARGE: 80,
+            }.get(card_size, 24))
             if adapter.capability_profile in {"arena-build", "arena-verify"}
             else None
         ),

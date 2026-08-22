@@ -1560,6 +1560,7 @@ def execute_candidate(
             spec=pi_launch_spec(
                 adapter, prompt=contract.task, worktree=str(worktree), model=MODEL,
                 card_size=candidate.size, phase_budget=worker.phase_budget,
+                inspection_max_calls=(worker.tool_limit * 2 if contract.role is SwarmRole.SCOUT else None),
             ),
             card_size=candidate.size, requested_model=MODEL,
             timeout_s=worker.wall_seconds,
