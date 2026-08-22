@@ -159,6 +159,24 @@ def test_remediation_snapshot_hashes_are_immutable_and_profile_is_narrow():
     assert set(QUALIFY.candidate_catalog(("c278b5c0",))) == {"c278b5c0"}
 
 
+def test_small_cleanup_remediation_has_bounded_read_only_preflight():
+    candidate = QUALIFY.REMEDIATION_CANDIDATES["c278b5c0"]
+    assert candidate.phases == (
+        ("phase-preflight", SwarmRole.SCOUT, ("c278b5c0-preflight",), ()),
+        ("phase-build", SwarmRole.BUILDER, ("c278b5c0-builder",), ("phase-preflight",)),
+    )
+    preflight, builder = candidate.workers
+    assert preflight.role is SwarmRole.SCOUT
+    assert preflight.writable_paths == ()
+    assert preflight.tool_limit == 8
+    assert preflight.phase_budget.total_s == preflight.pi_wall_seconds
+    assert preflight.phase_budget.inspect_s == 35
+    assert builder.phase_id == "phase-build"
+    assert set(builder.writable_paths) == set(candidate.allowed_changes)
+    assert "ACTIONABLE" in preflight.task and "BLOCKED" in preflight.task
+    assert "preflight findings" in builder.task
+
+
 def test_every_writable_scope_is_an_exact_readable_mount(tmp_path):
     all_paths = {
         path
