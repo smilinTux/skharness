@@ -177,12 +177,27 @@ def _registry_consistent(registry_ids, live_ids) -> bool:
 
 
 def _default_probe() -> dict:
-    """Best-effort skcode-hostd read. Fails SAFE (all healthy) when unreachable.
+    """Best-effort skcode-hostd read.
 
-    Mirrors ``skcode_adapter._probe_hostd``: hits the local :9394 API, parses the
-    session list + auth flag, and derives the four condition inputs. ANY failure
-    (connection refused, 401, malformed body) returns the all-healthy state so the
-    operator loop never pages falsely.
+    Mirrors ``skcode_adapter._probe_hostd`` (the exact module Atlas's in-process
+    seat adapter runs): hits the local :9394 API, parses the session list + auth
+    flag, and derives the four condition inputs. A successful response that
+    simply omits a field (e.g. no ``auth_enforced`` key) fails SAFE (healthy)
+    for that one field, never raising a false alarm from a partial answer.
+
+    A TOTAL failure to reach hostd at all (connection refused, DNS failure,
+    timeout, malformed body) is a DIFFERENT case, and is reported as Unknown
+    (``{"_probe_error": ...}``), never as a confident all-healthy state. Fixes
+    card 504d0046 (ATLAS Eyes PR #178's first real run): this probe used to
+    collapse "hostd is completely unreachable" into "HostdReady=True, everything
+    healthy" here, while Atlas's in-process seat adapter (``skcode_adapter``)
+    already read Unknown for the identical unreachable hostd, a live
+    HostdReady/SessionsHealthy/RegistryConsistent/AuthEnforced conflict across
+    all four conditions at once. Reporting a dead endpoint as ready is exactly
+    the class of lie that caused the 2026-08-20 freeze (repeated actuation
+    against a condition that was not actually firing): an operator that cannot
+    even connect to hostd does not know hostd is ready, and must say so, not
+    invent a confident default.
     """
     try:
         import urllib.request
@@ -200,13 +215,8 @@ def _default_probe() -> dict:
             "registry_consistent": _registry_consistent(registry_ids, live_ids),
             "auth_enforced": True if auth is None else bool(auth),
         }
-    except Exception:
-        return {
-            "hostd_ready": True,
-            "sessions_healthy": True,
-            "registry_consistent": True,
-            "auth_enforced": True,
-        }
+    except Exception as exc:
+        return {"_probe_error": type(exc).__name__}
 
 
 # --- contract verbs ----------------------------------------------------------
@@ -224,31 +234,39 @@ def operator_explain() -> dict:
 def operator_observe(probe: Callable[[], dict] | None = None) -> dict:
     """Read-only skcode-hostd health snapshot in the adapter-contract shape.
 
-    Maps the probe's four boolean inputs onto the four conditions. Each condition
-    defaults to healthy when its input is absent (fail safe). ``probe`` is
+    Maps the probe's four boolean inputs onto the four conditions. Each
+    condition defaults to healthy when ONE input is absent from an otherwise
+    successful probe (fail safe). A probe result carrying ``_probe_error`` (a
+    TOTAL inability to reach hostd, see ``_default_probe``) instead reports
+    every condition Unknown, never healthy: see card 504d0046. ``probe`` is
     injectable so tests drive each condition firing without any I/O.
     """
     st = (probe or _default_probe)()
+    unknown = bool(st.get("_probe_error"))
+
+    def status(key: str) -> str:
+        return "Unknown" if unknown else _b(bool(st.get(key, True)))
+
     return {
         "conditions": [
             {
                 "type": "HostdReady",
-                "status": _b(bool(st.get("hostd_ready", True))),
+                "status": status("hostd_ready"),
                 "object": "skcode-hostd",
             },
             {
                 "type": "SessionsHealthy",
-                "status": _b(bool(st.get("sessions_healthy", True))),
+                "status": status("sessions_healthy"),
                 "object": "sessions",
             },
             {
                 "type": "RegistryConsistent",
-                "status": _b(bool(st.get("registry_consistent", True))),
+                "status": status("registry_consistent"),
                 "object": "registry",
             },
             {
                 "type": "AuthEnforced",
-                "status": _b(bool(st.get("auth_enforced", True))),
+                "status": status("auth_enforced"),
                 "object": "verifier",
             },
         ]
