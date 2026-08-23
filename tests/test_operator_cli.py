@@ -168,16 +168,36 @@ def test_observe_missing_keys_default_healthy():
     assert set(st.values()) == {"True"}
 
 
-def test_default_probe_fails_safe_when_hostd_unreachable(monkeypatch):
-    # Point the probe at a closed port: connection refused -> all healthy.
+def test_default_probe_is_unknown_when_hostd_totally_unreachable(monkeypatch):
+    # Card 504d0046 (ATLAS Eyes PR #178): a closed port means hostd cannot be
+    # reached AT ALL, so the probe must report Unknown, never a confident
+    # all-healthy state. Point the probe at a closed port: connection refused.
     monkeypatch.setenv("SKCODE_HOSTD_HEALTH", "http://127.0.0.1:1/api/v1/hosts/self")
     state = op._default_probe()
-    assert state == {
-        "hostd_ready": True,
-        "sessions_healthy": True,
-        "registry_consistent": True,
-        "auth_enforced": True,
+    assert "_probe_error" in state
+
+
+def test_observe_is_unknown_when_hostd_totally_unreachable(monkeypatch):
+    # The same total-unreachability case, through operator_observe(): every
+    # condition renders Unknown, never a confident True. This is the exact
+    # discrepancy ATLAS Eyes found between this cli lane and Atlas's in-process
+    # seat adapter (skcode_adapter), which already reported Unknown here.
+    monkeypatch.setenv("SKCODE_HOSTD_HEALTH", "http://127.0.0.1:1/api/v1/hosts/self")
+    st = _statuses(op.operator_observe())
+    assert st == {
+        "HostdReady": "Unknown",
+        "SessionsHealthy": "Unknown",
+        "RegistryConsistent": "Unknown",
+        "AuthEnforced": "Unknown",
     }
+
+
+def test_observe_probe_error_renders_unknown_not_healthy():
+    # A probe that explicitly signals a total failure (the _probe_error marker
+    # _default_probe uses) must never be read as healthy, even if it happens to
+    # also carry stale True-ish keys.
+    st = _statuses(op.operator_observe(probe=lambda: {"_probe_error": "OSError"}))
+    assert set(st.values()) == {"Unknown"}
 
 
 # --- pure probe logic --------------------------------------------------------

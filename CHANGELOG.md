@@ -9,6 +9,21 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`skcode-hostd operator observe` no longer reports a totally unreachable
+  hostd as healthy (card 504d0046, skcapstone).** ATLAS Eyes' first real run
+  (skcapstone PR #178) found `HostdReady`/`SessionsHealthy`/
+  `RegistryConsistent`/`AuthEnforced` all confidently `True` from this CLI on a
+  node where the :9394 API could not be reached at all, while Atlas's
+  in-process seat adapter (`skcode_adapter`) honestly reported Unknown for the
+  same unreachable hostd, a four-condition lane conflict on every affected
+  node. `_default_probe()` now distinguishes a successful response that simply
+  omits one field (still fails safe to healthy for that field) from a TOTAL
+  connection failure (`_probe_error`, rendered as Unknown for all four
+  conditions by `operator_observe()`). Added regression coverage in
+  `tests/test_operator_cli.py`.
+
 - Updated the plane-signing default to the governed 2026-08-20 Chef
   fingerprint and documented the verified live freeze/protected ceremony.
   Explicit operator-home self-verification remains mandatory even when an
