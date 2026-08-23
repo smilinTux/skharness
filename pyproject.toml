@@ -28,6 +28,9 @@ skcode-hostd = "skharness.serve:main"
 skharness-sign-plane-files = "skharness.autocode.sign_plane_files:main"
 skharness-pi-bridge = "skharness.arena.pi_bridge:main"
 skharness-sk-backend = "skharness.arena.sk_backend:main"
+# Card bb536f68: the reachability detector for load-bearing mechanisms. Its own
+# entry point is listed in wiring_inventory.yaml so the detector audits itself.
+skharness-wiring-audit = "skharness.wiring:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -36,7 +39,7 @@ where = ["src"]
 # data); they are shipped in sdists via MANIFEST.in. The autocode engine and its
 # adapters are pure-Python subpackages discovered by find above.
 [tool.setuptools.package-data]
-skharness = ["client/*.html", "autocode/data/*.json"]
+skharness = ["client/*.html", "autocode/data/*.json", "wiring_inventory.yaml"]
 
 [tool.ruff]
 line-length = 99
