@@ -13,17 +13,43 @@ inert without this suite going red.
 """
 from __future__ import annotations
 
+import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
 import yaml
 
-from skharness.wiring import Analyzer, audit, load_inventory, main
-
 # Audit the tree THIS TEST LIVES IN (the worktree/CI checkout), independent of
 # where an editable `skharness` install happens to import from.
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
+
+
+def _load_detector():
+    """Load the detector from THIS checkout's source, not the editable install.
+
+    Several skharness worktrees share one editable install on this box, so a bare
+    ``import skharness.wiring`` resolves to whatever checkout the install points
+    at -- not necessarily the branch under test. The detector module is
+    self-contained (stdlib + yaml only), so we load it directly from the source
+    tree the test lives in. This makes the guard test THIS branch's detector both
+    locally and in CI, matching the file-path rooting used throughout below.
+    """
+    path = SRC_ROOT / "skharness" / "wiring.py"
+    spec = importlib.util.spec_from_file_location("skharness_wiring_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    # Register before exec so dataclass() can resolve the module's __dict__.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_detector = _load_detector()
+Analyzer = _detector.Analyzer
+audit = _detector.audit
+load_inventory = _detector.load_inventory
+main = _detector.main
 REAL_INVENTORY = SRC_ROOT / "skharness" / "wiring_inventory.yaml"
 FIXTURE_ROOT = REPO_ROOT / "tests" / "fixtures" / "wiring_prefix"
 FIXTURE_INVENTORY = FIXTURE_ROOT / "inventory.yaml"
