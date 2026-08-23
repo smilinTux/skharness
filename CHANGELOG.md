@@ -16,6 +16,18 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ### Added
 
+- Added `scripts/pi-cockpit.sh`, a tmux-driven MANUAL cockpit for driving
+  `EngineeringExecutor` (the real twin-gated worktree/build/grade/finalize engine) by
+  hand, one card per pane, while `fleet_dispatch` is frozen (card P6 / `08963fbb`).
+  Never calls `fleet_dispatch`, never touches `_freeze.json` or `skoperator.*`, and
+  never merges (automerge_repos is empty in every live config and this tool does not
+  touch that list); a pane's only terminal states are "branch + diff pushed, PR opened
+  for review" or "failed, with the real notes". Per-card skgateway model routing lives
+  in one small function, `scripts/pi_cockpit/model_routing.choose_model`, which prints
+  its reasoning into the pane. Verified live end to end 2026-08-23 against coord card
+  `a7e3ca15` (skcoord): claude-opus-5 (routed for the `security` tag), a genuine grade-
+  inconclusive/CI-green salvage outcome, opened skcoord PR #33, never auto-merged.
+
 - Added a process-safe, cursor-resumable live `ActivityEvent` journal for Atlas and the
   built-in skcode webapp. Interactive sessions publish independently of viewers and Pi
   Arena workers publish bounded phase/tool/assistant/disposition events while running,
