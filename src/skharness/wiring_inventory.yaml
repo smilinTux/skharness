@@ -1,0 +1,43 @@
+# Inventory of load-bearing mechanisms and the live-path call site that reaches
+# each one (card bb536f68). This is DATA: a new guard/recorder/gate/sensor
+# registers here in one place, and the reachability detector (skharness.wiring)
+# proves it is reached from a declared live entry point -- reachable, not merely
+# present.
+#
+# Entry points are the paths that actually run in the fleet:
+#   * skharness.autocode.orchestrator:run_once  -- the gated autopilot orchestrator
+#   * skharness.wiring:main                      -- the detector's own CLI entry
+#
+# A check FAILS (becomes a finding) when the mechanism is unreachable,
+# reached only behind a flag that is off everywhere, called with a
+# statically-null argument, or is a constant sensor. Keep this green: an entry
+# here is a promise that the mechanism is wired on the live path today.
+mechanisms:
+  - id: wiring_audit
+    description: >-
+      The reachability detector must itself be reachable from its own CLI entry
+      point, so it cannot become the ninth built-but-unwired mechanism.
+    checks:
+      - type: reachable
+        entrypoints: ["skharness.wiring:main"]
+        callee: audit
+
+  - id: autopilot_cost_record_run
+    description: >-
+      The append-only cost/outcome recorder. Before S4 (432b81b7) the gated
+      orchestrator path never wrote a row; it is now reached via run_once ->
+      record_off_node_rows -> record_outcome_row -> record_run.
+    checks:
+      - type: reachable
+        entrypoints: ["skharness.autocode.orchestrator:run_once"]
+        callee: record_run
+
+  - id: escalation_reason_feedback
+    description: >-
+      escalation_reason -- the ONE sanctioned feedback channel of the Joule
+      Economy (design D2). It is read off the card payload on the recorded
+      outcome path via reason_from_payload.
+    checks:
+      - type: reachable
+        entrypoints: ["skharness.autocode.orchestrator:run_once"]
+        callee: reason_from_payload

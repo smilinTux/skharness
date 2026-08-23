@@ -1,0 +1,78 @@
+# The eight built-but-unwired mechanisms of epic 935d4b61, as they stood before
+# their individual fix cards landed. The detector, pointed at this fixture tree,
+# must flag ALL EIGHT. Finding fewer means the detector is itself inert.
+mechanisms:
+  - id: instance_1_record_run
+    description: >-
+      autopilot_cost.record_run: the append-only recorder was called only from
+      the bridge; the gated orchestrator path never wrote a row.
+    checks:
+      - type: reachable
+        entrypoints: ["orchestrator:run_once"]
+        callee: record_run
+
+  - id: instance_2_record_success
+    description: >-
+      Board.record_success and the success-memory read path: passing tests, zero
+      production callers.
+    checks:
+      - type: reachable
+        entrypoints: ["orchestrator:run_once"]
+        callee: record_success
+
+  - id: instance_3_changed_paths_are_protected
+    description: >-
+      The self-modification carve-out: one call site, inside `if automerge:`,
+      and automerge_repos is [] in every live config, so it never runs.
+    checks:
+      - type: reachable
+        entrypoints: ["engineering:engineer"]
+        callee: changed_paths_are_protected
+        dead_flags: [automerge]
+
+  - id: instance_4_cap_ledger_ceiling
+    description: >-
+      The CapLedger budget ceiling: add() is called with getattr(result,
+      "tokens", 0) while GateResult has no tokens field, so it always adds zero.
+    checks:
+      - type: arg_constant
+        entrypoints: ["orchestrator:run_once"]
+        callee: add
+        arg_index: 0
+
+  - id: instance_5_escalation_reason
+    description: >-
+      escalation_reason: named in the approved Joule Economy design as decision
+      D2, yet zero occurrences in src for two days.
+    checks:
+      - type: present
+        symbol: escalation_reason
+
+  - id: instance_6_graded_dispatch
+    description: >-
+      Graded model dispatch: routing.buckets_enabled is OFF at the gateway, so
+      dispatch_graded is reached only behind a dead flag.
+    checks:
+      - type: reachable
+        entrypoints: ["routing:dispatch"]
+        callee: dispatch_graded
+        dead_flags: [buckets_enabled]
+
+  - id: instance_7_reverted_sensor
+    description: >-
+      meta.autopilot.reverted: a constant False, because the automerge that
+      would set it truthy never runs. A dead sensor reads like good news.
+    checks:
+      - type: sensor_varies
+        field: reverted
+
+  - id: instance_8_routing_guard_protected
+    description: >-
+      routing_guard.py added to _ALWAYS_PROTECTED: the membership is consulted
+      only by is_protected, itself reached only behind the dead automerge flag,
+      so the entry protects nothing (inherits instance 3).
+    checks:
+      - type: reachable
+        entrypoints: ["engineering:engineer"]
+        callee: is_protected
+        dead_flags: [automerge]
