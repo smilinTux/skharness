@@ -162,10 +162,43 @@ def test_observe_each_condition_fires_independently(key, condition):
             assert st[other] == "True"
 
 
-def test_observe_missing_keys_default_healthy():
-    # A probe that omits keys must fail safe (report healthy).
-    st = _statuses(op.operator_observe(probe=dict))
-    assert set(st.values()) == {"True"}
+@pytest.mark.parametrize(
+    "key,condition",
+    [
+        ("hostd_ready", "HostdReady"),
+        ("sessions_healthy", "SessionsHealthy"),
+        ("registry_consistent", "RegistryConsistent"),
+        ("auth_enforced", "AuthEnforced"),
+    ],
+)
+def test_observe_one_field_deletion_is_unknown(key, condition):
+    state = {
+        "hostd_ready": True,
+        "sessions_healthy": True,
+        "registry_consistent": True,
+        "auth_enforced": True,
+    }
+    del state[key]
+    st = _statuses(op.operator_observe(probe=lambda: state))
+    assert st[condition] == "Unknown"
+    assert list(st.values()).count("True") == 3
+
+
+@pytest.mark.parametrize("malformed", [None, 1, "true", [], {}])
+def test_observe_malformed_value_is_unknown(malformed):
+    state = {
+        "hostd_ready": True,
+        "sessions_healthy": True,
+        "registry_consistent": True,
+        "auth_enforced": malformed,
+    }
+    st = _statuses(op.operator_observe(probe=lambda: state))
+    assert st == {
+        "HostdReady": "True",
+        "SessionsHealthy": "True",
+        "RegistryConsistent": "True",
+        "AuthEnforced": "Unknown",
+    }
 
 
 def test_default_probe_is_unknown_when_hostd_totally_unreachable(monkeypatch):
