@@ -35,9 +35,9 @@ Actions:
     surface (dispatch P2). Flips a persisted flag; while set, POST /dispatch returns
     503 regardless of auth. --resume clears it.
 
-Every probe fails SAFE (reports healthy) when hostd is unreachable, mirroring the
-adapter's ``_probe_hostd``. The observe probe and the act runner/harness are all
-injectable so tests never touch real systemd, tmux, or the network.
+Every unobservable condition reports Unknown. The observe probe and the act
+runner/harness are all injectable so tests never touch real systemd, tmux, or
+the network.
 """
 
 from __future__ import annotations
@@ -173,7 +173,7 @@ def _registry_consistent(registry_ids, live_ids) -> bool:
     return set(registry_ids or ()) <= set(live_ids or ())
 
 
-# --- default (real) probe: reads the local hostd, fails SAFE = healthy -------
+# --- default (real) probe: reads the local hostd, fails closed ----------------
 
 
 def _default_probe() -> dict:
@@ -181,9 +181,8 @@ def _default_probe() -> dict:
 
     Mirrors ``skcode_adapter._probe_hostd`` (the exact module Atlas's in-process
     seat adapter runs): hits the local :9394 API, parses the session list + auth
-    flag, and derives the four condition inputs. A successful response that
-    simply omits a field (e.g. no ``auth_enforced`` key) fails SAFE (healthy)
-    for that one field, never raising a false alarm from a partial answer.
+    flag, and derives the four condition inputs. A successful but partial
+    response leaves unobservable conditions Unknown.
 
     A TOTAL failure to reach hostd at all (connection refused, DNS failure,
     timeout, malformed body) is a DIFFERENT case, and is reported as Unknown
@@ -205,15 +204,31 @@ def _default_probe() -> dict:
         url = os.environ.get("SKCODE_HOSTD_HEALTH", _HOSTD_HEALTH_URL)
         with urllib.request.urlopen(url, timeout=8) as r:  # noqa: S310 (local tailnet)
             body = json.loads(r.read())
-        sessions = body.get("sessions", []) if isinstance(body, dict) else []
-        registry_ids = [s.get("id") for s in sessions]
-        live_ids = [s.get("id") for s in sessions if s.get("backing_alive", True)]
+        sessions = body.get("sessions") if isinstance(body, dict) else None
+        sessions_valid = isinstance(sessions, list) and all(
+            isinstance(session, dict) for session in sessions
+        )
+        registry_observed = sessions_valid and all(
+            isinstance(session.get("id"), str)
+            and type(session.get("backing_alive")) is bool
+            for session in sessions
+        )
+        registry_ids = [session["id"] for session in sessions] if registry_observed else []
+        live_ids = (
+            [session["id"] for session in sessions if session["backing_alive"]]
+            if registry_observed
+            else []
+        )
         auth = body.get("auth_enforced") if isinstance(body, dict) else None
         return {
             "hostd_ready": True,
-            "sessions_healthy": _sessions_healthy(sessions),
-            "registry_consistent": _registry_consistent(registry_ids, live_ids),
-            "auth_enforced": True if auth is None else bool(auth),
+            "sessions_healthy": _sessions_healthy(sessions) if sessions_valid else None,
+            "registry_consistent": (
+                _registry_consistent(registry_ids, live_ids)
+                if registry_observed
+                else None
+            ),
+            "auth_enforced": auth,
         }
     except Exception as exc:
         return {"_probe_error": type(exc).__name__}
@@ -234,18 +249,17 @@ def operator_explain() -> dict:
 def operator_observe(probe: Callable[[], dict] | None = None) -> dict:
     """Read-only skcode-hostd health snapshot in the adapter-contract shape.
 
-    Maps the probe's four boolean inputs onto the four conditions. Each
-    condition defaults to healthy when ONE input is absent from an otherwise
-    successful probe (fail safe). A probe result carrying ``_probe_error`` (a
-    TOTAL inability to reach hostd, see ``_default_probe``) instead reports
-    every condition Unknown, never healthy: see card 504d0046. ``probe`` is
-    injectable so tests drive each condition firing without any I/O.
+    Maps the probe's four strictly boolean inputs onto the four conditions.
+    Absent, null, malformed, and unobservable values report Unknown. A probe
+    result carrying ``_probe_error`` reports every condition Unknown. ``probe``
+    is injectable so tests drive each condition firing without any I/O.
     """
     st = (probe or _default_probe)()
     unknown = bool(st.get("_probe_error"))
 
     def status(key: str) -> str:
-        return "Unknown" if unknown else _b(bool(st.get(key, True)))
+        value = st.get(key)
+        return _b(value) if not unknown and type(value) is bool else "Unknown"
 
     return {
         "conditions": [

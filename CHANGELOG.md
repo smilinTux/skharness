@@ -9,6 +9,9 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ## [Unreleased]
 
+- Report absent, null, malformed, and otherwise unobservable operator condition
+  values as Unknown instead of confidently healthy.
+
 ### Fixed
 
 - **`skcode-hostd operator observe` no longer reports a totally unreachable
