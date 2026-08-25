@@ -14,6 +14,10 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ### Fixed
 
+- Serialized Arena state observations with lifecycle transitions so a process
+  exit racing an operator cancellation cannot act on stale `RUNNING` state and
+  attempt to overwrite durable `CANCELLED` state (card `80dacdfd`).
+
 - **`skcode-hostd operator observe` no longer reports a totally unreachable
   hostd as healthy (card 504d0046, skcapstone).** ATLAS Eyes' first real run
   (skcapstone PR #178) found `HostdReady`/`SessionsHealthy`/
