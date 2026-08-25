@@ -142,6 +142,21 @@ class RunHandle:
             return
         self._mutate(ref, {"cleared_attempts": list(entries)})
 
+    def add_run_record(self, ref: str, record: dict) -> None:
+        """Append one RunRecord (already schema-validated, JSON-mode dict)
+        under ``items.<ref>.run_records[]`` -- the exact field
+        ``run_record.RUN_RECORD_JOURNAL_FIELD`` names as this schema's
+        journal home (coord card c672529e). Append, not `_mutate`'s
+        dict-merge: a card can reach several twin-gate verdicts (one per
+        Ralph round) in one run, and each must be kept, not overwritten.
+        """
+        data = read_run(self.run_id) or {"run_id": self.run_id, "items": {},
+                                         "tokens": 0, "cost_usd": 0.0}
+        item = data.setdefault("items", {}).setdefault(ref, {})
+        item.setdefault("run_records", []).append(record)
+        item["updated_at"] = _now()
+        write_run(self.run_id, data)
+
 
 def handle(run_id: str) -> RunHandle:
     """Return a RunHandle for mutating a run's items."""

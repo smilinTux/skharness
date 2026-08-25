@@ -165,6 +165,55 @@ class EngineeringExecutor:
 
         return self._build_usage.get(ref) or BuildUsage()
 
+    def _write_run_record(self, item: WorkItem, repo: RepoSpec, harness, *,
+                          round: int, score: int | None, passed: bool, notes: str,
+                          outcome: str, ci_status: str, cov: float | None,
+                          pr: str | None, started_at, finished_at) -> None:
+        """Write one RunRecord at the twin-gate verdict boundary (card
+        c672529e). Called from every return of run() that follows a
+        twin_gate_passed() evaluation: pass, salvage, and the ci_red
+        terminal fallback. Never called from the no_op short-circuit, which
+        returns before the gate is ever evaluated, so it reaches no verdict.
+
+        Best-effort by construction (see run_record_writer.write_verdict_run_record):
+        a broken provenance writer must never turn a real twin-gate verdict
+        into a crash, matching every other telemetry call in this method.
+        """
+        from . import run_record_writer
+        from .buckets import work_grade
+        from .orchestrator import _adapter_name, _grader_model, _model_requested
+
+        run_record_writer.write_verdict_run_record(
+            run_id=self.journal.run_id,
+            card_id=item.ref,
+            repository=repo.name,
+            round=round,
+            adapter=_adapter_name(harness),
+            model_requested=_model_requested(item, harness),
+            grader_model=_grader_model(item, harness),
+            effort_tier="gated",  # this executor is, by construction, the gated lane
+            work_grade=work_grade(item.payload),
+            score=score,
+            passed=passed,
+            notes=notes,
+            outcome=outcome,
+            ci_status=ci_status,
+            diff_coverage=cov,
+            min_diff_coverage=repo.min_diff_coverage,
+            pr=pr,
+            retries=round - 1,
+            # NOT escalation.reason_from_payload(item.payload) here: engineering.py
+            # is a listed ROUTING module (test_autocode_escalation.py's
+            # _ROUTING_MODULES) that must never reference the escalation
+            # vocabulary, so nothing there can route on a human's escalation
+            # note. The raw payload passes through untouched; run_record_writer
+            # (a reporting module) resolves it.
+            payload=item.payload,
+            started_at=started_at,
+            finished_at=finished_at,
+            source_namespace="skharness.autocode.engineering.run",
+        )
+
     def _settle_economics(self, item: WorkItem, sha: str, *,
                           retries: int = 0, rounds_max: int = 0) -> None:
         """Settle the build's joule P&L on a twin-gate pass (mint value, spend real
@@ -624,6 +673,9 @@ class EngineeringExecutor:
                            prior_feedback=feedback, round=rnd,
                            prior_success_feedback=success_feedback)
             attach_dispatch_model(tb, dispatch_model)
+            # RunRecord provenance (card c672529e): this round's own wall-clock
+            # start, genuinely observed here rather than reconstructed later.
+            round_started_at = datetime.now(timezone.utc)
             hr = harness.run_task(tb)
             # token/cost telemetry for the joule P&L. harness.name is the adapter
             # that actually ran, and it is the model of record when the envelope
@@ -680,6 +732,10 @@ class EngineeringExecutor:
             self.board.score_task(item.ref, round=rnd, score=(gr.score or 0),
                                   notes=strip_promise(gr.notes), harness=harness.name)
             last = gr
+            # kept in lockstep with `last` so a terminal record written after
+            # the loop (the ci_red fallback) always cites the round `last`
+            # actually came from, never a later round's empty-diff `continue`.
+            last_round_started_at = round_started_at
             # deterministic twin gate: LLM 5/5 + promise ANDed with CI green +
             # coverage. The predicate is the shared twin_gate_passed (also used by
             # the ratify one-shot) so the gate has one definition, never two.
@@ -722,6 +778,11 @@ class EngineeringExecutor:
                 # PEEK, never take: finalize's _settle_economics pops this usage
                 # to mint against it, and it is the only path allowed to.
                 u = self._peek_usage(item.ref)
+                self._write_run_record(
+                    item, repo, harness, round=rnd, score=gr.score, passed=True,
+                    notes=strip_promise(gr.notes), outcome="pass",
+                    ci_status=ci_status, cov=cov, pr=None,
+                    started_at=round_started_at, finished_at=datetime.now(timezone.utc))
                 return GateResult(score=gr.score, passed=True,
                                   notes=strip_promise(gr.notes), artifact=gr.artifact,
                                   outcome="pass", tokens=u.tokens,
@@ -738,10 +799,17 @@ class EngineeringExecutor:
                 # record what the salvaged rounds cost; no mint (the grade never
                 # said 5, so this is not a pass)
                 u = self._take_usage(item.ref, "salvage")
+                salvage_notes = (
+                    f"grade inconclusive but CI green + coverage met; opened "
+                    f"PR {pr_url} for human review (NOT auto-merged).")
+                self._write_run_record(
+                    item, repo, harness, round=rnd, score=None, passed=False,
+                    notes=salvage_notes, outcome="salvage",
+                    ci_status=ci_status, cov=cov, pr=pr_url,
+                    started_at=round_started_at, finished_at=datetime.now(timezone.utc))
                 return GateResult(
                     score=None, passed=False, artifact=pr_url,
-                    notes=(f"grade inconclusive but CI green + coverage met; opened "
-                           f"PR {pr_url} for human review (NOT auto-merged)."),
+                    notes=salvage_notes,
                     outcome="salvage", tokens=u.tokens, cost_usd=u.cost_usd,
                     mutation_report=shadow)
             feedback = strip_promise(gr.notes)
@@ -755,9 +823,19 @@ class EngineeringExecutor:
             why_failed=distill_failure(strip_promise(last.notes) if last else ""))
         # record what all the rounds cost; no mint (the gate never closed)
         u = self._take_usage(item.ref, "ci_red")
+        ci_red_notes = (f"did not converge in {self._MAX_ROUNDS} rounds: "
+                        f"{strip_promise(last.notes) if last else ''}")
+        if last is not None:
+            # A verdict was reached (twin_gate_passed ran every non-empty
+            # round, `last` above), so the boundary writes a RunRecord here
+            # too, exactly as it does for the pass/salvage returns.
+            self._write_run_record(
+                item, repo, harness, round=rnd, score=last.score, passed=False,
+                notes=ci_red_notes, outcome="ci_red",
+                ci_status=ci_status, cov=cov, pr=None,
+                started_at=last_round_started_at, finished_at=datetime.now(timezone.utc))
         return GateResult(score=(last.score if last else None), passed=False,
-                          notes=f"did not converge in {self._MAX_ROUNDS} rounds: "
-                                f"{strip_promise(last.notes) if last else ''}",
+                          notes=ci_red_notes,
                           artifact=(last.artifact if last else None),
                           outcome="ci_red", tokens=u.tokens, cost_usd=u.cost_usd)
 
