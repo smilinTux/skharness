@@ -629,11 +629,22 @@ def test_nonfinite_accounting_is_not_durable_json_evidence():
         _live_record(cost_usd=float("nan"))
 
 
-def test_schema_declares_existing_atomic_journal_destination_but_has_no_writer_dependency():
+def test_schema_has_exactly_one_sanctioned_production_writer():
+    """Card c672529e wires the ONE sanctioned writer (run_record_writer.py)
+    at the twin-gate verdict boundary. Before that card this test asserted
+    ZERO production importers, matching this schema's own docstring ("no
+    production writer imports it yet"); that was the guard against premature,
+    ad-hoc wiring. The guard's spirit does not change with a real writer in
+    place: it still must be true that nothing OTHER than the one sanctioned
+    writer imports this frozen schema directly, so a second, competing
+    RunRecord writer appearing anywhere else in the package still fails this
+    test, exactly as an ad-hoc import would have failed it before.
+    """
     assert RUN_RECORD_JOURNAL_TEMPLATE.endswith("coordination/autopilot/runs/<run_id>.json")
     assert RUN_RECORD_JOURNAL_FIELD == "items.<card_id>.run_records[]"
 
     source_root = Path(__file__).resolve().parents[1] / "src" / "skharness" / "autocode"
+    sanctioned_writer = source_root / "run_record_writer.py"
     production_importers = []
     for path in source_root.rglob("*.py"):
         if path.name == "run_record.py":
@@ -664,4 +675,4 @@ def test_schema_declares_existing_atomic_journal_destination_but_has_no_writer_d
             if absolute or from_absolute or from_relative or package_import:
                 production_importers.append(path)
                 break
-    assert production_importers == []
+    assert production_importers == [sanctioned_writer]
