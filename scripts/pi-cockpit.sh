@@ -20,6 +20,8 @@
 #                             refuses "swarm" and refuses an already-live name)
 #   PI_COCKPIT_PYTHON         interpreter to run the panes with (default: ~/.skenv/bin/python)
 #   PI_COCKPIT_AGENT_NAME     coord-board claim identity (default: pi-cockpit)
+#   SKHARNESS_PI_SPAWN_STATE  authoritative spawn-control state file (required)
+#   SKHARNESS_PI_SPAWN_ACTOR  attributable launcher identity (required)
 #
 # Example:
 #   scripts/pi-cockpit.sh a7e3ca15 284a7d6e
@@ -32,6 +34,9 @@ CONFIG="${SKOS_AUTOPILOT_CONFIG:-$HOME/.skcapstone/config/autopilot-pi-claude.ya
 SESSION="${PI_COCKPIT_SESSION:-pi-cockpit-$(date +%H%M%S)}"
 PY="${PI_COCKPIT_PYTHON:-$HOME/.skenv/bin/python}"
 AGENT_NAME="${PI_COCKPIT_AGENT_NAME:-pi-cockpit}"
+SPAWN_STATE="${SKHARNESS_PI_SPAWN_STATE:?SKHARNESS_PI_SPAWN_STATE is required}"
+SPAWN_ACTOR="${SKHARNESS_PI_SPAWN_ACTOR:?SKHARNESS_PI_SPAWN_ACTOR is required}"
+PI_LAUNCH=(skharness-pi-launch --state "$SPAWN_STATE" --actor "$SPAWN_ACTOR" --scope pi:all)
 
 if [ "$#" -eq 0 ]; then
   echo "usage: $0 CARD_ID [CARD_ID...]" >&2
@@ -68,15 +73,17 @@ echo "  NEVER merges. fleet_dispatch is not consulted."
 echo
 
 # Control pane (window "control", pane 0).
-tmux new-session -d -s "$SESSION" -n control \
+"${PI_LAUNCH[@]}" --worker-id "$RUN_ID-control" --kind tmux -- \
+  tmux new-session -d -s "$SESSION" -n control \
   "$PY" "$HERE/scripts/pi_cockpit/control.py" \
     --status-dir "$STATUS_DIR" --config "$CONFIG" --cards "$@"
 
 # One pane per card, tiled alongside the control pane in the same window.
 for CARD in "$@"; do
-  CMD="$(printf 'SKOS_AUTOPILOT_CONFIG=%q %q %q --card %q --status-dir %q --agent-name %q; ec=$?; echo; if [ $ec -eq 0 ]; then echo "[pane done: 0 -- press Enter to close]"; else echo "[pane done: $ec -- press Enter to close]"; fi; read _' \
-    "$CONFIG" "$PY" "$HERE/scripts/pi_cockpit/run_card.py" "$CARD" "$STATUS_DIR" "$AGENT_NAME")"
-  tmux split-window -t "$SESSION:control" -h "$CMD"
+  CMD="$(printf 'SKOS_AUTOPILOT_CONFIG=%q skharness-pi-launch --state %q --worker-id %q --actor %q --scope pi:all --kind process -- %q %q --card %q --status-dir %q --agent-name %q; ec=$?; echo; if [ $ec -eq 0 ]; then echo "[pane done: 0 -- press Enter to close]"; else echo "[pane done: $ec -- press Enter to close]"; fi; read _' \
+    "$CONFIG" "$SPAWN_STATE" "$RUN_ID-$CARD" "$SPAWN_ACTOR" "$PY" "$HERE/scripts/pi_cockpit/run_card.py" "$CARD" "$STATUS_DIR" "$AGENT_NAME")"
+  "${PI_LAUNCH[@]}" --worker-id "$RUN_ID-pane-$CARD" --kind tmux -- \
+    tmux split-window -t "$SESSION:control" -h "$CMD"
   tmux select-layout -t "$SESSION:control" tiled
 done
 

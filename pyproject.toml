@@ -31,6 +31,8 @@ skharness-sk-backend = "skharness.arena.sk_backend:main"
 # Card bb536f68: the reachability detector for load-bearing mechanisms. Its own
 # entry point is listed in wiring_inventory.yaml so the detector audits itself.
 skharness-wiring-audit = "skharness.wiring:main"
+skharness-pi-spawn-control = "skharness.pi_spawn_control:main"
+skharness-pi-launch = "skharness.pi_spawn_control:launch_main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

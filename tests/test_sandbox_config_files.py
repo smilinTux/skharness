@@ -1,7 +1,18 @@
 import json
 import os
 
+import pytest
+
 from skharness.autocode.sandbox import AuthMount, LaunchSpec, Sandbox
+from skharness.pi_spawn_control import SpawnControl
+
+
+@pytest.fixture(autouse=True)
+def _isolated_pi_spawn_control(tmp_path, monkeypatch):
+    state = tmp_path / "pi-spawn-control.json"
+    SpawnControl(state).bootstrap(actor="test-bootstrap")
+    monkeypatch.setenv("SKHARNESS_PI_SPAWN_STATE", str(state))
+    monkeypatch.setenv("SKHARNESS_PI_SPAWN_ACTOR", "pytest")
 
 
 def _spec(**kw):

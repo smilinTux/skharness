@@ -27,6 +27,7 @@ from .sandbox_lifecycle import (
     SandboxOwnership,
     reconcile_sandbox_orphans,
 )
+from skharness.pi_spawn_control import SpawnControl, SpawnControlError
 
 PROXY_PORT = 8080
 
@@ -432,6 +433,33 @@ class Sandbox:
         raise HarnessUnavailable(f"sandbox egress proxy unavailable (fail closed): {detail[:240]}")
 
     def spawn(self, spec: LaunchSpec, *, repo_remote_host=None, ci_host=None) -> dict:
+        if spec.name != "pi":
+            return self._spawn_uncontrolled(
+                spec, repo_remote_host=repo_remote_host, ci_host=ci_host
+            )
+        state_path = os.environ.get("SKHARNESS_PI_SPAWN_STATE")
+        actor = os.environ.get("SKHARNESS_PI_SPAWN_ACTOR")
+        if not state_path or not actor:
+            raise HarnessUnavailable(
+                "Pi spawn control is unavailable: SKHARNESS_PI_SPAWN_STATE and "
+                "SKHARNESS_PI_SPAWN_ACTOR are required"
+            )
+        worker_id = spec.sandbox_run_id or f"sandbox-{secrets.token_hex(8)}"
+        control = SpawnControl(state_path)
+        try:
+            control.check_open()
+        except (SpawnControlError, ValueError) as exc:
+            raise HarnessUnavailable(f"Pi spawn denied: {exc}") from exc
+        return self._spawn_uncontrolled(
+            spec,
+            repo_remote_host=repo_remote_host,
+            ci_host=ci_host,
+            pi_control=(control, worker_id, actor),
+        )
+
+    def _spawn_uncontrolled(
+        self, spec: LaunchSpec, *, repo_remote_host=None, ci_host=None, pi_control=None
+    ) -> dict:
         if not self.live_execution:
             raise HarnessUnavailable(
                 "live harness execution is disabled (posture C / config): set "
@@ -476,7 +504,16 @@ class Sandbox:
                           "timeout": self.run_timeout}
             if spec.stdin is not None:
                 run_kwargs["input"] = spec.stdin
+            reservation = None
             try:
+                if pi_control is not None:
+                    control, worker_id, actor = pi_control
+                    try:
+                        reservation = control.reserve(
+                            worker_id, actor=actor, scope="pi:all", kind="process"
+                        )
+                    except (SpawnControlError, ValueError) as exc:
+                        raise HarnessUnavailable(f"Pi spawn denied at final boundary: {exc}") from exc
                 proc = subprocess.run(
                     self._docker_run_argv(spec, net, proxy_alias, container_name=harness_name,
                                           extra_mounts=cfg_mounts, ownership=ownership),
@@ -491,6 +528,14 @@ class Sandbox:
                     e.stdout.decode(errors="replace") if e.stdout else "")
                 return {"result": partial, "is_error": True, "exit_code": 124,
                         "timeout": True}
+            finally:
+                if reservation is not None:
+                    try:
+                        control.finish(worker_id, token=reservation.token)
+                    except SpawnControlError as exc:
+                        raise HarnessUnavailable(
+                            f"Pi worker completion could not be recorded: {exc}"
+                        ) from exc
             try:
                 return json.loads(proc.stdout or "{}")
             except json.JSONDecodeError:
