@@ -512,6 +512,7 @@ class Sandbox:
                         reservation = control.reserve(
                             worker_id, actor=actor, scope="pi:all", kind="process"
                         )
+                        control.validate_reservation(reservation)
                     except (SpawnControlError, ValueError) as exc:
                         raise HarnessUnavailable(f"Pi spawn denied at final boundary: {exc}") from exc
                 proc = subprocess.run(

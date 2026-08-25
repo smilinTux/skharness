@@ -34,6 +34,11 @@ Bootstrap is atomic and idempotent. A missing, unreadable, malformed, or
 unsupported state denies new Pi creation. There is no implicit open fallback.
 Every control transition records its application time and complete semantic
 postcondition. Status and worker reservation reject inconsistent history.
+State timestamps use canonical UTC `Z` form at whole-second or exactly
+six-digit microsecond precision. One clock sample per boundary must satisfy
+`created_at <= worker.reserved_at <= updated_at <= now` for every worker.
+Malformed offsets, noncanonical fractions, clock regression, and a mixed
+valid-invalid worker registry fail closed without rewriting state.
 Version 1 state is not migrated in place. Before first activation of this
 undeployed version 2 contract, bootstrap a fresh state path and retain any old
 state only as inert evidence.
@@ -81,6 +86,9 @@ skharness-pi-launch --state "$SKHARNESS_PI_SPAWN_STATE" \
   --kind process -- pi --model approved-model
 ```
 
-The launcher atomically reserves an exact worker identity before calling the
-command and removes only that reservation after the command exits. Pause and
-drain never alter existing worker processes or tmux panes.
+The launcher atomically reserves an exact worker identity, reloads and
+revalidates the complete state immediately before the final process or tmux
+mutation, then removes only that reservation after the command exits. The
+Sandbox process path performs the same final revalidation before its worker
+container call. Pause and drain never alter existing worker processes or tmux
+panes.

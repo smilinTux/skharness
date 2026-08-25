@@ -28,6 +28,15 @@ def rewrite_state(gate: SpawnControl, mutate) -> None:
     gate.path.write_text(json.dumps(state), encoding="utf-8")
 
 
+def future_worker_state(gate: SpawnControl, reserved_at: object) -> None:
+    gate.bootstrap(actor="installer")
+    gate.reserve("existing", actor="pool", scope="pi:all", kind="process")
+    rewrite_state(
+        gate,
+        lambda state: state["workers"]["existing"].update(reserved_at=reserved_at),
+    )
+
+
 def test_missing_and_malformed_state_fail_closed(tmp_path):
     gate = control(tmp_path)
     with pytest.raises(StateUnavailableError):
@@ -39,6 +48,156 @@ def test_missing_and_malformed_state_fail_closed(tmp_path):
     gate.path.symlink_to(tmp_path / "missing-target")
     with pytest.raises(StateUnavailableError):
         gate.status()
+
+
+@pytest.mark.parametrize(
+    "reserved_at",
+    [
+        "2026-08-25T14:59:59.999999Z",
+        "2026-08-25T15:00:00.000001Z",
+        "2026-08-25T16:00:00Z",
+        "2026-08-25T10:00:00-05:00",
+        "2026-08-25T15:00:00.1Z",
+        "2026-08-25T15:00:00.0000001Z",
+        "not-a-time",
+        float("inf"),
+    ],
+)
+def test_invalid_worker_time_fails_before_status_reservation_or_process(tmp_path, reserved_at):
+    gate = control(tmp_path)
+    future_worker_state(gate, reserved_at)
+    before = gate.path.read_bytes()
+    calls = []
+
+    with pytest.raises(StateUnavailableError):
+        gate.status()
+    with pytest.raises(StateUnavailableError):
+        gate.reserve("second", actor="pool", scope="pi:all", kind="process")
+    with pytest.raises(StateUnavailableError):
+        gate.guarded_run(
+            ["fake-pi"], worker_id="third", actor="pool", scope="pi:all",
+            kind="process", runner=lambda argv: calls.append(argv),
+        )
+
+    assert calls == []
+    assert gate.path.read_bytes() == before
+
+
+def test_mixed_worker_times_and_duplicate_identity_fail_closed(tmp_path):
+    gate = control(tmp_path)
+    gate.bootstrap(actor="installer")
+    gate.reserve("valid", actor="pool", scope="pi:all", kind="process")
+    gate.reserve("invalid", actor="pool", scope="pi:all", kind="tmux")
+    rewrite_state(
+        gate,
+        lambda state: state["workers"]["invalid"].update(
+            reserved_at="2026-08-25T15:00:00.000001Z"
+        ),
+    )
+    with pytest.raises(StateUnavailableError):
+        gate.status()
+
+    rewrite_state(
+        gate,
+        lambda state: state["workers"]["invalid"].update(
+            reserved_at="2026-08-25T15:00:00Z", worker_id="valid"
+        ),
+    )
+    with pytest.raises(StateUnavailableError):
+        gate.status()
+
+
+def test_equal_worker_time_and_canonical_microseconds_are_valid(tmp_path):
+    precise_now = NOW.replace(microsecond=123456)
+    gate = SpawnControl(tmp_path / "pi-spawn.json", clock=lambda: precise_now)
+    gate.bootstrap(actor="installer")
+    gate.reserve("worker", actor="pool", scope="pi:all", kind="process")
+
+    status = gate.status()
+
+    assert status["workers"][0]["reserved_at"] == "2026-08-25T15:00:00.123456Z"
+    assert status["updated_at"] == status["created_at"]
+
+
+def test_clock_regression_fails_closed_without_state_write(tmp_path):
+    current = [NOW]
+    gate = SpawnControl(tmp_path / "pi-spawn.json", clock=lambda: current[0])
+    gate.bootstrap(actor="installer")
+    before = gate.path.read_bytes()
+    current[0] = NOW - timedelta(microseconds=1)
+
+    with pytest.raises(StateUnavailableError):
+        gate.reserve("worker", actor="pool", scope="pi:all", kind="process")
+
+    assert gate.path.read_bytes() == before
+
+
+def test_each_boundary_uses_one_explicit_clock_sample(tmp_path):
+    calls = []
+
+    def clock():
+        calls.append(None)
+        if len(calls) > 1:
+            raise AssertionError("clock sampled more than once")
+        return NOW
+
+    gate = SpawnControl(tmp_path / "pi-spawn.json", clock=clock)
+    gate.bootstrap(actor="installer")
+    for action in (
+        gate.status,
+        lambda: gate.reserve("worker", actor="pool", scope="pi:all", kind="process"),
+    ):
+        calls.clear()
+        action()
+        assert len(calls) == 1
+
+
+def test_concurrent_duplicate_reservation_has_one_winner(tmp_path):
+    gate = control(tmp_path)
+    gate.bootstrap(actor="installer")
+    outcomes = []
+
+    def attempt(actor):
+        try:
+            outcomes.append(gate.reserve(
+                "same-worker", actor=actor, scope="pi:all", kind="process"
+            ).worker_id)
+        except ControlDeniedError:
+            outcomes.append("denied")
+
+    threads = [threading.Thread(target=attempt, args=(actor,)) for actor in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(outcomes) == ["denied", "same-worker"]
+    assert [worker["worker_id"] for worker in gate.status()["workers"]] == ["same-worker"]
+
+
+@pytest.mark.parametrize("kind", ["process", "tmux"])
+def test_snapshot_replacement_before_final_mutation_fails_with_zero_calls(
+    tmp_path, monkeypatch, kind
+):
+    gate = control(tmp_path)
+    gate.bootstrap(actor="installer")
+    original_reserve = gate.reserve
+    calls = []
+
+    def reserve_then_replace(*args, **kwargs):
+        reservation = original_reserve(*args, **kwargs)
+        original_reserve(
+            "interloper", actor="other-pool", scope="pi:all", kind="process"
+        )
+        return reservation
+
+    monkeypatch.setattr(gate, "reserve", reserve_then_replace)
+    with pytest.raises(ControlDeniedError):
+        gate.guarded_run(
+            [f"fake-{kind}"], worker_id=f"worker-{kind}", actor="pool",
+            scope="pi:all", kind=kind, runner=lambda argv: calls.append(argv),
+        )
+    assert calls == []
 
 
 def test_unknown_operation_shape_fails_closed(tmp_path):

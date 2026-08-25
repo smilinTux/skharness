@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -25,6 +26,7 @@ SCHEMA = "skharness.pi-spawn-control.v2"
 MAX_TTL_SECONDS = 3600
 CONTROL_SCOPE = "pi:all"
 _TOKEN = re.compile(r"\A[A-Za-z0-9._:@/+-]{1,200}\Z")
+_TIMESTAMP = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{6})?Z\Z")
 _STATE_KEYS = {
     "schema",
     "mode",
@@ -58,6 +60,7 @@ class Reservation:
     worker_id: str
     token: str
     fence: int
+    state_hash: str
 
 
 def _utcnow() -> datetime:
@@ -65,18 +68,21 @@ def _utcnow() -> datetime:
 
 
 def _timestamp(value: datetime) -> str:
-    if value.tzinfo is None:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("clock must return a timezone-aware datetime")
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _parse_timestamp(value: object, name: str) -> datetime:
-    if not isinstance(value, str) or not value.endswith("Z"):
+    if not isinstance(value, str) or not _TIMESTAMP.fullmatch(value):
         raise StateUnavailableError(f"malformed {name}")
     try:
-        return datetime.fromisoformat(value[:-1] + "+00:00")
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
     except ValueError as exc:
         raise StateUnavailableError(f"malformed {name}") from exc
+    if _timestamp(parsed) != value:
+        raise StateUnavailableError(f"malformed {name}")
+    return parsed
 
 
 def _checked_token(name: str, value: str) -> str:
@@ -158,6 +164,14 @@ def _request_matches(operation: dict, request: dict) -> bool:
     return all(operation.get(key) == value for key, value in request.items())
 
 
+def _state_bytes(state: dict) -> bytes:
+    return (json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def _state_hash(state: dict) -> str:
+    return hashlib.sha256(_state_bytes(state)).hexdigest()
+
+
 class SpawnControl:
     """Atomic file-backed Pi spawn decision and active-worker registry."""
 
@@ -165,6 +179,12 @@ class SpawnControl:
         self.path = Path(path)
         self.lock_path = self.path.with_name(self.path.name + ".lock")
         self.clock = clock
+
+    def _now(self) -> datetime:
+        try:
+            return _parse_timestamp(_timestamp(self.clock()), "clock")
+        except (TypeError, ValueError, OverflowError, StateUnavailableError) as exc:
+            raise StateUnavailableError("Pi spawn clock is invalid") from exc
 
     def _locked(self, *, bootstrap: bool = False):
         if bootstrap:
@@ -186,7 +206,7 @@ class SpawnControl:
         except (OSError, StateUnavailableError) as exc:
             raise StateUnavailableError("Pi spawn decision is unavailable") from exc
 
-    def _load(self) -> dict:
+    def _load(self, *, now: datetime | None = None) -> dict:
         try:
             flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
             descriptor = os.open(self.path, flags)
@@ -212,7 +232,7 @@ class SpawnControl:
             raise StateUnavailableError("Pi spawn decision has an invalid fence") from exc
         created_at = _parse_timestamp(raw["created_at"], "created_at")
         updated_at = _parse_timestamp(raw["updated_at"], "updated_at")
-        now = self.clock()
+        now = self._now() if now is None else now
         if created_at > updated_at or updated_at > now:
             raise StateUnavailableError("Pi spawn decision has inconsistent timestamps")
         if raw["mode"] == "open":
@@ -292,11 +312,13 @@ class SpawnControl:
                     raise StateUnavailableError(f"Pi spawn worker has invalid {name}") from exc
             if worker["kind"] not in {"process", "tmux"}:
                 raise StateUnavailableError("Pi spawn worker has invalid kind")
-            _parse_timestamp(worker["reserved_at"], "reserved_at")
+            reserved_at = _parse_timestamp(worker["reserved_at"], "reserved_at")
+            if reserved_at < created_at or reserved_at > updated_at or reserved_at > now:
+                raise StateUnavailableError("Pi spawn worker has inconsistent time")
         return raw
 
     def _write(self, state: dict) -> None:
-        encoded = (json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        encoded = _state_bytes(state)
         temp_name = None
         try:
             with tempfile.NamedTemporaryFile(dir=self.path.parent, delete=False) as temp:
@@ -323,14 +345,15 @@ class SpawnControl:
     def bootstrap(self, *, actor: str) -> dict:
         _checked_token("actor", actor)
         with self._locked(bootstrap=True):
+            now = self._now()
             if self.path.exists():
-                state = self._load()
+                state = self._load(now=now)
                 if not _request_matches(
                     state["last_operation"], {"command": "bootstrap", "actor": actor}
                 ):
                     raise ControlDeniedError("Pi spawn bootstrap replay does not match state")
-                return self._view(state)
-            now = _timestamp(self.clock())
+                return self._view(state, now=now)
+            timestamp = _timestamp(now)
             state = {
                 "schema": SCHEMA,
                 "mode": "open",
@@ -338,22 +361,25 @@ class SpawnControl:
                 "owner": None,
                 "reason": None,
                 "scope": None,
-                "created_at": now,
+                "created_at": timestamp,
                 "expires_at": None,
-                "updated_at": now,
-                "last_operation": {"command": "bootstrap", "actor": actor, "applied_at": now},
+                "updated_at": timestamp,
+                "last_operation": {
+                    "command": "bootstrap", "actor": actor, "applied_at": timestamp
+                },
                 "workers": {},
             }
             self._write(state)
-            return self._view(state)
+            return self._view(state, now=now)
 
-    def _view(self, state: dict) -> dict:
+    def _view(self, state: dict, *, now: datetime | None = None) -> dict:
+        now = self._now() if now is None else now
         view = {
             key: value for key, value in state.items() if key not in {"workers", "last_operation"}
         }
         expired = state["mode"] != "open" and _parse_timestamp(
             state["expires_at"], "expires_at"
-        ) <= self.clock()
+        ) <= now
         view["effective_mode"] = "expired" if expired else state["mode"]
         view["workers"] = sorted(
             ({key: value for key, value in worker.items() if key != "token"}
@@ -364,21 +390,23 @@ class SpawnControl:
         return view
 
     def status(self, *, _already_locked: bool = False) -> dict:
+        now = self._now()
         if _already_locked:
-            return self._view(self._load())
+            return self._view(self._load(now=now), now=now)
         with self._locked():
-            return self._view(self._load())
+            return self._view(self._load(now=now), now=now)
 
     def check_open(self) -> dict:
         """Fail closed without registering a worker, for early launcher preflight."""
         with self._locked():
-            state = self._load()
+            now = self._now()
+            state = self._load(now=now)
             if state["mode"] != "open":
-                effective = self._view(state)["effective_mode"]
+                effective = self._view(state, now=now)["effective_mode"]
                 raise ControlDeniedError(
                     f"new Pi worker creation denied: control mode is {effective}"
                 )
-            return self._view(state)
+            return self._view(state, now=now)
 
     @staticmethod
     def _ttl(ttl_seconds: int) -> int:
@@ -414,12 +442,12 @@ class SpawnControl:
             "expected_fence": expected_fence,
         }
         with self._locked():
-            state = self._load()
+            now = self._now()
+            state = self._load(now=now)
             if _request_matches(state["last_operation"], operation):
-                return self._view(state)
+                return self._view(state, now=now)
             if state["mode"] != "open" or state["fence"] != expected_fence:
                 raise ControlDeniedError("Pi spawn control is already owned or the fence is stale")
-            now = self.clock()
             operation["applied_at"] = _timestamp(now)
             state.update(
                 mode=mode,
@@ -432,7 +460,7 @@ class SpawnControl:
                 last_operation=operation,
             )
             self._write(state)
-            return self._view(state)
+            return self._view(state, now=now)
 
     def renew(self, *, owner: str, fence: int, ttl_seconds: int) -> dict:
         owner = _checked_token("owner", owner)
@@ -445,10 +473,10 @@ class SpawnControl:
             "ttl_seconds": ttl_seconds,
         }
         with self._locked():
-            state = self._load()
-            now = self.clock()
+            now = self._now()
+            state = self._load(now=now)
             if _request_matches(state["last_operation"], request):
-                return self._view(state)
+                return self._view(state, now=now)
             if state["mode"] == "open" or state["owner"] != owner or state["fence"] != fence:
                 raise ControlDeniedError("Pi spawn renewal owner or fence is stale")
             if _parse_timestamp(state["expires_at"], "expires_at") <= now:
@@ -465,19 +493,20 @@ class SpawnControl:
             state["updated_at"] = _timestamp(now)
             state["last_operation"] = operation
             self._write(state)
-            return self._view(state)
+            return self._view(state, now=now)
 
     def resume(self, *, owner: str, fence: int) -> dict:
         owner = _checked_token("owner", owner)
         _checked_fence(fence)
         request = {"command": "resume", "owner": owner, "fence": fence}
         with self._locked():
-            state = self._load()
+            now_value = self._now()
+            state = self._load(now=now_value)
             if _request_matches(state["last_operation"], request):
-                return self._view(state)
+                return self._view(state, now=now_value)
             if state["mode"] == "open" or state["owner"] != owner or state["fence"] != fence:
                 raise ControlDeniedError("Pi spawn resume owner or fence is stale")
-            now = _timestamp(self.clock())
+            now = _timestamp(now_value)
             operation = {
                 **request,
                 "mode": state["mode"],
@@ -497,7 +526,7 @@ class SpawnControl:
                 last_operation=operation,
             )
             self._write(state)
-            return self._view(state)
+            return self._view(state, now=now_value)
 
     def reserve(self, worker_id: str, *, actor: str, scope: str, kind: str) -> Reservation:
         worker_id = _checked_token("worker_id", worker_id)
@@ -506,9 +535,10 @@ class SpawnControl:
         if kind not in {"process", "tmux"}:
             raise ValueError("kind must be process or tmux")
         with self._locked():
-            state = self._load()
+            now = self._now()
+            state = self._load(now=now)
             if state["mode"] != "open":
-                effective = self._view(state)["effective_mode"]
+                effective = self._view(state, now=now)["effective_mode"]
                 raise ControlDeniedError(
                     f"new Pi worker creation denied: control mode is {effective}"
                 )
@@ -521,26 +551,45 @@ class SpawnControl:
                 "scope": scope,
                 "kind": kind,
                 "token": token,
-                "reserved_at": _timestamp(self.clock()),
+                "reserved_at": _timestamp(now),
             }
-            state["updated_at"] = _timestamp(self.clock())
+            state["updated_at"] = _timestamp(now)
             self._write(state)
-            return Reservation(worker_id=worker_id, token=token, fence=state["fence"])
+            return Reservation(
+                worker_id=worker_id,
+                token=token,
+                fence=state["fence"],
+                state_hash=_state_hash(state),
+            )
+
+    def validate_reservation(self, reservation: Reservation) -> None:
+        """Revalidate persisted state immediately before a process or tmux mutation."""
+        with self._locked():
+            now = self._now()
+            state = self._load(now=now)
+            worker = state["workers"].get(reservation.worker_id)
+            if (
+                worker is None
+                or worker["token"] != reservation.token
+                or _state_hash(state) != reservation.state_hash
+            ):
+                raise ControlDeniedError("Pi worker reservation is stale")
 
     def finish(self, worker_id: str, *, token: str) -> dict:
         worker_id = _checked_token("worker_id", worker_id)
         token = _checked_token("token", token)
         with self._locked():
-            state = self._load()
+            now = self._now()
+            state = self._load(now=now)
             worker = state["workers"].get(worker_id)
             if worker is None:
-                return self._view(state)
+                return self._view(state, now=now)
             if worker["token"] != token:
                 raise ControlDeniedError("Pi worker completion token is stale")
             del state["workers"][worker_id]
-            state["updated_at"] = _timestamp(self.clock())
+            state["updated_at"] = _timestamp(now)
             self._write(state)
-            return self._view(state)
+            return self._view(state, now=now)
 
     def guarded_run(
         self,
@@ -557,6 +606,7 @@ class SpawnControl:
             raise ValueError("argv must contain nonempty strings")
         reservation = self.reserve(worker_id, actor=actor, scope=scope, kind=kind)
         try:
+            self.validate_reservation(reservation)
             return (runner or subprocess.run)(list(argv), **kwargs)
         finally:
             self.finish(worker_id, token=reservation.token)

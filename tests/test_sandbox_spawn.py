@@ -171,6 +171,36 @@ def test_pi_pause_race_at_final_boundary_denies_worker_process(monkeypatch):
     )
 
 
+def test_pi_worker_time_replacement_at_final_boundary_denies_worker_process(monkeypatch):
+    calls = []
+    original_validate = SpawnControl.validate_reservation
+
+    def replace_before_validate(control, reservation):
+        control.reserve(
+            "interloper", actor="other-pool", scope="pi:all", kind="process"
+        )
+        return original_validate(control, reservation)
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+    sandbox = Sandbox(live_execution=True)
+    monkeypatch.setattr(sandbox, "_ensure_capable", lambda spec: None)
+    monkeypatch.setattr(sandbox, "_wait_for_proxy", lambda name: None)
+    monkeypatch.setattr(SpawnControl, "validate_reservation", replace_before_validate)
+    monkeypatch.setattr("skharness.autocode.sandbox.subprocess.run", fake_run)
+
+    with pytest.raises(HarnessUnavailable):
+        sandbox.spawn(_spec())
+
+    assert not any(
+        call[:2] == ["docker", "run"]
+        and any(str(item).startswith("sbxrun-") for item in call)
+        for call in calls
+    )
+
+
 def test_image_preflight_fails_clearly_when_required_test_command_is_absent(monkeypatch):
     def fake_run(argv, **kwargs):
         class Result:
