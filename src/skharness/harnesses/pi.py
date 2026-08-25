@@ -33,6 +33,7 @@ from skharness.harnesses.claude_code import ClaudeCodeHarness, parse_windows
 _HARNESS = "pi"
 _DEFAULT_MODEL = "sk-codex"
 _DEFAULT_MAX_TOKENS = 131072
+_LOCAL_API_KEY = "sk-local"
 
 
 def parse_pi_json_line(line: str, *, ts: float = 0.0) -> list[SessionEvent]:
@@ -87,20 +88,20 @@ class PiHarness(ClaudeCodeHarness):
         pi_bin: str = "pi",
         default_model: str = _DEFAULT_MODEL,
         gateway_base: str | None = None,
-        gateway_api_key: str | None = None,
         max_tokens: int = _DEFAULT_MAX_TOKENS,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self.pi_bin = pi_bin
         self.default_model = self._model_name(default_model)
-        self.pi_gateway_base = gateway_base or os.environ.get(
-            "SKCODE_PI_GATEWAY_BASE",
-            os.environ.get("SKCODE_GATEWAY_BASE", "http://localhost:18780/v1"),
-        )
-        self.pi_gateway_api_key = gateway_api_key or os.environ.get(
-            "SKCODE_GATEWAY_TOKEN", "sk-local"
-        )
+        self.pi_gateway_base = (
+            gateway_base or os.environ.get("SKCODE_PI_GATEWAY_BASE", "")
+        ).strip()
+        if not self.pi_gateway_base:
+            raise ValueError(
+                "PiHarness gateway route is required: pass gateway_base or set "
+                "SKCODE_PI_GATEWAY_BASE"
+            )
         self.max_tokens = int(max_tokens)
 
     @staticmethod
@@ -183,7 +184,9 @@ class PiHarness(ClaudeCodeHarness):
                 "skgw": {
                     "baseUrl": self.pi_gateway_base,
                     "api": "openai-completions",
-                    "apiKey": self.pi_gateway_api_key,
+                    # The deployed local route uses Pi's required non-secret
+                    # placeholder. Never persist a caller token in the worktree.
+                    "apiKey": _LOCAL_API_KEY,
                     "compat": {"supportsDeveloperRole": False},
                     "headers": {
                         "x-agent-id": agent,
@@ -234,7 +237,7 @@ class PiHarness(ClaudeCodeHarness):
             "--model",
             f"skgw/{model_name}",
             "--api-key",
-            self.pi_gateway_api_key,
+            _LOCAL_API_KEY,
         ]
 
     async def _stream_structured(self, sid: str) -> AsyncIterator[SessionEvent]:

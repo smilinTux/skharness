@@ -61,7 +61,13 @@ def git_ok():
     return runner, calls
 
 
-def harness(tmp_path: Path, *, repo: Path | None = None, full_agent: str = "pi-worker"):
+def harness(
+    tmp_path: Path,
+    *,
+    repo: Path | None = None,
+    full_agent: str = "pi-worker",
+    **pi_kwargs,
+):
     repo = repo or tmp_path / "repo"
     repo.mkdir(exist_ok=True)
     tmux = FakeTmux()
@@ -76,9 +82,9 @@ def harness(tmp_path: Path, *, repo: Path | None = None, full_agent: str = "pi-w
         full_agent=full_agent,
         full_home=tmp_path / "home",
         child_path="/usr/bin:/bin",
-        gateway_base="http://chiap01.example:18780/v1",
-        gateway_api_key="synthetic-test-key",
+        gateway_base="http://chiap01.example:18790/v1",
         default_model="sk-codex",
+        **pi_kwargs,
     )
     return value, tmux, git_calls, repo
 
@@ -106,7 +112,7 @@ def assert_no_machine_touch(tmux: FakeTmux, git_calls: list[list[str]]) -> None:
 
 
 def test_is_session_plane_harness_and_reuses_guarded_lifecycle():
-    value = PiHarness(runner=lambda _argv: "", gateway_api_key="synthetic-test-key")
+    value = PiHarness(runner=lambda _argv: "", gateway_base="http://gateway.test/v1")
     assert isinstance(value, Harness)
     assert value.name == "pi"
     assert value.capabilities()["session_plane"] is True
@@ -200,8 +206,9 @@ async def test_spawn_builds_isolated_pi_routing_and_attribution_config(tmp_path)
     assert config_dir == tmp_path / "worktrees" / session.sid / ".pi-coding-agent"
     config = json.loads((config_dir / "models.json").read_text())
     provider = config["providers"]["skgw"]
-    assert provider["baseUrl"] == "http://chiap01.example:18780/v1"
+    assert provider["baseUrl"] == "http://chiap01.example:18790/v1"
     assert provider["api"] == "openai-completions"
+    assert provider["apiKey"] == "sk-local"
     assert provider["compat"] == {"supportsDeveloperRole": False}
     assert provider["models"][0]["id"] == "sk-codex"
     assert provider["headers"] == {
@@ -214,8 +221,48 @@ async def test_spawn_builds_isolated_pi_routing_and_attribution_config(tmp_path)
     assert pi_argv[pi_argv.index("--mode") + 1] == "json"
     assert "--no-session" in pi_argv
     assert pi_argv[pi_argv.index("--model") + 1] == "skgw/sk-codex"
-    assert "--api-key" in pi_argv
+    assert pi_argv[pi_argv.index("--api-key") + 1] == "sk-local"
     assert any("worktree" in git_call and "add" in git_call for git_call in git_calls)
+
+
+@pytest.mark.asyncio
+async def test_caller_secret_is_never_persisted_or_passed_to_pi(tmp_path, monkeypatch):
+    caller_secret = "caller-secret-that-must-not-land"
+    monkeypatch.setenv("SKCODE_GATEWAY_TOKEN", caller_secret)
+    value, tmux, _git_calls, repo = harness(
+        tmp_path, gateway_token=caller_secret
+    )
+
+    session = await value.spawn(
+        SessionDescriptor(repo=str(repo), branch="main", quality="sandbox"), prompt="x"
+    )
+
+    config_path = (
+        tmp_path / "worktrees" / session.sid / ".pi-coding-agent" / "models.json"
+    )
+    persisted = config_path.read_text()
+    call = new_window(tmux.calls)
+    assert caller_secret not in persisted
+    assert caller_secret not in call
+    assert json.loads(persisted)["providers"]["skgw"]["apiKey"] == "sk-local"
+    assert call[call.index("--api-key") + 1] == "sk-local"
+
+
+def test_missing_route_is_refused(monkeypatch):
+    monkeypatch.delenv("SKCODE_PI_GATEWAY_BASE", raising=False)
+    with pytest.raises(ValueError, match="gateway route is required"):
+        PiHarness(runner=lambda _argv: "")
+
+
+def test_environment_route_is_preserved(monkeypatch):
+    monkeypatch.setenv("SKCODE_PI_GATEWAY_BASE", "http://environment.test:18790/v1")
+    value = PiHarness(runner=lambda _argv: "")
+    assert value.pi_gateway_base == "http://environment.test:18790/v1"
+
+
+def test_explicit_effective_route_is_preserved():
+    value = PiHarness(runner=lambda _argv: "", gateway_base="http://gateway.test:29999/v1")
+    assert value.pi_gateway_base == "http://gateway.test:29999/v1"
 
 
 def test_parse_assistant_message_end_content_text():
