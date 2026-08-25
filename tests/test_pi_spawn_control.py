@@ -22,6 +22,12 @@ def control(tmp_path) -> SpawnControl:
     return SpawnControl(tmp_path / "pi-spawn.json", clock=lambda: NOW)
 
 
+def rewrite_state(gate: SpawnControl, mutate) -> None:
+    state = json.loads(gate.path.read_text(encoding="utf-8"))
+    mutate(state)
+    gate.path.write_text(json.dumps(state), encoding="utf-8")
+
+
 def test_missing_and_malformed_state_fail_closed(tmp_path):
     gate = control(tmp_path)
     with pytest.raises(StateUnavailableError):
@@ -44,6 +50,173 @@ def test_unknown_operation_shape_fails_closed(tmp_path):
     gate.path.chmod(0o600)
     with pytest.raises(StateUnavailableError):
         gate.status()
+
+
+def test_pause_replay_rejects_open_state_and_cannot_reserve(tmp_path):
+    gate = control(tmp_path)
+    gate.bootstrap(actor="installer")
+    state = json.loads(gate.path.read_text(encoding="utf-8"))
+    state["last_operation"] = {
+        "command": "pause",
+        "owner": "operator-a",
+        "reason": "reserve canary",
+        "scope": "pi:all",
+        "ttl_seconds": 300,
+        "expected_fence": 0,
+    }
+    gate.path.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(StateUnavailableError):
+        gate.pause(
+            mode="pause",
+            owner="operator-a",
+            reason="reserve canary",
+            scope="pi:all",
+            ttl_seconds=300,
+            expected_fence=0,
+        )
+    with pytest.raises(StateUnavailableError):
+        gate.reserve("worker-bypass", actor="wave", scope="pi:all", kind="process")
+
+
+def test_status_rejects_resume_record_with_mismatched_fence(tmp_path):
+    gate = control(tmp_path)
+    gate.bootstrap(actor="installer")
+    state = json.loads(gate.path.read_text(encoding="utf-8"))
+    state["last_operation"] = {"command": "resume", "owner": "operator-a", "fence": 99}
+    gate.path.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(StateUnavailableError):
+        gate.status()
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda state: state.update(mode="open", owner=None, reason=None, scope=None, expires_at=None),
+        lambda state: state.update(fence=0),
+        lambda state: state.update(fence=2),
+        lambda state: state.update(owner="other-owner"),
+        lambda state: state.update(reason="other reason"),
+        lambda state: state.update(scope="pi:other"),
+        lambda state: state.update(expires_at="2026-08-25T15:05:01Z"),
+        lambda state: state["last_operation"].update(applied_at="2026-08-25T15:00:01Z"),
+    ],
+)
+def test_pause_history_mismatch_fails_closed(tmp_path, mutate):
+    gate = control(tmp_path)
+    gate.bootstrap(actor="installer")
+    gate.pause(
+        mode="pause",
+        owner="operator-a",
+        reason="reserve canary",
+        scope="pi:all",
+        ttl_seconds=300,
+        expected_fence=0,
+    )
+    rewrite_state(gate, mutate)
+
+    with pytest.raises(StateUnavailableError):
+        gate.status()
+    with pytest.raises(StateUnavailableError):
+        gate.reserve("worker-bypass", actor="wave", scope="pi:all", kind="process")
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda state: state.update(mode="drain"),
+        lambda state: state.update(fence=1),
+        lambda state: state.update(fence=3),
+        lambda state: state.update(owner="other-owner"),
+        lambda state: state.update(reason="other reason"),
+        lambda state: state.update(expires_at="2026-08-25T15:10:01Z"),
+        lambda state: state["last_operation"].update(mode="drain"),
+        lambda state: state["last_operation"].update(scope="pi:other"),
+    ],
+)
+def test_renew_history_mismatch_fails_closed(tmp_path, mutate):
+    gate = control(tmp_path)
+    gate.bootstrap(actor="installer")
+    gate.pause(
+        mode="pause",
+        owner="operator-a",
+        reason="reserve canary",
+        scope="pi:all",
+        ttl_seconds=300,
+        expected_fence=0,
+    )
+    gate.renew(owner="operator-a", fence=1, ttl_seconds=600)
+    rewrite_state(gate, mutate)
+
+    with pytest.raises(StateUnavailableError):
+        gate.status()
+
+
+def test_strict_replay_rejects_changed_bootstrap_renew_and_resume(tmp_path):
+    gate = control(tmp_path)
+    gate.bootstrap(actor="installer")
+    with pytest.raises(ControlDeniedError):
+        gate.bootstrap(actor="other-installer")
+
+    gate.pause(
+        mode="drain",
+        owner="operator-a",
+        reason="reserve canary",
+        scope="pi:all",
+        ttl_seconds=300,
+        expected_fence=0,
+    )
+    gate.renew(owner="operator-a", fence=1, ttl_seconds=600)
+    before = gate.path.read_bytes()
+    with pytest.raises(ControlDeniedError):
+        gate.renew(owner="operator-a", fence=1, ttl_seconds=601)
+    assert gate.path.read_bytes() == before
+
+    gate.resume(owner="operator-a", fence=2)
+    before = gate.path.read_bytes()
+    with pytest.raises(ControlDeniedError):
+        gate.resume(owner="other-owner", fence=2)
+    with pytest.raises(ControlDeniedError):
+        gate.resume(owner="operator-a", fence=1)
+    assert gate.path.read_bytes() == before
+
+
+def test_valid_replay_survives_worker_registry_updates(tmp_path):
+    gate = control(tmp_path)
+    gate.bootstrap(actor="installer")
+    reservation = gate.reserve("worker-a", actor="pool", scope="pi:all", kind="process")
+    assert gate.bootstrap(actor="installer")["workers"][0]["worker_id"] == "worker-a"
+    paused = gate.pause(
+        mode="drain",
+        owner="operator-a",
+        reason="reserve canary",
+        scope="pi:all",
+        ttl_seconds=300,
+        expected_fence=0,
+    )
+    gate.finish("worker-a", token=reservation.token)
+    replay = gate.pause(
+        mode="drain",
+        owner="operator-a",
+        reason="reserve canary",
+        scope="pi:all",
+        ttl_seconds=300,
+        expected_fence=0,
+    )
+    assert replay["fence"] == paused["fence"]
+    assert replay["workers"] == []
+
+
+def test_legacy_partial_history_requires_fresh_bootstrap_state(tmp_path):
+    gate = control(tmp_path)
+    gate.bootstrap(actor="installer")
+    rewrite_state(gate, lambda state: state["last_operation"].pop("applied_at"))
+    with pytest.raises(StateUnavailableError):
+        gate.status()
+
+    replacement = control(tmp_path / "replacement")
+    assert replacement.bootstrap(actor="installer")["mode"] == "open"
 
 
 def test_bootstrap_pause_drain_status_renew_expiry_and_resume(tmp_path):

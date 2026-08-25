@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Sequence
 
-SCHEMA = "skharness.pi-spawn-control.v1"
+SCHEMA = "skharness.pi-spawn-control.v2"
 MAX_TTL_SECONDS = 3600
 CONTROL_SCOPE = "pi:all"
 _TOKEN = re.compile(r"\A[A-Za-z0-9._:@/+-]{1,200}\Z")
@@ -113,10 +113,11 @@ def _validate_operation(operation: object) -> None:
         raise StateUnavailableError("Pi spawn last operation is malformed")
     command = operation["command"]
     try:
-        if command == "bootstrap" and set(operation) == {"command", "actor"}:
+        if command == "bootstrap" and set(operation) == {"command", "actor", "applied_at"}:
             _checked_token("actor", operation["actor"])
         elif command in {"pause", "drain"} and set(operation) == {
-            "command", "owner", "reason", "scope", "ttl_seconds", "expected_fence"
+            "command", "owner", "reason", "scope", "ttl_seconds", "expected_fence",
+            "applied_at",
         }:
             _checked_token("owner", operation["owner"])
             _checked_reason(operation["reason"])
@@ -124,18 +125,37 @@ def _validate_operation(operation: object) -> None:
             SpawnControl._ttl(operation["ttl_seconds"])
             _checked_fence(operation["expected_fence"], "expected_fence")
         elif command == "renew" and set(operation) == {
-            "command", "owner", "fence", "ttl_seconds"
+            "command", "owner", "fence", "ttl_seconds", "mode", "reason", "scope",
+            "applied_at",
         }:
             _checked_token("owner", operation["owner"])
             _checked_fence(operation["fence"])
             SpawnControl._ttl(operation["ttl_seconds"])
-        elif command == "resume" and set(operation) == {"command", "owner", "fence"}:
+            if operation["mode"] not in {"pause", "drain"}:
+                raise ValueError("invalid mode")
+            _checked_reason(operation["reason"])
+            _checked_scope(operation["scope"])
+        elif command == "resume" and set(operation) == {
+            "command", "owner", "fence", "mode", "reason", "scope", "expires_at",
+            "applied_at",
+        }:
             _checked_token("owner", operation["owner"])
             _checked_fence(operation["fence"])
+            if operation["mode"] not in {"pause", "drain"}:
+                raise ValueError("invalid mode")
+            _checked_reason(operation["reason"])
+            _checked_scope(operation["scope"])
         else:
             raise ValueError("unsupported operation")
+        _parse_timestamp(operation["applied_at"], "last_operation.applied_at")
+        if command == "resume":
+            _parse_timestamp(operation["expires_at"], "last_operation.expires_at")
     except ValueError as exc:
         raise StateUnavailableError("Pi spawn last operation is malformed") from exc
+
+
+def _request_matches(operation: dict, request: dict) -> bool:
+    return all(operation.get(key) == value for key, value in request.items())
 
 
 class SpawnControl:
@@ -190,8 +210,11 @@ class SpawnControl:
             _checked_fence(raw["fence"])
         except ValueError as exc:
             raise StateUnavailableError("Pi spawn decision has an invalid fence") from exc
-        _parse_timestamp(raw["created_at"], "created_at")
-        _parse_timestamp(raw["updated_at"], "updated_at")
+        created_at = _parse_timestamp(raw["created_at"], "created_at")
+        updated_at = _parse_timestamp(raw["updated_at"], "updated_at")
+        now = self.clock()
+        if created_at > updated_at or updated_at > now:
+            raise StateUnavailableError("Pi spawn decision has inconsistent timestamps")
         if raw["mode"] == "open":
             if any(raw[name] is not None for name in ("owner", "reason", "scope", "expires_at")):
                 raise StateUnavailableError("open Pi spawn decision retains control authority")
@@ -211,6 +234,48 @@ class SpawnControl:
         if not isinstance(raw["workers"], dict):
             raise StateUnavailableError("Pi spawn worker registry is malformed")
         _validate_operation(raw["last_operation"])
+        operation = raw["last_operation"]
+        applied_at = _parse_timestamp(operation["applied_at"], "last_operation.applied_at")
+        if applied_at < created_at or applied_at > updated_at or applied_at > now:
+            raise StateUnavailableError("Pi spawn last operation has inconsistent time")
+        command = operation["command"]
+        if command == "bootstrap":
+            valid = (
+                raw["mode"] == "open"
+                and raw["fence"] == 0
+                and all(raw[name] is None for name in ("owner", "reason", "scope", "expires_at"))
+                and applied_at == created_at
+            )
+        elif command in {"pause", "drain"}:
+            valid = (
+                raw["mode"] == command
+                and raw["fence"] == operation["expected_fence"] + 1
+                and raw["owner"] == operation["owner"]
+                and raw["reason"] == operation["reason"]
+                and raw["scope"] == operation["scope"]
+                and _parse_timestamp(raw["expires_at"], "expires_at")
+                == applied_at + timedelta(seconds=operation["ttl_seconds"])
+            )
+        elif command == "renew":
+            valid = (
+                raw["mode"] == operation["mode"]
+                and raw["fence"] == operation["fence"] + 1
+                and raw["owner"] == operation["owner"]
+                and raw["reason"] == operation["reason"]
+                and raw["scope"] == operation["scope"]
+                and _parse_timestamp(raw["expires_at"], "expires_at")
+                == applied_at + timedelta(seconds=operation["ttl_seconds"])
+            )
+        else:
+            valid = (
+                raw["mode"] == "open"
+                and raw["fence"] == operation["fence"] + 1
+                and all(raw[name] is None for name in ("owner", "reason", "scope", "expires_at"))
+                and _parse_timestamp(operation["expires_at"], "last_operation.expires_at")
+                > created_at
+            )
+        if not valid:
+            raise StateUnavailableError("Pi spawn last operation is inconsistent with state")
         for worker_id, worker in raw["workers"].items():
             if not isinstance(worker, dict) or set(worker) != _WORKER_KEYS:
                 raise StateUnavailableError("Pi spawn worker record is malformed")
@@ -259,7 +324,12 @@ class SpawnControl:
         _checked_token("actor", actor)
         with self._locked(bootstrap=True):
             if self.path.exists():
-                return self.status(_already_locked=True)
+                state = self._load()
+                if not _request_matches(
+                    state["last_operation"], {"command": "bootstrap", "actor": actor}
+                ):
+                    raise ControlDeniedError("Pi spawn bootstrap replay does not match state")
+                return self._view(state)
             now = _timestamp(self.clock())
             state = {
                 "schema": SCHEMA,
@@ -271,7 +341,7 @@ class SpawnControl:
                 "created_at": now,
                 "expires_at": None,
                 "updated_at": now,
-                "last_operation": {"command": "bootstrap", "actor": actor},
+                "last_operation": {"command": "bootstrap", "actor": actor, "applied_at": now},
                 "workers": {},
             }
             self._write(state)
@@ -345,11 +415,12 @@ class SpawnControl:
         }
         with self._locked():
             state = self._load()
-            if state["last_operation"] == operation:
+            if _request_matches(state["last_operation"], operation):
                 return self._view(state)
             if state["mode"] != "open" or state["fence"] != expected_fence:
                 raise ControlDeniedError("Pi spawn control is already owned or the fence is stale")
             now = self.clock()
+            operation["applied_at"] = _timestamp(now)
             state.update(
                 mode=mode,
                 fence=state["fence"] + 1,
@@ -367,7 +438,7 @@ class SpawnControl:
         owner = _checked_token("owner", owner)
         _checked_fence(fence)
         ttl_seconds = self._ttl(ttl_seconds)
-        operation = {
+        request = {
             "command": "renew",
             "owner": owner,
             "fence": fence,
@@ -376,12 +447,19 @@ class SpawnControl:
         with self._locked():
             state = self._load()
             now = self.clock()
-            if state["last_operation"] == operation:
+            if _request_matches(state["last_operation"], request):
                 return self._view(state)
             if state["mode"] == "open" or state["owner"] != owner or state["fence"] != fence:
                 raise ControlDeniedError("Pi spawn renewal owner or fence is stale")
             if _parse_timestamp(state["expires_at"], "expires_at") <= now:
                 raise ControlDeniedError("expired Pi spawn control cannot be renewed")
+            operation = {
+                **request,
+                "mode": state["mode"],
+                "reason": state["reason"],
+                "scope": state["scope"],
+                "applied_at": _timestamp(now),
+            }
             state["fence"] += 1
             state["expires_at"] = _timestamp(now + timedelta(seconds=ttl_seconds))
             state["updated_at"] = _timestamp(now)
@@ -392,14 +470,22 @@ class SpawnControl:
     def resume(self, *, owner: str, fence: int) -> dict:
         owner = _checked_token("owner", owner)
         _checked_fence(fence)
-        operation = {"command": "resume", "owner": owner, "fence": fence}
+        request = {"command": "resume", "owner": owner, "fence": fence}
         with self._locked():
             state = self._load()
-            if state["last_operation"] == operation:
+            if _request_matches(state["last_operation"], request):
                 return self._view(state)
             if state["mode"] == "open" or state["owner"] != owner or state["fence"] != fence:
                 raise ControlDeniedError("Pi spawn resume owner or fence is stale")
             now = _timestamp(self.clock())
+            operation = {
+                **request,
+                "mode": state["mode"],
+                "reason": state["reason"],
+                "scope": state["scope"],
+                "expires_at": state["expires_at"],
+                "applied_at": now,
+            }
             state.update(
                 mode="open",
                 fence=state["fence"] + 1,

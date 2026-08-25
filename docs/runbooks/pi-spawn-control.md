@@ -6,8 +6,8 @@ boundary. Direct `pi`, `tmux`, or temporary launcher execution is unsupported.
 ## Supported entrypoints
 
 - SKHarness autocode and arena Pi runs pass through `Sandbox.spawn`, which
-  reserves the worker before any Docker network, proxy, or worker process is
-  created.
+  checks the control before Docker setup, then reserves immediately before the
+  worker container mutation.
 - `scripts/pi-cockpit.sh` runs every tmux creation and every worker command
   through `skharness-pi-launch`.
 - Rolling pool controllers, wave launchers, repair launchers, and retry
@@ -32,6 +32,11 @@ skharness-pi-spawn-control --state "$SKHARNESS_PI_SPAWN_STATE" \
 
 Bootstrap is atomic and idempotent. A missing, unreadable, malformed, or
 unsupported state denies new Pi creation. There is no implicit open fallback.
+Every control transition records its application time and complete semantic
+postcondition. Status and worker reservation reject inconsistent history.
+Version 1 state is not migrated in place. Before first activation of this
+undeployed version 2 contract, bootstrap a fresh state path and retain any old
+state only as inert evidence.
 
 ## Reserve a window
 
