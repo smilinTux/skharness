@@ -38,6 +38,9 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ### Added
 
+- Added a guarded Pi session-plane harness for lane-1 pools, with explicit
+  SKGateway routing, attributed JSON event streams, and transcript-first teardown.
+
 - Added a versioned lane 2 rolling-target autoscale policy (card `d9f8f889`) that
   observes live per-host capacity through `autoscale.resolve`, parks scale proposals
   outside a safe band, and drives only the existing `PoolController.scale` primitive
