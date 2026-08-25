@@ -38,6 +38,18 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ### Added
 
+- Added a versioned lane 2 rolling-target autoscale policy (card `d9f8f889`) that
+  observes live per-host capacity through `autoscale.resolve`, parks scale proposals
+  outside a safe band, and drives only the existing `PoolController.scale` primitive
+  after explicit authorization. Scale-down requires exact-target, host, pane, evidence,
+  and parent-card preflight facts before the primitive runs, then verifies transcript
+  archive receipts. Optional horizontal placement uses the `skcapstone.fleet` scheduler's
+  live allocatable headroom when the fleet is functional and otherwise returns an
+  evidence-backed blocker. The 2026-08-25 chi fleet finding is blocked: the package
+  imports on chiap01, chiap02, chiap03, and chiap08, but self names are
+  `node-chiapXX` while the roster uses `chiapXX`, every roster view is `Dead`, and
+  heartbeat age is about 183,475 seconds, leaving zero `Ready` nodes.
+
 - Added `scripts/pi-cockpit.sh`, a tmux-driven MANUAL cockpit for driving
   `EngineeringExecutor` (the real twin-gated worktree/build/grade/finalize engine) by
   hand, one card per pane, while `fleet_dispatch` is frozen (card P6 / `08963fbb`).
