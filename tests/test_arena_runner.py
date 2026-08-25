@@ -56,24 +56,39 @@ class ScriptedSupervisor:
         self.cancelled = True
 
 
+class StateObservingController(ArenaController):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.worker_thread_id = None
+        self.state_attempted = threading.Event()
+
+    def state(self, experiment_id, attempt=1):
+        if threading.get_ident() == self.worker_thread_id:
+            self.state_attempted.set()
+        return super().state(experiment_id, attempt)
+
+
 class BlockingSupervisor(ScriptedSupervisor):
-    def __init__(self):
+    def __init__(self, controller):
         super().__init__(exit_code=143)
+        self.controller = controller
         self.started = threading.Event()
         self.stopped = threading.Event()
 
     def run(self, spec, attempt_dir, timeout_s):
         self.started.set()
-        self.stopped.wait(2)
+        assert self.stopped.wait(5)
+        self.controller.worker_thread_id = threading.get_ident()
         return 143, "exit"
 
     def cancel(self):
         self.cancelled = True
         self.stopped.set()
+        assert self.controller.state_attempted.wait(5)
 
 
-def _controller(tmp_path, scheduler=None):
-    return ArenaController(
+def _controller(tmp_path, scheduler=None, *, controller_type=ArenaController):
+    return controller_type(
         ArenaStore(tmp_path / "store"),
         scheduler or LeaseScheduler(ResourceRequest(cpu=2, ram_gb=4, gateway_slots=2)),
         writer_id="runner",
@@ -602,19 +617,26 @@ def test_cancel_calls_real_supervisor_seam_before_durable_cancel(tmp_path):
 
 
 def test_cancel_racing_process_exit_does_not_overwrite_terminal_state(tmp_path):
-    controller = _controller(tmp_path)
+    controller = _controller(tmp_path, controller_type=StateObservingController)
     controller.propose("experiment")
-    supervisor = BlockingSupervisor()
+    supervisor = BlockingSupervisor(controller)
     runner = PiExperimentRunner(controller, supervisor, tmp_path / "runs")
     outcomes = []
-    thread = threading.Thread(
-        target=lambda: outcomes.append(runner.execute(_request(), _spec(tmp_path)))
-    )
+    errors = []
+
+    def execute():
+        try:
+            outcomes.append(runner.execute(_request(), _spec(tmp_path)))
+        except BaseException as exc:  # surface thread failures in the test thread
+            errors.append(exc)
+
+    thread = threading.Thread(target=execute)
     thread.start()
-    assert supervisor.started.wait(1)
+    assert supervisor.started.wait(5)
     runner.cancel("experiment")
-    thread.join(2)
+    thread.join(5)
     assert not thread.is_alive()
+    assert errors == []
     assert outcomes[0].classification == "cancelled"
     assert controller.state("experiment") is ExperimentState.CANCELLED
 

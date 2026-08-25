@@ -78,8 +78,13 @@ class ArenaController:
         ]
 
     def state(self, experiment_id: str, attempt: int = 1) -> ExperimentState | None:
-        events = self._events(experiment_id, attempt)
-        return events[-1].to_state if events else None
+        # A state observation participates in the same ordering as a transition.
+        # In particular, cancel holds this lock across supervisor stop + CANCELLED;
+        # the process-exit path must not observe RUNNING in that interval and then
+        # attempt a stale terminal transition after cancellation wins.
+        with self._transition_lock:
+            events = self._events(experiment_id, attempt)
+            return events[-1].to_state if events else None
 
     def _append(
         self,
