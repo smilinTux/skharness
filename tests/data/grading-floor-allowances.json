@@ -58,6 +58,25 @@
         "to buckets.py in general, and do not re-point the blob at a later",
         "revision without reading the new diff and writing a new reason."
       ]
+    },
+    {
+      "path": "tests/data/joule-economy-golden-set-v1.json",
+      "blob": "6881d00aec2f10ec49aff07bb34c701b7bcc396d",
+      "card": "bb34462f",
+      "recorded_by": "lumina, verdict-correction pass, 2026-08-26",
+      "human_signoff": "APPROVED by Chef 2026-08-26, card bb34462f. Asked for an assessment and approved acting on it. Assessment recorded: the diff adds exactly one line, a schema discriminator \"skharness.joule-economy-golden-set.v1\". Card count is 42 before and after, and zero lines touch size, risk, model_class or why. No grading judgment is altered. The discriminator is what makes the v1-cannot-be-promoted-into-v2 rule enforceable by schema rather than convention, which is this card's fourth acceptance criterion, so the change strengthens the floor it is asking permission to touch.",
+      "reason": [
+        "Card bb34462f adds one top-level schema discriminator to the retained",
+        "v1 golden-set document. All 42 card records are unchanged.",
+        "",
+        "The discriminator lets the loader reject this v1 fixture whenever v2",
+        "is expected. It changes no size, risk, model_class, why, or grading",
+        "judgment. Full v2 source embedding and promotion remain in card 5e3569b9.",
+        "",
+        "SCOPE: this review covers only blob",
+        "6881d00aec2f10ec49aff07bb34c701b7bcc396d. Any later content",
+        "change requires a fresh review and content pin."
+      ]
     }
   ]
 }
