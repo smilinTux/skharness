@@ -9,6 +9,10 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ## [Unreleased]
 
+- Added an empty, promotion-only Joule Economy golden-set v2 boundary. Candidate
+  creation embeds and hashes exact source text, only ratified entries can gate,
+  and v1 entries fail the v2 promotion schema (card `5e3569b9`).
+
 - Marked the Joule Economy golden set as an explicit v1 schema, enforced that
   boundary in its test loader, and clarified that its retained 42 entries test
   class derivation rather than grader judgment (card `bb34462f`).
