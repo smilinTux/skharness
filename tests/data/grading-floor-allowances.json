@@ -77,6 +77,24 @@
         "6881d00aec2f10ec49aff07bb34c701b7bcc396d. Any later content",
         "change requires a fresh review and content pin."
       ]
+    },
+    {
+      "path": "tests/data/joule-economy-golden-set-v2.json",
+      "blob": "b3f1f6ad86452b0bdb5cbd9ebdff7702847ae340",
+      "card": "5e3569b9",
+      "recorded_by": "lumina, golden-set-v2 review, 2026-08-26",
+      "human_signoff": "APPROVED by Chef 2026-08-26, card 5e3569b9. Asked for an assessment and approved acting on it. Assessment recorded: the new file contains only schema \"skharness.joule-economy-golden-set.v2\" and an empty entries list. Git blob is b3f1f6ad86452b0bdb5cbd9ebdff7702847ae340 and SHA256 is 0295813b0b6df167c3660f5f0953a45e833e88450f08bd0dbda9d42483b0cbc7. No grading judgment, source text, candidate or signoff is present. It starts v2 empty and prevents v1 entries from satisfying the v2 schema. Approval covers this exact blob only.",
+      "reason": [
+        "Card 5e3569b9 creates the empty v2 golden-set document. It contains",
+        "only the exact v2 schema discriminator and an empty entries list.",
+        "",
+        "No grading judgment, source, candidate, or signoff is present. The",
+        "schema prevents v1 entries from satisfying the v2 promotion boundary.",
+        "",
+        "SCOPE: this review covers only blob",
+        "b3f1f6ad86452b0bdb5cbd9ebdff7702847ae340. Any later content",
+        "change requires a fresh review and content pin."
+      ]
     }
   ]
 }
