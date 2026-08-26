@@ -22,6 +22,9 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ### Fixed
 
+- Threaded the in-scope session and card identities through the registered Pi
+  harness factory and Pi cockpit adapter construction (card `a49d1c36`, PR #71).
+
 - Measured autoscale disk headroom on the `SKCODE_STATE_DIR/worktrees`
   filesystem, using its nearest existing ancestor before the first worker, and
   reduced concurrency to one when disk capacity cannot be measured (card
