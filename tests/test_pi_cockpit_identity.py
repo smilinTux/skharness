@@ -1,6 +1,7 @@
 """Identity wiring at the manual Pi cockpit production construction site."""
 from __future__ import annotations
 
+import ast
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,22 @@ def _config(**overrides):
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def test_main_passes_its_existing_run_and_card_names_to_the_adapter():
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_build_pi_adapter"
+    ]
+    assert len(calls) == 1
+    keywords = {keyword.arg: keyword.value for keyword in calls[0].keywords}
+    assert isinstance(keywords["session_id"], ast.Name)
+    assert keywords["session_id"].id == "run_id"
+    assert isinstance(keywords["card_id"], ast.Name)
+    assert keywords["card_id"].id == "card"
 
 
 def test_cockpit_adapter_carries_local_run_and_card_ids():
