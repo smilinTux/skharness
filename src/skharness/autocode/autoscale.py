@@ -25,7 +25,6 @@ from pathlib import Path
 # Absolute sanity ceiling: never propose more than this regardless of resources
 # (claude-code + Docker fan-out has diminishing returns and shared-API limits).
 _HARD_CEIL = 12
-_REPO_ROOT = "~/clawd/skcapstone-repos"     # where per-build worktrees are created
 
 # Per-build resource budgets (GB) used to derive the ceilings.
 _RAM_PER_BUILD_REC = 3.0
@@ -44,17 +43,23 @@ def _free_ram_gb() -> float:
     try:
         for line in Path("/proc/meminfo").read_text().splitlines():
             if line.startswith("MemAvailable:"):
-                return int(line.split()[1]) / 2**20   # kB -> GB
+                return int(line.split()[1]) / 2**20  # kB -> GB
     except Exception:
         pass
-    return 8.0                                        # optimistic fallback
+    return 8.0  # optimistic fallback
 
 
 def _free_disk_gb() -> float:
+    state = os.environ.get("SKCODE_STATE_DIR")
+    base = Path(state).expanduser() if state else Path.home() / ".skcapstone" / "skcode"
+    probe = (base / "worktrees").absolute()
+
     try:
-        return shutil.disk_usage(Path(_REPO_ROOT).expanduser()).free / 2**30
+        while not probe.exists() and probe.parent != probe:
+            probe = probe.parent
+        return shutil.disk_usage(probe).free / 2**30
     except Exception:
-        return 20.0
+        return 0.0
 
 
 def resources() -> dict:
@@ -68,15 +73,13 @@ def resources() -> dict:
 
 def _ceiling(*, aggressive: bool) -> int:
     r = resources()
-    if aggressive:                                    # "max": use most of the box
+    if aggressive:  # "max": use most of the box
         cpu = r["cores"]
         ram_per, disk_per = _RAM_PER_BUILD_MAX, _DISK_PER_BUILD_MAX
-    else:                                             # "recommended": leave headroom
-        cpu = max(1, r["cores"] - 1)                  # keep a core for the host/daemon
+    else:  # "recommended": leave headroom
+        cpu = max(1, r["cores"] - 1)  # keep a core for the host/daemon
         ram_per, disk_per = _RAM_PER_BUILD_REC, _DISK_PER_BUILD_REC
-    return max(1, min(_HARD_CEIL, cpu,
-                      int(r["ram_gb"] // ram_per),
-                      int(r["disk_gb"] // disk_per)))
+    return max(1, min(_HARD_CEIL, cpu, int(r["ram_gb"] // ram_per), int(r["disk_gb"] // disk_per)))
 
 
 def recommended() -> int:
@@ -115,7 +118,9 @@ def resolve(mode, hard_cap: int | None = None) -> int:
 def describe(mode, hard_cap: int | None = None) -> str:
     """One-line human summary of the autoscaler decision (for logs/doctor)."""
     r = resources()
-    return (f"concurrency={resolve(mode, hard_cap)} "
-            f"(mode={mode}, recommended={recommended()}, max={maximum()}, "
-            f"cap={hard_cap}) on {r['cores']} cores / {r['ram_gb']}GB RAM / "
-            f"{r['disk_gb']}GB disk")
+    return (
+        f"concurrency={resolve(mode, hard_cap)} "
+        f"(mode={mode}, recommended={recommended()}, max={maximum()}, "
+        f"cap={hard_cap}) on {r['cores']} cores / {r['ram_gb']}GB RAM / "
+        f"{r['disk_gb']}GB disk"
+    )

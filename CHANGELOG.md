@@ -14,6 +14,11 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ### Fixed
 
+- Measured autoscale disk headroom on the `SKCODE_STATE_DIR/worktrees`
+  filesystem, using its nearest existing ancestor before the first worker, and
+  reduced concurrency to one when disk capacity cannot be measured (card
+  `aab4ae95`).
+
 - Serialized Arena state observations with lifecycle transitions so a process
   exit racing an operator cancellation cannot act on stale `RUNNING` state and
   attempt to overwrite durable `CANCELLED` state (card `80dacdfd`).
