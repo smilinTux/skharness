@@ -9,6 +9,10 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ## [Unreleased]
 
+- Marked the Joule Economy golden set as an explicit v1 schema, enforced that
+  boundary in its test loader, and clarified that its retained 42 entries test
+  class derivation rather than grader judgment (card `bb34462f`).
+
 - Report absent, null, malformed, and otherwise unobservable operator condition
   values as Unknown instead of confidently healthy.
 

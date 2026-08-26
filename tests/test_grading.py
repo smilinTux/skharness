@@ -20,11 +20,20 @@ from skharness.autocode.grading import (
 )
 
 GOLDEN_SET_PATH = Path(__file__).parent / "data" / "joule-economy-golden-set-v1.json"
+GOLDEN_SET_V1_SCHEMA = "skharness.joule-economy-golden-set.v1"
+GOLDEN_SET_V2_SCHEMA = "skharness.joule-economy-golden-set.v2"
 
 
-def _load_golden_set() -> list[dict]:
-    with GOLDEN_SET_PATH.open("r", encoding="utf-8") as f:
-        return json.load(f)["cards"]
+def _load_golden_set(
+    path: Path = GOLDEN_SET_PATH, *, expected_schema: str = GOLDEN_SET_V1_SCHEMA
+) -> list[dict]:
+    with path.open("r", encoding="utf-8") as f:
+        document = json.load(f)
+    if document.get("schema") != expected_schema:
+        raise ValueError(
+            f"expected golden set schema {expected_schema!r}, got {document.get('schema')!r}"
+        )
+    return document["cards"]
 
 
 # ---------------------------------------------------------------------------
@@ -193,28 +202,32 @@ def test_parse_grade_is_total_for_non_string_input(raw):
 
 
 # ---------------------------------------------------------------------------
-# Golden set scoring harness: proves the rule agrees with hand grading before
-# any model is involved.
+# Golden set scoring harness
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "card", _load_golden_set(), ids=lambda c: f"{c['n']:02d}-{c['id']}"
-)
-def test_golden_set_class_matches_hand_grading(card):
+@pytest.mark.parametrize("card", _load_golden_set(), ids=lambda c: f"{c['n']:02d}-{c['id']}")
+def test_golden_set_class_derivation_is_consistent(card):
+    """V1 checks model_class derivation from its own size and risk labels.
+
+    It cannot test grader judgment because the 42 source cards are gone.
+    """
     # No .lower() here on purpose. The golden set stores risk in the canonical
     # lowercase enum, so normalising at read time would hide it drifting back
     # to UPPERCASE. It carried that drift once: fed to a comparison rather
     # than to set_grade(), an uppercase risk mismatches silently and 100% of
     # the time, which reads as a catastrophically miscalibrated grader rather
     # than as a format bug. test_golden_set_is_canonical guards the shape.
-    raw = json.dumps(
-        {"size": card["size"], "risk": card["risk"], "sensitivity": "internal"}
-    )
+    raw = json.dumps({"size": card["size"], "risk": card["risk"], "sensitivity": "internal"})
     grade = parse_grade(raw)
     assert grade is not None, f"card {card['n']} ({card['id']}) did not parse: {raw!r}"
     got = model_class_for(grade["size"], grade["risk"])
     assert got == card["model_class"], f"card {card['n']} ({card['id']}): {card['why']}"
+
+
+def test_golden_set_v1_cannot_pass_as_v2():
+    with pytest.raises(ValueError, match="expected golden set schema"):
+        _load_golden_set(expected_schema=GOLDEN_SET_V2_SCHEMA)
 
 
 def test_golden_set_is_canonical():
