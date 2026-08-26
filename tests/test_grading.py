@@ -210,7 +210,8 @@ def test_parse_grade_is_total_for_non_string_input(raw):
 def test_golden_set_class_derivation_is_consistent(card):
     """V1 checks model_class derivation from its own size and risk labels.
 
-    It cannot test grader judgment because the 42 source cards are gone.
+    It cannot test grader judgment because all 42 source cards no longer exist
+    anywhere on the estate.
     """
     # No .lower() here on purpose. The golden set stores risk in the canonical
     # lowercase enum, so normalising at read time would hide it drifting back
