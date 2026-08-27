@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
+from skharness.card_router import SessionAssignment
 from skharness.autoscale_policy import (
     AutoscalePolicy,
     FleetNode,
@@ -34,6 +35,13 @@ class _FakePool:
     def members(self, lane=None):
         return list(self._members)
 
+    async def scale_assignments(self, **kwargs):
+        self.events.append("scale_assignments")
+        self.scale_calls.append(kwargs)
+        for assignment in kwargs["assignments"]:
+            self._members.append(_Member(assignment.session_id))
+        return [member for member in self._members if not member.drained]
+
     async def scale(self, **kwargs):
         self.events.append("scale")
         self.scale_calls.append(kwargs)
@@ -50,6 +58,18 @@ class _FakePool:
                 }
                 member.drained = True
         return [member for member in self._members if not member.drained]
+
+
+def _assignments(count):
+    return [
+        SessionAssignment(
+            card_id=f"card-{number}", repo="/repo", base_branch="main", prompt="work",
+            agent_id=f"agent-{number}", session_id=f"agent-{number}-session",
+            worktree=f"/wt/agent-{number}-session",
+            branch=f"skcode/agent-{number}-session", claim_event_id=f"event-{number}",
+        )
+        for number in range(count)
+    ]
 
 
 def _policy(pool, headroom=12):
@@ -85,13 +105,11 @@ async def test_outside_band_proposes_then_authorized_execution_converges_fake_po
     active = await policy.execute(
         proposal,
         authorize=lambda candidate: candidate.proposal_id == proposal.proposal_id,
-        repo="/repo",
-        branch="main",
-        prompt="work",
+        assignments=_assignments(7),
     )
 
     assert len(active) == 10
-    assert pool.scale_calls[0]["target"] == 10
+    assert len(pool.scale_calls[0]["assignments"]) == 7
     assert resolve_calls == [("recommended", 12), ("recommended", 12)]
 
 

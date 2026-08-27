@@ -717,7 +717,9 @@ class ClaudeCodeHarness(Harness):
             }
 
         worktree = self.worktree_root / sid
-        env = self._build_env(ctx["profile"], ctx["agent"], worktree, ctx["model"])
+        env = self._build_env(
+            ctx["profile"], ctx["agent"], worktree, ctx["model"], ctx.get("card_id", "")
+        )
         resume = self._resume_argv(ctx["profile"], ctx["model"], session_id, text)
         env_argv = ["env", "-i", *[f"{k}={v}" for k, v in env.items()]]
         target = f"{self.tmux_session}:{sid}"
@@ -759,7 +761,7 @@ class ClaudeCodeHarness(Harness):
         return getattr(r, "returncode", 1) == 0
 
     def _build_env(self, profile: str, agent: str, worktree: Path,
-                   model: str | None = None) -> dict[str, str]:
+                   model: str | None = None, card_id: str = "") -> dict[str, str]:
         """Construct the child's ENTIRE environment for a profile (spec 6.2).
 
         Enforcement is by CONSTRUCTION, not by a flag: the returned dict is the
@@ -914,17 +916,25 @@ class ClaudeCodeHarness(Harness):
             if not self._branch_ok(branch):
                 raise SpawnRejected(f"branch {branch!r} failed git check-ref-format")
 
-        # 4. name charset. The agent prefix is the real identity for FULL and a
-        #    fixed 'sandbox' for SANDBOX (never the real identity), plus a random id.
-        agent = self.full_agent if profile == "full" else "sandbox"
+        # 4. name charset. A governed router may supply a per-assignment identity
+        #    and session id. Manual dispatch keeps the historical full/sandbox
+        #    principal behavior. Sandbox still withholds SKAGENT and MCP in
+        #    _build_env; the routed identity is used only for session attribution.
+        agent = (desc.agent_id or (
+            self.full_agent if profile == "full" else "sandbox"
+        )).strip()
         if not _SID_RE.match(agent):
             raise SpawnRejected(f"agent name {agent!r} breaks the [A-Za-z0-9_-]+ charset")
-        sid = f"{agent}-{secrets.token_hex(4)}"
+        sid = (desc.sid or f"{agent}-{secrets.token_hex(4)}").strip()
         if not _SID_RE.match(sid):
             raise SpawnRejected(f"session name {sid!r} breaks the [A-Za-z0-9_-]+ charset")
+        if desc.sid and not sid.startswith(f"{agent}-"):
+            raise SpawnRejected("routed session id must be namespaced by its agent id")
 
         # --- all guards passed: now (and only now) touch the machine ---
         worktree = self.worktree_root / sid
+        if desc.worktree and Path(desc.worktree) != worktree:
+            raise SpawnRejected("routed worktree does not match the guarded session worktree")
         try:
             self.worktree_root.mkdir(parents=True, exist_ok=True)
         except OSError:
@@ -953,7 +963,7 @@ class ClaudeCodeHarness(Harness):
         # B2: both modes launch headless stream-json (-p skips onboarding), so no
         # ~/.claude.json seed is written for either. The mode difference is only
         # that interactive is resumable via inject.
-        env = self._build_env(profile, agent, worktree, desc.model)
+        env = self._build_env(profile, agent, worktree, desc.model, desc.card_id)
         launch = self._claude_argv(profile, prompt, desc.model)
         env_argv = ["env", "-i", *[f"{k}={v}" for k, v in env.items()]]
         # EVERY session emits stream-json; make the capture dir now so the pipe-pane
@@ -1006,17 +1016,20 @@ class ClaudeCodeHarness(Harness):
         if mode == "interactive":
             self._resume_ctx[sid] = {
                 "profile": profile, "model": desc.model, "agent": agent,
+                "card_id": desc.card_id,
             }
 
         return HarnessSession(
             sid=sid,
             descriptor=SessionDescriptor(
                 sid=sid, host=self.host, harness=self.name, repo=repo_real,
-                branch=branch, model=desc.model, state="running", quality=profile,
+                branch=session_branch if repo_real else branch,
+                model=desc.model, state="running", quality=profile,
                 permission_mode=desc.permission_mode, mode=mode,
+                agent_id=agent, card_id=desc.card_id, worktree=str(worktree),
             ),
             status="running",
-            branch=branch,
+            branch=session_branch if repo_real else branch,
         )
 
     def _stream_log_path(self, sid: str) -> Path:
