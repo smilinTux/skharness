@@ -1,16 +1,54 @@
 """Focused PiHarness session-plane tests; no real tmux, git, Pi, or network."""
+
 from __future__ import annotations
 
+import asyncio
 import json
+import multiprocessing
+import os
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from skharness.events import EventType
-from skharness.harness import Harness, SessionDescriptor, SpawnRejected
+from skharness.harness import (
+    Harness,
+    SessionDescriptor,
+    SpawnOwnershipError,
+    SpawnRejected,
+)
+from skharness.harnesses.claude_code import CommandResult
 from skharness.harnesses.pi import PiHarness, parse_pi_json_line
 from skharness.pool import PoolController
+from skharness.securefs import SecureDir
+
+
+def _same_uid_link_worker(root: str, operation: str, conn) -> None:
+    state = SecureDir.anchor(Path(root) / "state")
+    if operation == "audit":
+        state.append_durable("audit.log", b"first\n")
+    original_write = SecureDir._write_all
+
+    def pause_before_write(fd: int, data: bytes, *, message: str) -> None:
+        conn.send((os.getpid(), fd))
+        assert conn.recv() == "continue"
+        original_write(fd, data, message=message)
+
+    SecureDir._write_all = staticmethod(pause_before_write)
+    try:
+        if operation == "config":
+            fd = state.write_exclusive("models.json", b'{"route":"private"}')
+            os.close(fd)
+        else:
+            state.append_durable("audit.log", b"mandatory-second\n")
+        conn.send(None)
+    except Exception as exc:
+        conn.send((type(exc).__name__, str(exc)))
+    finally:
+        SecureDir._write_all = staticmethod(original_write)
+        state.close()
+        conn.close()
 
 
 class FakeTmux:
@@ -19,31 +57,45 @@ class FakeTmux:
         self.calls: list[list[str]] = []
         self.archive_checks: list[tuple[str, bool]] = []
         self.expected_archive: dict[str, Path] = {}
+        self.ids: dict[str, str] = {}
+        self._next_id = 1
 
     def __call__(self, argv: list[str]) -> str:
         self.calls.append(list(argv))
         if "new-session" in argv or "set-window-option" in argv or "pipe-pane" in argv:
             return ""
         if "new-window" in argv:
-            self.live.add(argv[argv.index("-n") + 1])
-            return ""
+            sid = argv[argv.index("-n") + 1]
+            resource_id = f"@{self._next_id}"
+            self._next_id += 1
+            self.live.add(sid)
+            self.ids[resource_id] = sid
+            return resource_id + "\n"
+        if "display-message" in argv:
+            target = argv[argv.index("-t") + 1]
+            return target + "\n" if target in self.ids else ""
         if "list-windows" in argv:
             return "monitor\t1\n" + "".join(f"{sid}\t2\n" for sid in sorted(self.live))
         if "capture-pane" in argv:
-            sid = argv[argv.index("-t") + 1].rsplit(":", 1)[-1]
+            target = argv[argv.index("-t") + 1]
+            sid = self.ids.get(target, target.rsplit(":", 1)[-1])
             path = self.expected_archive.get(sid)
             self.archive_checks.append(("capture", bool(path and path.exists())))
-            return json.dumps(
-                {
-                    "type": "message_end",
-                    "message": {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": "done"}],
-                    },
-                }
-            ) + "\n"
+            return (
+                json.dumps(
+                    {
+                        "type": "message_end",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "done"}],
+                        },
+                    }
+                )
+                + "\n"
+            )
         if "kill-window" in argv:
-            sid = argv[argv.index("-t") + 1].rsplit(":", 1)[-1]
+            target = argv[argv.index("-t") + 1]
+            sid = self.ids.pop(target, target.rsplit(":", 1)[-1])
             path = self.expected_archive.get(sid)
             self.archive_checks.append(("kill", bool(path and path.exists())))
             self.live.discard(sid)
@@ -72,19 +124,22 @@ def harness(
     repo.mkdir(exist_ok=True)
     tmux = FakeTmux()
     git, git_calls = git_ok()
+    options = {
+        "worktree_root": tmp_path / "worktrees",
+        "sessions_root": tmp_path / "agents",
+        **pi_kwargs,
+    }
     value = PiHarness(
         host="chiap02",
         runner=tmux,
         git_runner=git,
         dispatch_repos=[str(repo)],
-        worktree_root=tmp_path / "worktrees",
-        sessions_root=tmp_path / "agents",
         full_agent=full_agent,
         full_home=tmp_path / "home",
         child_path="/usr/bin:/bin",
         gateway_base="http://chiap01.example:18790/v1",
         default_model="sk-codex",
-        **pi_kwargs,
+        **options,
     )
     return value, tmux, git_calls, repo
 
@@ -193,9 +248,7 @@ async def test_guard_4_session_regex_rejects_unsafe_agent_before_machine_touch(t
 async def test_spawn_builds_isolated_pi_routing_and_attribution_config(tmp_path):
     value, tmux, git_calls, repo = harness(tmp_path)
     session = await value.spawn(
-        SessionDescriptor(
-            repo=str(repo), branch="main", model="sk-codex", quality="sandbox"
-        ),
+        SessionDescriptor(repo=str(repo), branch="main", model="sk-codex", quality="sandbox"),
         prompt="Return one word",
     )
 
@@ -203,7 +256,9 @@ async def test_spawn_builds_isolated_pi_routing_and_attribution_config(tmp_path)
     env = child_env(call)
     assert "OPENAI_BASE_URL" not in env
     config_dir = Path(env["PI_CODING_AGENT_DIR"])
-    assert config_dir == tmp_path / "worktrees" / session.sid / ".pi-coding-agent"
+    assert config_dir == Path(value._config_dirs[session.sid].proc_path)
+    assert (tmp_path / "pi-config" / session.sid).samefile(config_dir)
+    assert not (tmp_path / "pi-config" / session.sid).is_relative_to(tmp_path / "worktrees")
     config = json.loads((config_dir / "models.json").read_text())
     provider = config["providers"]["skgw"]
     assert provider["baseUrl"] == "http://chiap01.example:18790/v1"
@@ -226,20 +281,65 @@ async def test_spawn_builds_isolated_pi_routing_and_attribution_config(tmp_path)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("link_kind", ["absolute", "relative"])
+async def test_real_git_repo_pi_config_symlink_cannot_escape_controller_root(tmp_path, link_kind):
+    """A committed absolute/relative config symlink is materialized by real git.
+
+    Pi must ignore that repository-controlled location and write only below the
+    separately owned config root.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link_target = str(outside) if link_kind == "absolute" else "../../outside"
+    (repo / ".pi-coding-agent").symlink_to(link_target, target_is_directory=True)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "test"], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", ".pi-coding-agent"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "adversarial symlink"], check=True)
+    branch = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--show-current"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    tmux = FakeTmux()
+    value = PiHarness(
+        runner=tmux,
+        dispatch_repos=[str(repo)],
+        worktree_root=tmp_path / "worktrees",
+        config_root=tmp_path / "controller-config",
+        sessions_root=tmp_path / "agents",
+        gateway_base="http://gateway.test/v1",
+    )
+
+    session = await value.spawn(
+        SessionDescriptor(repo=str(repo), branch=branch, quality="sandbox"), prompt="x"
+    )
+
+    assert (tmp_path / "worktrees" / session.sid / ".pi-coding-agent").is_symlink()
+    assert not (outside / "models.json").exists()
+    config = tmp_path / "controller-config" / session.sid / "models.json"
+    assert config.is_file()
+    assert Path(child_env(new_window(tmux.calls))["PI_CODING_AGENT_DIR"]).samefile(config.parent)
+
+
+@pytest.mark.asyncio
 async def test_caller_secret_is_never_persisted_or_passed_to_pi(tmp_path, monkeypatch):
     caller_secret = "caller-secret-that-must-not-land"
     monkeypatch.setenv("SKCODE_GATEWAY_TOKEN", caller_secret)
-    value, tmux, _git_calls, repo = harness(
-        tmp_path, gateway_token=caller_secret
-    )
+    value, tmux, _git_calls, repo = harness(tmp_path, gateway_token=caller_secret)
 
     session = await value.spawn(
         SessionDescriptor(repo=str(repo), branch="main", quality="sandbox"), prompt="x"
     )
 
-    config_path = (
-        tmp_path / "worktrees" / session.sid / ".pi-coding-agent" / "models.json"
-    )
+    config_path = tmp_path / "pi-config" / session.sid / "models.json"
     persisted = config_path.read_text()
     call = new_window(tmux.calls)
     assert caller_secret not in persisted
@@ -263,6 +363,26 @@ def test_environment_route_is_preserved(monkeypatch):
 def test_explicit_effective_route_is_preserved():
     value = PiHarness(runner=lambda _argv: "", gateway_base="http://gateway.test:29999/v1")
     assert value.pi_gateway_base == "http://gateway.test:29999/v1"
+
+
+def test_config_root_inside_worktrees_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="outside repository worktrees"):
+        PiHarness(
+            runner=lambda _argv: "",
+            gateway_base="http://gateway.test/v1",
+            worktree_root=tmp_path / "worktrees",
+            config_root=tmp_path / "worktrees" / "pi-config",
+        )
+
+
+def test_config_root_traversal_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="traversal"):
+        PiHarness(
+            runner=lambda _argv: "",
+            gateway_base="http://gateway.test/v1",
+            worktree_root=tmp_path / "worktrees",
+            config_root=tmp_path / "state" / ".." / "pi-config",
+        )
 
 
 def test_parse_assistant_message_end_content_text():
@@ -295,6 +415,281 @@ def test_parse_ignores_non_assistant_or_malformed_lines(line):
 
 
 @pytest.mark.asyncio
+async def test_worktree_root_ancestor_symlink_is_rejected_without_git_or_tmux(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "state-link").symlink_to(outside, target_is_directory=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    value, tmux, git_calls, _repo = harness(
+        tmp_path,
+        repo=repo,
+        worktree_root=tmp_path / "state-link" / "worktrees",
+    )
+
+    with pytest.raises(SpawnRejected, match="(worktree|reservation) root"):
+        await value.spawn(
+            SessionDescriptor(repo=str(repo), branch="main", quality="sandbox"),
+            prompt="x",
+        )
+
+    assert not (outside / "worktrees").exists()
+    assert not any("worktree" in call for call in git_calls)
+    assert not any("new-window" in call for call in tmux.calls)
+
+
+def test_transcript_root_ancestor_symlink_fails_before_write_or_teardown(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "state-link").symlink_to(outside, target_is_directory=True)
+    value, tmux, _git_calls, _repo = harness(
+        tmp_path, sessions_root=tmp_path / "state-link" / "agents"
+    )
+    sid = "sandbox-transcriptroot"
+    tmux.live.add(sid)
+
+    result = asyncio.run(value.archive(sid))
+
+    assert result["archived"] is False
+    assert result["transcript_persisted"] is False
+    assert result["teardown_succeeded"] is False
+    assert sid in tmux.live
+    assert not (outside / "agents").exists()
+
+
+def test_config_root_ancestor_symlink_is_rejected_without_escape(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "state-link").symlink_to(outside, target_is_directory=True)
+    value, tmux, _git_calls, _repo = harness(
+        tmp_path, config_root=tmp_path / "state-link" / "pi-config"
+    )
+
+    with pytest.raises(SpawnRejected, match="config reservation"):
+        value._build_env("sandbox", "sandbox", tmp_path / "worktrees" / "sandbox-safe")
+
+    assert not (outside / "pi-config").exists()
+    assert not any("new-window" in call for call in tmux.calls)
+
+
+def test_config_parent_swap_cannot_redirect_models_write(tmp_path, monkeypatch):
+    value, _tmux, _git_calls, _repo = harness(tmp_path)
+    original_mkdir = SecureDir.mkdir
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    def swap_after_open(self, name, **kwargs):
+        directory = original_mkdir(self, name, **kwargs)
+        moved = tmp_path / "held-config"
+        value.config_root.rename(moved)
+        value.config_root.symlink_to(outside, target_is_directory=True)
+        return directory
+
+    monkeypatch.setattr(SecureDir, "mkdir", swap_after_open)
+    env = value._build_env("sandbox", "sandbox", tmp_path / "worktrees" / "sandbox-safe")
+
+    assert Path(env["PI_CODING_AGENT_DIR"]).joinpath("models.json").is_file()
+    assert (tmp_path / "held-config" / "sandbox-safe" / "models.json").is_file()
+    assert not (outside / "sandbox-safe" / "models.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("operation", "final_name", "expected"),
+    [
+        ("config", "models.json", b'{"route":"private"}'),
+        ("audit", "audit.log", b"first\nmandatory-second\n"),
+    ],
+)
+def test_same_uid_process_cannot_link_anonymous_inode_before_first_write(
+    tmp_path, operation, final_name, expected
+):
+    root = tmp_path / operation
+    (root / "outside").mkdir(parents=True)
+    parent, child = multiprocessing.Pipe()
+    process = multiprocessing.Process(
+        target=_same_uid_link_worker, args=(str(root), operation, child)
+    )
+    process.start()
+    pid, fd = parent.recv()
+
+    outside_fd = os.open(root / "outside", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(PermissionError):
+            os.link(
+                f"/proc/{pid}/fd/{fd}",
+                "stolen",
+                dst_dir_fd=outside_fd,
+                follow_symlinks=True,
+            )
+    finally:
+        os.close(outside_fd)
+        parent.send("continue")
+    assert not (root / "outside" / "stolen").exists()
+    assert parent.recv() is None
+    process.join(10)
+    assert process.exitcode == 0
+    assert (root / "state" / final_name).read_bytes() == expected
+    assert not (root / "outside" / "stolen").exists()
+
+
+def test_models_bytes_are_unlinkable_at_former_verification_write_boundary(tmp_path, monkeypatch):
+    value, _tmux, _git_calls, _repo = harness(tmp_path)
+    outside = tmp_path / "outside-models.json"
+    original_publish = SecureDir._publish_exclusive
+
+    def publish_after_try_link(self, fd, name, *, mode):
+        with pytest.raises(FileNotFoundError):
+            os.link(value.config_root / "sandbox-safe" / "models.json", outside)
+        original_publish(self, fd, name, mode=mode)
+
+    monkeypatch.setattr(SecureDir, "_publish_exclusive", publish_after_try_link)
+    env = value._build_env("sandbox", "sandbox", tmp_path / "worktrees" / "sandbox-safe")
+
+    model_path = Path(env["PI_CODING_AGENT_DIR"]) / "models.json"
+    assert model_path.is_file()
+    assert not outside.exists()
+    assert os.stat(model_path).st_nlink == 1
+
+
+def test_reservation_root_ancestor_symlink_is_rejected_without_escape(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "state-link").symlink_to(outside, target_is_directory=True)
+    value, tmux, _git_calls, _repo = harness(
+        tmp_path, reservation_root=tmp_path / "state-link" / "reservations"
+    )
+
+    with pytest.raises(SpawnRejected, match="reservation root"):
+        value._reserve_sid("sandbox")
+
+    assert not (outside / "reservations").exists()
+    assert not any("new-window" in call for call in tmux.calls)
+
+
+@pytest.mark.asyncio
+async def test_archive_list_failure_is_truthful_and_never_captures_or_kills(tmp_path):
+    value, tmux, _git_calls, _repo = harness(tmp_path)
+    sid = "sandbox-listfailure"
+    value._spawned_sids.add(sid)
+
+    def fail_list(argv):
+        if "list-windows" in argv:
+            return CommandResult(tuple(argv), 1, "", "server unavailable")
+        raise AssertionError(f"must not actuate after list failure: {argv}")
+
+    value._runner = fail_list
+    result = await value.archive(sid)
+
+    assert result["archived"] is False
+    assert result["transcript_persisted"] is False
+    assert result["teardown_succeeded"] is False
+    assert "list-windows" in result["reason"]
+    assert not any("capture-pane" in call or "kill-window" in call for call in tmux.calls)
+
+
+@pytest.mark.asyncio
+async def test_archive_transcript_failure_is_receipted_and_window_survives(tmp_path):
+    value, tmux, _git_calls, _repo = harness(tmp_path)
+    sid = "sandbox-transcriptfailure"
+    tmux.live.add(sid)
+    value._secure_sessions = SecureDir.anchor(tmp_path / "agents")
+    (tmp_path / "agents").rename(tmp_path / "agents-held")
+    (tmp_path / "agents").write_text("not a directory")
+    # Descriptor anchoring means the parent replacement itself cannot redirect;
+    # force a final collision in the exact held inode to exercise receipt truth.
+    held = tmp_path / "agents-held" / "sandbox" / "sessions"
+    held.mkdir(parents=True)
+    (held / f"{sid}.json").write_text("existing")
+
+    result = await value.archive(sid)
+
+    assert result["archived"] is False
+    assert result["transcript_persisted"] is False
+    assert result["teardown_succeeded"] is False
+    assert sid in tmux.live
+    assert not any("kill-window" in call for call in tmux.calls)
+
+
+@pytest.mark.asyncio
+async def test_setup_rollback_kill_failure_exposes_unresolved_resource(tmp_path):
+    value, tmux, _git_calls, repo = harness(tmp_path)
+
+    def fail_pipe_and_kill(argv):
+        if "pipe-pane" in argv:
+            return CommandResult(tuple(argv), 1, "", "pipe refused")
+        if "kill-window" in argv:
+            return CommandResult(tuple(argv), 1, "", "kill refused")
+        return tmux(argv)
+
+    value._runner = fail_pipe_and_kill
+    with pytest.raises(SpawnOwnershipError) as caught:
+        await value.spawn(
+            SessionDescriptor(repo=str(repo), branch="main", quality="sandbox"),
+            prompt="x",
+        )
+
+    assert caught.value.receipt["teardown_succeeded"] is False
+    assert caught.value.receipt["tracked"] is False
+    assert tmux.live
+
+
+@pytest.mark.asyncio
+async def test_spawn_command_failure_is_honest_and_not_tracked(tmp_path):
+    value, tmux, _git_calls, repo = harness(tmp_path)
+
+    def fail_new_window(argv):
+        if "new-window" in argv:
+            return CommandResult(tuple(argv), 1, "", "no such executable")
+        return tmux(argv)
+
+    value._runner = fail_new_window
+    with pytest.raises(SpawnRejected, match="tmux new-window failed"):
+        await value.spawn(
+            SessionDescriptor(repo=str(repo), branch="main", quality="sandbox"),
+            prompt="x",
+        )
+    assert value._spawned_sids == set()
+
+
+@pytest.mark.asyncio
+async def test_capture_setup_failure_kills_window_and_is_not_tracked(tmp_path):
+    value, tmux, _git_calls, repo = harness(tmp_path)
+
+    def fail_pipe(argv):
+        if "pipe-pane" in argv:
+            return CommandResult(tuple(argv), 1, "", "pipe refused")
+        return tmux(argv)
+
+    value._runner = fail_pipe
+    with pytest.raises(SpawnRejected, match="tmux pipe-pane failed"):
+        await value.spawn(
+            SessionDescriptor(repo=str(repo), branch="main", quality="sandbox"),
+            prompt="x",
+        )
+    assert value._spawned_sids == set()
+    assert tmux.live == set()
+
+
+@pytest.mark.asyncio
+async def test_liveness_failure_does_not_track_running_session(tmp_path):
+    value, tmux, _git_calls, repo = harness(tmp_path)
+
+    def fail_liveness(argv):
+        if "display-message" in argv:
+            return CommandResult(tuple(argv), 1, "", "window absent")
+        return tmux(argv)
+
+    value._runner = fail_liveness
+    with pytest.raises(SpawnRejected, match="liveness check"):
+        await value.spawn(
+            SessionDescriptor(repo=str(repo), branch="main", quality="sandbox"),
+            prompt="x",
+        )
+    assert value._spawned_sids == set()
+    assert tmux.live == set()
+
+
+@pytest.mark.asyncio
 async def test_archive_persists_transcript_before_stopping_window(tmp_path):
     value, tmux, _git_calls, repo = harness(tmp_path)
     session = await value.spawn(
@@ -311,6 +706,49 @@ async def test_archive_persists_transcript_before_stopping_window(tmp_path):
     record = json.loads(expected.read_text())
     assert record["harness"] == "pi"
     assert "message_end" in record["transcript"]
+
+
+@pytest.mark.asyncio
+async def test_archive_teardown_failure_is_partial_with_transcript_receipt(tmp_path):
+    value, tmux, _git_calls, repo = harness(tmp_path)
+    session = await value.spawn(
+        SessionDescriptor(repo=str(repo), branch="main", quality="sandbox"), prompt="x"
+    )
+
+    def fail_kill(argv):
+        if "kill-window" in argv:
+            return CommandResult(tuple(argv), 1, "", "server unavailable")
+        return tmux(argv)
+
+    value._runner = fail_kill
+    result = await value.archive(session.sid)
+
+    assert result["archived"] is False
+    assert result["partial"] is True
+    assert result["transcript_persisted"] is True
+    assert result["teardown_succeeded"] is False
+    assert Path(result["transcript_path"]).is_file()
+    assert session.sid in tmux.live
+
+
+@pytest.mark.asyncio
+async def test_sid_collision_retries_before_launch(tmp_path, monkeypatch):
+    value, tmux, _git_calls, _repo = harness(tmp_path)
+    colliding = "a" * 32
+    replacement = "b" * 32
+    value.reservation_root.mkdir(parents=True)
+    (value.reservation_root / f"sandbox-{colliding}").mkdir()
+    tokens = iter([colliding, replacement])
+    monkeypatch.setattr(
+        "skharness.harnesses.claude_code.secrets.token_hex",
+        lambda _n: next(tokens),
+    )
+
+    session = await value.spawn(SessionDescriptor(quality="sandbox"), prompt="x")
+
+    assert session.sid == f"sandbox-{replacement}"
+    call = new_window(tmux.calls)
+    assert call[call.index("-n") + 1] == session.sid
 
 
 @pytest.mark.asyncio
