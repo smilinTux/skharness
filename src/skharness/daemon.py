@@ -41,7 +41,7 @@ from skharness.control import (
     ControlTargetKind,
 )
 from skharness.events import EventType, SessionEvent
-from skharness.harness import Harness, SessionDescriptor, SpawnRejected
+from skharness.harness import Harness, SessionDescriptor, SpawnOwnershipError, SpawnRejected
 from skharness.jobs import JobRun
 from skharness.manifest import skcode_module_manifest
 from skharness.session_events import SessionEventStore
@@ -155,6 +155,7 @@ ROUTE_SCOPES: dict[tuple[str, str], str] = {
     ("POST", "/api/v1/sessions/{sid}/ratify"): SCOPE_WRITE,
     ("POST", "/api/v1/sessions/{sid}/inject"): SCOPE_WRITE,
     ("POST", "/api/v1/sessions/{sid}/deny"): SCOPE_WRITE,
+    ("POST", "/api/v1/sessions/{sid}/archive"): SCOPE_DISPATCH,
     ("POST", "/api/v1/dispatch"): SCOPE_DISPATCH,
     ("POST", "/api/v1/sessions/{sid}/cancel"): SCOPE_DISPATCH,
     # The route's minimum scope is inject. Action-level enforcement below raises
@@ -270,9 +271,7 @@ def build_daemon_app(
         source = _session_source(sid)
         session_agent_id = "session-agent-" + _content_hash(sid)
         try:
-            context = ActivityContext(
-                session_id=sid, agent_id=session_agent_id, source=source
-            )
+            context = ActivityContext(session_id=sid, agent_id=session_agent_id, source=source)
         except ValueError:
             context = ActivityContext(
                 session_id="session-" + _content_hash(sid),
@@ -333,10 +332,7 @@ def build_daemon_app(
                     if row.state in {"running", "spawning"}
                     and (row.source or "interactive") in {"interactive", "attach"}
                 }
-                stale = [
-                    activity_pumps.pop(sid)
-                    for sid in set(activity_pumps) - set(live_rows)
-                ]
+                stale = [activity_pumps.pop(sid) for sid in set(activity_pumps) - set(live_rows)]
                 for task in stale:
                     task.cancel()
                 if stale:
@@ -375,9 +371,7 @@ def build_daemon_app(
                         await asyncio.to_thread(
                             activity_journal.publish,
                             context,
-                            ActivityKind.ERROR
-                            if job.status == "failed"
-                            else ActivityKind.STATUS,
+                            ActivityKind.ERROR if job.status == "failed" else ActivityKind.STATUS,
                             summary=f"job state: {job.status}",
                             data={
                                 "job": job.job,
@@ -437,9 +431,15 @@ def build_daemon_app(
         return subj.strip() if isinstance(subj, str) and subj.strip() else "unknown-device"
 
     def _emit_audit(record: dict) -> None:
-        # audit_log is a plain str sink; serialize the structured record.
-        if audit_log is not None:
+        """Persist one mandatory record or fail closed with a truthful 503."""
+        if audit_log is None:
+            return
+        try:
             audit_log(json.dumps(record, default=str, sort_keys=True))
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001 - sink failures are policy failures
+            raise HTTPException(503, "durable audit persistence failed") from exc
 
     def _emit_decision_obligations(decision) -> None:
         # Honour the PDP's audit obligations (spec 7.4: every decision, allow OR
@@ -484,7 +484,9 @@ def build_daemon_app(
         try:
             event = activity_journal.publish(
                 _activity_context_for_control(command.target_kind, command.target_id),
-                ActivityKind.STATUS if status is ControlStatus.APPLIED else ActivityKind.DISPOSITION,
+                ActivityKind.STATUS
+                if status is ControlStatus.APPLIED
+                else ActivityKind.DISPOSITION,
                 summary=f"Atlas control {status.value}: {command.action.value}",
                 data={
                     "command_id": command.command_id,
@@ -719,9 +721,7 @@ def build_daemon_app(
         )
 
     @app.get("/api/v1/control/{command_id}")
-    async def control_status(
-        command_id: str, authorization: str | None = Header(default=None)
-    ):
+    async def control_status(command_id: str, authorization: str | None = Header(default=None)):
         """Read one Atlas command and its latest controller receipt."""
 
         _auth(authorization, SCOPE_READ)
@@ -736,9 +736,7 @@ def build_daemon_app(
         return JSONResponse({"command": command.to_public_dict(), "receipt": receipt.to_dict()})
 
     @app.post("/api/v1/control")
-    async def atlas_control(
-        request: Request, authorization: str | None = Header(default=None)
-    ):
+    async def atlas_control(request: Request, authorization: str | None = Header(default=None)):
         """Submit an authenticated Atlas steering command.
 
         Session message/cancel commands are applied synchronously through the
@@ -787,9 +785,7 @@ def build_daemon_app(
                 "resource": resource,
                 "decision": "allow" if allow else "deny",
                 "reason": getattr(decision, "reason", ""),
-                "payload_sha256": _content_hash(
-                    json.dumps(payload, sort_keys=True, default=str)
-                ),
+                "payload_sha256": _content_hash(json.dumps(payload, sort_keys=True, default=str)),
             }
         )
         if not allow:
@@ -820,7 +816,11 @@ def build_daemon_app(
 
         if replayed:
             return JSONResponse(
-                {"command": command.to_public_dict(), "receipt": receipt.to_dict(), "replayed": replayed},
+                {
+                    "command": command.to_public_dict(),
+                    "receipt": receipt.to_dict(),
+                    "replayed": replayed,
+                },
                 status_code=200 if receipt.status in TERMINAL_CONTROL_STATUSES else 202,
             )
         if target_kind is not ControlTargetKind.SESSION:
@@ -835,7 +835,11 @@ def build_daemon_app(
                     activity_cursor=cursor,
                 )
                 return JSONResponse(
-                    {"command": command.to_public_dict(), "receipt": receipt.to_dict(), "replayed": False},
+                    {
+                        "command": command.to_public_dict(),
+                        "receipt": receipt.to_dict(),
+                        "replayed": False,
+                    },
                     status_code=202,
                 )
             await asyncio.to_thread(
@@ -870,7 +874,11 @@ def build_daemon_app(
                 activity_cursor=cursor,
             )
             return JSONResponse(
-                {"command": command.to_public_dict(), "receipt": receipt.to_dict(), "replayed": False}
+                {
+                    "command": command.to_public_dict(),
+                    "receipt": receipt.to_dict(),
+                    "replayed": False,
+                }
             )
 
         if command.expected_state:
@@ -880,9 +888,7 @@ def build_daemon_app(
             )
             actual_state = session.state if session is not None else "missing"
             if actual_state != command.expected_state:
-                detail = (
-                    f"expected state {command.expected_state}; observed {actual_state}"
-                )
+                detail = f"expected state {command.expected_state}; observed {actual_state}"
                 cursor = _publish_control_activity(command, ControlStatus.CONFLICT, detail)
                 receipt = await asyncio.to_thread(
                     control_journal.record,
@@ -912,7 +918,9 @@ def build_daemon_app(
                 detail="interactive harness does not implement this action",
                 activity_cursor=cursor,
             )
-            return JSONResponse({"command": command.to_public_dict(), "receipt": receipt.to_dict()})
+            return JSONResponse(
+                {"command": command.to_public_dict(), "receipt": receipt.to_dict()}
+            )
 
         receipt = await asyncio.to_thread(
             control_journal.record,
@@ -1169,6 +1177,15 @@ def build_daemon_app(
         if mode not in ("direct", "interactive"):
             raise HTTPException(400, f"invalid mode {mode!r} (want 'direct' or 'interactive')")
         prompt = str(body.get("prompt", "") or "")
+        requested_harness = str(body.get("harness", "") or harness.name)
+        requested_host = str(body.get("host", "") or host_id)
+        # This endpoint is host-local by construction. Metadata can neither
+        # select another machine nor another in-process harness while filesystem
+        # and tmux operations remain local.
+        if requested_host != host_id:
+            raise HTTPException(400, "dispatch host must match this host-local daemon")
+        if requested_harness != harness.name:
+            raise HTTPException(400, "dispatch harness is not served by this host daemon")
         subject = _subject(auth)
         resource = {"host": host_id, "repo": repo, "branch": branch, "profile": profile}
         #   4. authz decision (the allow gate) + audit ALWAYS (allow or deny).
@@ -1181,7 +1198,7 @@ def build_daemon_app(
                 "subject": subject,
                 "decision": "allow" if allow else "deny",
                 "request": {
-                    "harness": str(body.get("harness", "") or ""),
+                    "harness": requested_harness,
                     "host": host_id,
                     "repo": repo,
                     "branch": branch,
@@ -1201,7 +1218,7 @@ def build_daemon_app(
         #      so a bad repo/branch/name never reaches a subprocess.
         desc = SessionDescriptor(
             host=host_id,
-            harness=str(body.get("harness", "") or harness.name),
+            harness=requested_harness,
             repo=repo,
             branch=branch,
             model=str(body.get("model", "") or ""),
@@ -1209,26 +1226,93 @@ def build_daemon_app(
             permission_mode=permission_mode,
             mode=mode,
         )
-        try:
-            session = await harness.spawn(desc, prompt=prompt)
-        except SpawnRejected as exc:
-            _emit_audit(
-                {
-                    "event": "skcode.dispatch.rejected",
-                    "subject": subject,
-                    "resource": resource,
-                    "reason": str(exc),
-                }
-            )
-            raise HTTPException(400, f"spawn rejected: {exc}")
+        # A durable intent record is the final precondition before actuation.
+        # The earlier decision record is also durable; this distinct record says
+        # exactly what is now authorized to launch.
         _emit_audit(
             {
-                "event": "skcode.dispatch.spawned",
+                "event": "skcode.dispatch.actuation_intent",
                 "subject": subject,
-                "sid": session.sid,
                 "resource": resource,
             }
         )
+        try:
+            session = await harness.spawn(desc, prompt=prompt)
+        except SpawnOwnershipError as exc:
+            # Actuation may have happened. This is categorically not bad input:
+            # retain every containment field at both the mandatory audit boundary
+            # and authenticated API boundary so the exact resource stays actionable.
+            receipt = dict(exc.receipt)
+            attribution = {"subject": subject, "resource": resource}
+            try:
+                _emit_audit(
+                    {
+                        "event": "skcode.dispatch.ownership_failure",
+                        **attribution,
+                        "reason": str(exc),
+                        "receipt": receipt,
+                    }
+                )
+            except HTTPException as audit_exc:
+                raise HTTPException(
+                    503,
+                    {
+                        "failure": "spawn_ownership_audit_failure",
+                        "reason": str(exc),
+                        "receipt": receipt,
+                        "attribution": attribution,
+                        "audit_persisted": False,
+                    },
+                ) from audit_exc
+            return JSONResponse(
+                {
+                    "failure": "spawn_ownership_failure",
+                    "reason": str(exc),
+                    "receipt": receipt,
+                    "attribution": attribution,
+                    "audit_persisted": True,
+                },
+                status_code=503,
+            )
+        except SpawnRejected as exc:
+            try:
+                _emit_audit(
+                    {
+                        "event": "skcode.dispatch.rejected",
+                        "subject": subject,
+                        "resource": resource,
+                        "reason": str(exc),
+                    }
+                )
+            except HTTPException as audit_exc:
+                raise HTTPException(
+                    503, f"spawn rejected and rejection audit failed: {exc}"
+                ) from audit_exc
+            raise HTTPException(400, f"spawn rejected: {exc}")
+        try:
+            _emit_audit(
+                {
+                    "event": "skcode.dispatch.spawned",
+                    "subject": subject,
+                    "sid": session.sid,
+                    "resource": resource,
+                }
+            )
+        except HTTPException as exc:
+            # Actuation occurred, so never return a normal success. Keep the
+            # harness-tracked session live rather than violating transcript-first
+            # teardown; expose its exact identity for a later governed archive.
+            raise HTTPException(
+                503,
+                {
+                    "reason": "spawned receipt audit failed",
+                    "sid": session.sid,
+                    "resource_id": session.resource_id,
+                    "tracked": True,
+                    "teardown_succeeded": False,
+                    "teardown_reason": "not attempted: transcript-first archive required",
+                },
+            ) from exc
         return JSONResponse(
             {
                 "sid": session.sid,
@@ -1238,6 +1322,70 @@ def build_daemon_app(
                 "mode": mode,
             }
         )
+
+    @app.post("/api/v1/sessions/{sid}/archive")
+    async def archive_session(sid: str, authorization: str | None = Header(default=None)):
+        """Persist a transcript and then tear down one host-local session.
+
+        Archive is governed like cancel because it stops a process: dispatch
+        bearer scope, PDP decision, mandatory audit, and a receipt carrying both
+        persistence and teardown truth (including partial success).
+        """
+        auth = _authed_context(authorization, SCOPE_DISPATCH)
+        if audit_log is None:
+            raise HTTPException(501, "audit sink not configured; archive denied")
+        if authorize_dispatch is None:
+            raise HTTPException(501, "authz PDP not configured; archive denied")
+        subject = _subject(auth)
+        resource = {"host": host_id, "sid": sid, "action": "archive"}
+        decision = authorize_dispatch(subject, resource, {})
+        _emit_decision_obligations(decision)
+        allow = bool(getattr(decision, "allow", False))
+        if not allow:
+            _emit_audit(
+                {
+                    "event": "skcode.archive",
+                    "subject": subject,
+                    "sid": sid,
+                    "decision": "deny",
+                    "reason": getattr(decision, "reason", ""),
+                }
+            )
+            raise HTTPException(403, "archive not authorized")
+        _emit_audit(
+            {
+                "event": "skcode.archive.actuation_intent",
+                "subject": subject,
+                "sid": sid,
+                "decision": "allow",
+            }
+        )
+        result = await harness.archive(sid)
+        try:
+            _emit_audit(
+                {
+                    "event": "skcode.archive",
+                    "subject": subject,
+                    "sid": sid,
+                    "decision": "allow",
+                    "archived": bool(result.get("archived")),
+                    "transcript_persisted": bool(result.get("transcript_persisted")),
+                    "teardown_succeeded": bool(result.get("teardown_succeeded")),
+                    "transcript_path": result.get("transcript_path", ""),
+                    "reason": result.get("reason", ""),
+                }
+            )
+        except HTTPException:
+            # The action may already be complete; return a partial/failure receipt,
+            # never an ordinary archived:true response without its durable audit.
+            result = dict(result)
+            result["archived"] = False
+            result["audit_persisted"] = False
+            result["actuation_may_have_completed"] = True
+            result["reason"] = "archive outcome audit persistence failed"
+            return JSONResponse(result, status_code=503)
+        result["audit_persisted"] = True
+        return JSONResponse(result)
 
     @app.post("/api/v1/sessions/{sid}/cancel")
     async def cancel_session(sid: str, authorization: str | None = Header(default=None)):
@@ -1366,9 +1514,7 @@ def build_daemon_app(
                     continue
                 if rows:
                     for event in rows:
-                        await websocket.send_json(
-                            {"type": "activity", "event": event.to_dict()}
-                        )
+                        await websocket.send_json({"type": "activity", "event": event.to_dict()})
                         cursor = event.cursor
                     heartbeat_at = asyncio.get_running_loop().time()
                     continue
