@@ -14,6 +14,12 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ### Fixed
 
+- Closed the PiHarness bootstrap same-uid hard-link disclosure by denying peer
+  access to the controller's procfs file descriptors from before anonymous inode
+  creation until private configuration and mandatory audit contents, restrictive
+  mode, fsync, and publication are final (card `d13d6eb2`). Added concurrent
+  same-uid regression coverage for both configuration and audit writes.
+
 - Serialized Arena state observations with lifecycle transitions so a process
   exit racing an operator cancellation cannot act on stale `RUNNING` state and
   attempt to overwrite durable `CANCELLED` state (card `80dacdfd`).
