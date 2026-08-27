@@ -14,6 +14,10 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ### Fixed
 
+- Open the `SecureDir` filesystem root with descriptor-only `O_PATH` authority so
+  `skcode-hostd` starts under the shipped `ProtectSystem=strict` sandbox without
+  broadening its two existing writable paths.
+
 - Serialized Arena state observations with lifecycle transitions so a process
   exit racing an operator cancellation cannot act on stale `RUNNING` state and
   attempt to overwrite durable `CANCELLED` state (card `80dacdfd`).

@@ -4,10 +4,16 @@ These are tooling-only checks (no daemon import): they assert the unit keeps the
 two safety defaults the deploy card requires. If someone edits the unit to bind
 a wildcard, drop the port, or bake in the real verifier, these fail.
 """
+
 from __future__ import annotations
 
 import configparser
+import os
+import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 _SYSTEMD = Path(__file__).resolve().parent.parent / "systemd"
 _UNIT = _SYSTEMD / "skcode-hostd.service"
@@ -69,4 +75,46 @@ def test_unit_carries_standard_hardening() -> None:
     service = _parse_unit()["Service"]
     assert service["NoNewPrivileges"] == "true"
     assert service["ProtectSystem"] == "strict"
+    assert service["ProtectHome"] == "read-only"
+    assert service["ReadWritePaths"].split() == ["%h/.skharness", "%h/.skcapstone"]
     assert service["Restart"] == "on-failure"
+
+
+@pytest.mark.skipif(
+    os.environ.get("SKHARNESS_RUN_SYSTEMD_SANDBOX_TEST") != "1",
+    reason="requires a user systemd manager with transient-unit support",
+)
+def test_service_start_and_secure_publication_under_exact_filesystem_sandbox() -> None:
+    state = Path.home() / ".skcapstone" / f"systemd-sandbox-test-{os.getpid()}"
+    code = (
+        "import os, shutil, uvicorn; from pathlib import Path; "
+        "from skharness.securefs import SecureDir; "
+        f"state=Path({str(state)!r}); root=SecureDir.anchor(state); "
+        "fd=root.write_exclusive('started', b'ok'); os.close(fd); root.close(); "
+        "uvicorn.run=lambda app,host,port: None; from skharness import serve; "
+        "serve._serve(['--host', '127.0.0.2', '--host-id', 'hermetic']); "
+        "assert (state/'started').read_bytes() == b'ok'; shutil.rmtree(state)"
+    )
+    command = [
+        "systemd-run",
+        "--user",
+        "--wait",
+        "--collect",
+        "--quiet",
+        f"--unit=skharness-securedir-{os.getpid()}",
+        "--property=Type=oneshot",
+        "--property=NoNewPrivileges=true",
+        "--property=ProtectSystem=strict",
+        "--property=ProtectHome=read-only",
+        f"--property=ReadWritePaths={Path.home() / '.skharness'} {Path.home() / '.skcapstone'}",
+        "--property=PrivateTmp=true",
+        f"--setenv=PYTHONPATH={_SYSTEMD.parent / 'src'}",
+        f"--setenv=SKCODE_STATE_DIR={state}",
+        "--setenv=SKCODE_FORCE_DENY_ALL=1",
+        sys.executable,
+        "-c",
+        code,
+    ]
+    completed = subprocess.run(command, text=True, capture_output=True, timeout=30)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert not state.exists()
