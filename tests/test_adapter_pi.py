@@ -489,11 +489,8 @@ def test_config_files_budget_overridable():
 
 
 # -- A6.1 attribution headers -------------------------------------------------
-# pi forwards nothing identifying by default, so skgateway request_log rows carry a
-# NULL agent_id/session_id for every harness run. These tests pin BOTH directions:
-# the headers appear when we know the ids, and the `headers` key is absent entirely
-# when we do not. A test for presence alone would also pass if the adapter emitted
-# the headers unconditionally, which is the failure mode worth catching.
+# Session and card ids remain optional. Agent identity is always emitted from the
+# shared resolver so pi traffic no longer creates unattributed request_log rows.
 
 
 def _skgw(a, **kw):
@@ -507,15 +504,18 @@ def test_attribution_headers_emitted_when_ids_supplied():
         session_id="9f3c1a2b4d5e6f70",
         card_id="4852c56d",
     )
-    assert _skgw(a)["headers"] == {"x-session-id": "9f3c1a2b4d5e6f70", "x-sk-card-id": "4852c56d"}
+    assert _skgw(a)["headers"] == {
+        "x-agent-id": a.agent_id,
+        "x-session-id": "9f3c1a2b4d5e6f70",
+        "x-sk-card-id": "4852c56d",
+    }
 
 
-def test_no_ids_means_no_headers_key_at_all():
-    # NEGATIVE CONTROL for the test above. Absent, not {} and not empty strings:
-    # "no session" and "session is empty" are different facts at the gateway.
+def test_no_optional_ids_still_emits_resolved_agent():
+    # Session/card absence stays observable while attribution is always present.
     a = _a(model="ornith-big", base_url="http://gw:18780/v1")
     skgw = _skgw(a)
-    assert "headers" not in skgw
+    assert skgw["headers"] == {"x-agent-id": a.agent_id}
     assert a.session_id is None and a.card_id is None
     # and the rest of the provider block is untouched by the feature
     assert skgw["api"] == "openai-completions"
@@ -524,18 +524,32 @@ def test_no_ids_means_no_headers_key_at_all():
 
 def test_each_id_is_independent():
     only_sid = _a(model="m", base_url="http://gw/v1", session_id="abc123")
-    assert _skgw(only_sid)["headers"] == {"x-session-id": "abc123"}
+    assert _skgw(only_sid)["headers"] == {"x-agent-id": only_sid.agent_id, "x-session-id": "abc123"}
     only_card = _a(model="m", base_url="http://gw/v1", card_id="4852c56d")
-    assert _skgw(only_card)["headers"] == {"x-sk-card-id": "4852c56d"}
+    assert _skgw(only_card)["headers"] == {
+        "x-agent-id": only_card.agent_id,
+        "x-sk-card-id": "4852c56d",
+    }
 
 
 def test_ids_may_be_supplied_per_call():
     a = _a(model="m", base_url="http://gw/v1")
     assert _skgw(a, session_id="s1", card_id="c1")["headers"] == {
+        "x-agent-id": a.agent_id,
         "x-session-id": "s1",
         "x-sk-card-id": "c1",
     }
-    assert "headers" not in _skgw(a)  # per-call value never sticks
+    assert _skgw(a)["headers"] == {"x-agent-id": a.agent_id}  # per-call values never stick
+
+
+def test_agent_id_comes_from_resolve_identity(monkeypatch):
+    from types import SimpleNamespace
+    import skharness.autocode.adapters.pi as pi_module
+
+    monkeypatch.setattr(pi_module, "resolve_identity", lambda: SimpleNamespace(agent="from-precedence"))
+    a = _a(model="m", base_url="http://gw/v1")
+    assert a.agent_id == "from-precedence"
+    assert _skgw(a)["headers"] == {"x-agent-id": "from-precedence"}
 
 
 def test_header_values_are_literals_never_env_interpolation():
