@@ -1,4 +1,5 @@
 import json
+import inspect
 
 from skharness.autocode.adapters.pi import PiAdapter
 from skharness.autocode.sandbox import Sandbox
@@ -457,6 +458,36 @@ def test_per_call_model_override_keeps_argv_and_models_json_in_agreement():
 
 def test_pi_declares_the_per_call_override_seam():
     assert _a().supports_model_override() is True
+
+
+def test_regression_preference_config_keyword_never_reaches_pi_argv(monkeypatch):
+    """Bad head 0fd05bf sent family_preference through the shared argv kwargs."""
+    adapter = _a(model="ornith-big", base_url="http://gw:18780/v1")
+    seen = {}
+
+    def spawn(spec, repo_remote_host=None, ci_host=None):
+        seen["spec"] = spec
+        return {"result": "{}"}
+
+    monkeypatch.setattr(adapter.sandbox, "spawn", spawn)
+    parameters = inspect.signature(adapter._run_raw).parameters
+    preference_kw = (
+        {"family_preference": ["claude"]}
+        if "family_preference" in parameters
+        else {"preference": ("claude",)}
+    )
+    adapter._run_raw(
+        "i",
+        "d",
+        worktree="/tmp",
+        repo=None,
+        model="sk-l-public",
+        **preference_kw,
+    )
+
+    spec = seen["spec"]
+    config = json.loads(spec.config_files["/agent/models.json"])
+    assert config["providers"]["skgw"]["headers"]["x-sk-prefer"] == "claude"
 
 
 def test_arena_build_declares_pytest_as_an_image_preflight_requirement():

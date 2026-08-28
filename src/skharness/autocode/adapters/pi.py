@@ -26,6 +26,7 @@ import re
 
 from .base import BaseCliAdapter, extract_json, parse_event_stream
 from ...arena.pi_bridge import PI_PROFILES, BridgeDeniedError
+from ..buckets import bucket_sensitivity, validate_bucket, validate_routing_preference
 from ..pi_events import (
     assistant_message_events,
     event_response_models,
@@ -166,6 +167,7 @@ class PiAdapter(BaseCliAdapter):
     # supplied by the caller.
     _H_SESSION = "x-session-id"
     _H_CARD = "x-sk-card-id"
+    _H_PREFER = "x-sk-prefer"
 
     def __init__(
         self,
@@ -226,6 +228,9 @@ class PiAdapter(BaseCliAdapter):
         # pi honours it in both places that name a model: _argv (the REQUEST) and
         # _config_files (the DECLARATION). Both read _effective_model, so they
         # cannot disagree.
+        return True
+
+    def supports_routing_preference(self) -> bool:
         return True
 
     def _effective_model(self, model: str | None = None) -> str | None:
@@ -307,8 +312,23 @@ class PiAdapter(BaseCliAdapter):
             headers[self._H_CARD] = cid
         return headers
 
-    def _config_files(self, model: str | None = None, session_id=None, card_id=None):
+    def _config_files(
+        self,
+        model: str | None = None,
+        session_id=None,
+        card_id=None,
+        preference: tuple[str, ...] | None = None,
+    ):
         eff = self._effective_model(model)
+        wire_preference = None
+        if preference is not None:
+            bucket = validate_bucket(eff)
+            wire_preference = ",".join(
+                validate_routing_preference(
+                    preference,
+                    sensitivity=bucket_sensitivity(bucket),
+                )
+            )
         if not self.base_url:
             return {}
         skgw = {
@@ -327,6 +347,8 @@ class PiAdapter(BaseCliAdapter):
             ],
         }
         headers = self._attribution_headers(session_id=session_id, card_id=card_id)
+        if wire_preference:
+            headers[self._H_PREFER] = wire_preference
         if headers:  # absent, never {}, when we know no ids
             skgw["headers"] = headers
         return {"/agent/models.json": json.dumps({"providers": {"skgw": skgw}})}

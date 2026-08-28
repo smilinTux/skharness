@@ -15,7 +15,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import health
-from .buckets import attach_dispatch_model, bucket_for_payload
+from .buckets import (
+    attach_dispatch_model,
+    bucket_for_payload,
+    routing_preference_for_payload,
+)
 from .ci import external_ci_verdict, diff_coverage
 from .failure_memory import (build_prior_feedback, build_prior_success_feedback,
                              distill_failure)
@@ -638,6 +642,10 @@ class EngineeringExecutor:
         """
         return bucket_for_payload(item.payload)
 
+    def _dispatch_preference(self, item: WorkItem) -> tuple[str, ...] | None:
+        """Return the validated governed routing preference, if present."""
+        return routing_preference_for_payload(item.payload)
+
     def run(self, item: WorkItem, harness) -> GateResult:
         self.claim(item)                    # claim before any work: no double-execution
         repo = self.resolve_repo(item)
@@ -661,6 +669,7 @@ class EngineeringExecutor:
         # round's implement and grade call carries the same one, so a card cannot
         # drift zone mid-build.
         dispatch_model = self._dispatch_model(item)
+        dispatch_preference = self._dispatch_preference(item)
         if dispatch_model:
             health.record("graded_dispatch", task=item.ref, bucket=dispatch_model)
         last: GateResult | None = None
@@ -671,7 +680,8 @@ class EngineeringExecutor:
                            title=p.get("title", ""), description=p.get("description", ""),
                            acceptance=p.get("acceptance", []),
                            prior_feedback=feedback, round=rnd,
-                           prior_success_feedback=success_feedback)
+                           prior_success_feedback=success_feedback,
+                           routing_preference=dispatch_preference)
             attach_dispatch_model(tb, dispatch_model)
             # RunRecord provenance (card c672529e): this round's own wall-clock
             # start, genuinely observed here rather than reconstructed later.

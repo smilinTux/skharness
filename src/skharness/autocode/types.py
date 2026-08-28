@@ -124,6 +124,7 @@ class TaskBrief:  # implement input
     #   success memory is byte-identical to the behaviour before this field existed.
     #   Unlike prior_feedback it is NOT overwritten round to round: it is cross-RUN memory
     #   with no in-run equivalent, and the live grade has nothing to say about it.
+    routing_preference: tuple[str, ...] | None = None
 
 
 @dataclass
