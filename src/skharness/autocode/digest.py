@@ -75,7 +75,8 @@ def _load_store_items() -> list[dict]:
 
 
 def build_manifest(items: list[dict] | None = None, *, digest_date: str,
-                   sent_at: str | None = None) -> dict:
+                   sent_at: str | None = None,
+                   calibration_report: dict | None = None) -> dict:
     """Build the digest manifest over unanswered autopilot decision items."""
     if items is None:
         items = _load_store_items()
@@ -103,8 +104,12 @@ def build_manifest(items: list[dict] | None = None, *, digest_date: str,
             "source_ref": it.get("source_ref"), "prompt": prompt, "options": options,
             "content_hash": content_hash(qid, prompt, options),
             "expires_at": expires_at, "answered": False})
+    if calibration_report is None:
+        from .calibration import build_report
+        calibration_report = build_report()
     return {"digest_date": digest_date, "sent_at": sent_at,
-            "generation": generation_hash(manifest_items), "items": manifest_items}
+            "generation": generation_hash(manifest_items), "items": manifest_items,
+            "calibration": calibration_report}
 
 
 def _fallback_expiry(created_at: str | None) -> str:
@@ -121,7 +126,10 @@ def _fallback_expiry(created_at: str | None) -> str:
 
 def build_digest_text(manifest: dict) -> str:
     """Render the reply-by-number DM body."""
+    from .calibration import build_report, digest_line
+
     lines = ["Morning decisions (reply with the number):"]
+    lines.append(digest_line(manifest.get("calibration") or build_report()))
     for it in manifest["items"]:
         opts = it.get("options") or {}
         optstr = "/".join(opts.keys()) if isinstance(opts, dict) else ""
@@ -143,7 +151,12 @@ def write_manifest(manifest: dict) -> Path:
 def rebuild_manifest() -> dict:
     """Rebuild today's manifest over unanswered autopilot items and persist it."""
     from datetime import datetime, timezone
-    m = build_manifest(digest_date=datetime.now(timezone.utc).date().isoformat())
+    from .calibration import default_report
+
+    m = build_manifest(
+        digest_date=datetime.now(timezone.utc).date().isoformat(),
+        calibration_report=default_report(),
+    )
     write_manifest(m)
     return m
 
