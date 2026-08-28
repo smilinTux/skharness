@@ -124,10 +124,6 @@ class TaskBrief:  # implement input
     #   success memory is byte-identical to the behaviour before this field existed.
     #   Unlike prior_feedback it is NOT overwritten round to round: it is cross-RUN memory
     #   with no in-run equivalent, and the live grade has nothing to say about it.
-    family_preference: list[str] | None = None  # SKW-ROUTE-03: optional ordered list of
-    #   model family names (e.g., ["claude", "codex"]) or ["free"] for cost preference.
-    #   Applied by skgateway AFTER bucket resolution and cost ranking, never widening
-    #   the resolved member set. Null/empty means no preference, using cost ranking only.
 
 
 @dataclass

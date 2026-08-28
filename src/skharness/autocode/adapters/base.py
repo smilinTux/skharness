@@ -224,7 +224,7 @@ class BaseCliAdapter(Harness):
     def _auth_env(self) -> dict:
         raise NotImplementedError
 
-    def _config_files(self, model: str | None = None, family_preference: list[str] | None = None) -> dict:
+    def _config_files(self, model: str | None = None) -> dict:
         return {}
 
     def _required_commands(self) -> list[str]:
@@ -298,7 +298,6 @@ class BaseCliAdapter(Harness):
         repo,
         light: bool = False,
         model: str | None = None,
-        family_preference: list[str] | None = None,
     ) -> dict:
         prompt = frame(instruction, data)
         image = getattr(repo, "sandbox_image", None) or self._image()
@@ -316,9 +315,6 @@ class BaseCliAdapter(Harness):
                 )
             validate_bucket(model)  # never emit an unvalidated bucket id
             mkw["model"] = model
-        # SKW-ROUTE-03: pass family preference through to _config_files
-        if family_preference is not None:
-            mkw["family_preference"] = family_preference
         spec = LaunchSpec(
             name=self.name,
             argv=self._argv(prompt, light=light, **mkw),
@@ -371,13 +367,12 @@ class BaseCliAdapter(Harness):
         repo,
         light: bool = False,
         model: str | None = None,
-        family_preference: list[str] | None = None,
     ) -> dict:
         parsed: dict = {}
         attempts = self._run_attempts()
         for i in range(attempts):
             raw = self._run_raw(
-                instruction, data, worktree=worktree, repo=repo, light=light, model=model, family_preference=family_preference
+                instruction, data, worktree=worktree, repo=repo, light=light, model=model
             )
             if not (isinstance(raw, dict) and raw.get("is_error")):
                 parsed = self._parse(raw)
@@ -571,10 +566,8 @@ class BaseCliAdapter(Harness):
         # hooks in _run_raw and the result-provenance hook, preventing the model
         # recorded as requested from drifting from the model actually launched.
         model = dispatch_model_of(brief)
-        # SKW-ROUTE-03: family preference from TaskBrief, passed through to the adapter
-        family_preference = getattr(brief, 'family_preference', None)
         raw = self._run_raw(
-            instruction, data, worktree=brief.worktree, repo=brief.repo, model=model, family_preference=family_preference
+            instruction, data, worktree=brief.worktree, repo=brief.repo, model=model
         )
         usage = raw.get("usage", {}) if isinstance(raw, dict) else {}
         return HarnessResult(

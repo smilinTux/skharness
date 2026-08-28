@@ -285,7 +285,7 @@ class PiAdapter(BaseCliAdapter):
             return [["/usr/local/bin/skharness-pi-python-test-preflight"]]
         return []
 
-    def _attribution_headers(self, session_id=None, card_id=None, family_preference=None) -> dict:
+    def _attribution_headers(self, session_id=None, card_id=None) -> dict:
         """The provider-level `headers` map, or {} when we have nothing to attribute.
 
         Values are baked in as LITERALS and must never be written as `$VAR` env
@@ -305,12 +305,9 @@ class PiAdapter(BaseCliAdapter):
             headers[self._H_SESSION] = sid
         if cid:
             headers[self._H_CARD] = cid
-        # SKW-ROUTE-03: family preference header (optional ordered list of family names)
-        if family_preference and isinstance(family_preference, list) and len(family_preference) > 0:
-            headers["x-sk-family-preference"] = json.dumps(family_preference)
         return headers
 
-    def _config_files(self, model: str | None = None, session_id=None, card_id=None, family_preference=None):
+    def _config_files(self, model: str | None = None, session_id=None, card_id=None):
         eff = self._effective_model(model)
         if not self.base_url:
             return {}
@@ -329,7 +326,7 @@ class PiAdapter(BaseCliAdapter):
                 {"id": eff, "limit": {"context": self.max_tokens, "output": self.max_tokens}}
             ],
         }
-        headers = self._attribution_headers(session_id=session_id, card_id=card_id, family_preference=family_preference)
+        headers = self._attribution_headers(session_id=session_id, card_id=card_id)
         if headers:  # absent, never {}, when we know no ids
             skgw["headers"] = headers
         return {"/agent/models.json": json.dumps({"providers": {"skgw": skgw}})}
