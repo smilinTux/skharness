@@ -11,7 +11,13 @@ import subprocess
 from skharness.harness import Harness
 
 from .. import health
-from ..buckets import dispatch_model_of, validate_bucket
+from ..buckets import (
+    BucketError,
+    bucket_sensitivity,
+    dispatch_model_of,
+    validate_bucket,
+    validate_routing_preference,
+)
 from ..grader_pin import grader_bucket
 from ..claude_code import frame
 from ..grading import GRADE_RUBRIC, parse_grade
@@ -90,6 +96,10 @@ class ModelOverrideUnsupported(RuntimeError):
     Raised instead of dropping the override: dropping it would run the call on the
     statically configured model, discarding the requested routing (and with it the
     card's sensitivity ceiling) with no visible signal at all."""
+
+
+class RoutingPreferenceUnsupported(RuntimeError):
+    """A routing preference was requested of an adapter that cannot send it."""
 
 
 def _record_assess_inconclusive(brief: AssessBrief, out: dict) -> None:
@@ -251,6 +261,10 @@ class BaseCliAdapter(Harness):
         of failure this seam exists to prevent. Fail closed and loudly instead."""
         return False
 
+    def supports_routing_preference(self) -> bool:
+        """True only when the adapter emits the validated preference header."""
+        return False
+
     def _stdin_for(self, prompt: str) -> str | None:
         return None
 
@@ -298,14 +312,14 @@ class BaseCliAdapter(Harness):
         repo,
         light: bool = False,
         model: str | None = None,
+        preference: tuple[str, ...] | None = None,
     ) -> dict:
         prompt = frame(instruction, data)
         image = getattr(repo, "sandbox_image", None) or self._image()
-        # One kwargs dict feeds BOTH hooks, so _argv and _config_files can never be
-        # handed different model ids. They must agree: _config_files DECLARES the
-        # model to the CLI and _argv REQUESTS it, so a disagreement means the CLI
-        # asks for a model it never declared.
-        mkw: dict = {}
+        # The model feeds both hooks because declaration and request must agree.
+        # Preference is config-only and must never reach a concrete argv hook.
+        argv_kw: dict = {}
+        config_kw: dict = {}
         if model is not None:
             if not self.supports_model_override():
                 raise ModelOverrideUnsupported(
@@ -314,16 +328,30 @@ class BaseCliAdapter(Harness):
                     "model without the requested routing."
                 )
             validate_bucket(model)  # never emit an unvalidated bucket id
-            mkw["model"] = model
+            argv_kw["model"] = model
+            config_kw["model"] = model
+        if preference is not None:
+            if model is None:
+                raise BucketError(
+                    "routing preference requires a validated per-call bucket"
+                )
+            if not self.supports_routing_preference():
+                raise RoutingPreferenceUnsupported(
+                    f"{self.name} adapter cannot honour a routing preference"
+                )
+            config_kw["preference"] = validate_routing_preference(
+                preference,
+                sensitivity=bucket_sensitivity(model),
+            )
         spec = LaunchSpec(
             name=self.name,
-            argv=self._argv(prompt, light=light, **mkw),
+            argv=self._argv(prompt, light=light, **argv_kw),
             image=image,
             worktree=worktree,
             auth_mounts=self._auth_mounts(),
             auth_env=self._auth_env(),
             egress_hosts=self.egress_hosts,
-            config_files=self._config_files(**mkw),
+            config_files=self._config_files(**config_kw),
             stdin=self._stdin_for(prompt),
             required_commands=self._required_commands(),
             required_checks=self._required_checks(),
@@ -367,12 +395,19 @@ class BaseCliAdapter(Harness):
         repo,
         light: bool = False,
         model: str | None = None,
+        preference: tuple[str, ...] | None = None,
     ) -> dict:
         parsed: dict = {}
         attempts = self._run_attempts()
         for i in range(attempts):
             raw = self._run_raw(
-                instruction, data, worktree=worktree, repo=repo, light=light, model=model
+                instruction,
+                data,
+                worktree=worktree,
+                repo=repo,
+                light=light,
+                model=model,
+                preference=preference,
             )
             if not (isinstance(raw, dict) and raw.get("is_error")):
                 parsed = self._parse(raw)
@@ -567,7 +602,12 @@ class BaseCliAdapter(Harness):
         # recorded as requested from drifting from the model actually launched.
         model = dispatch_model_of(brief)
         raw = self._run_raw(
-            instruction, data, worktree=brief.worktree, repo=brief.repo, model=model
+            instruction,
+            data,
+            worktree=brief.worktree,
+            repo=brief.repo,
+            model=model,
+            preference=brief.routing_preference,
         )
         usage = raw.get("usage", {}) if isinstance(raw, dict) else {}
         return HarnessResult(

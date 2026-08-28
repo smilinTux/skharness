@@ -10,10 +10,14 @@ from __future__ import annotations
 
 import itertools
 import json
+import types as _t
 
 import pytest
 
-from skharness.autocode.adapters.base import ModelOverrideUnsupported
+from skharness.autocode.adapters.base import (
+    ModelOverrideUnsupported,
+    RoutingPreferenceUnsupported,
+)
 from skharness.autocode.adapters.opencode import OpenCodeAdapter
 from skharness.autocode.adapters.pi import PiAdapter
 from skharness.autocode.buckets import (
@@ -25,13 +29,17 @@ from skharness.autocode.buckets import (
     bucket_for_grade,
     bucket_for_payload,
     bucket_id,
+    bucket_sensitivity,
     dispatch_model_of,
     is_wider_than,
+    routing_preference_for_payload,
     ungraded_floor_bucket,
     validate_bucket,
+    validate_routing_preference,
     work_grade,
 )
 from skharness.autocode.engineering import EngineeringExecutor
+from skharness.autocode.types import GateResult, HarnessResult, RepoSpec, WorkItem
 
 GATEWAY_URL = "http://localhost:18780/v1"
 
@@ -209,6 +217,93 @@ def test_graded_executor_dispatch_resolves_the_bucket():
     assert ex._dispatch_model(Item()) == "sk-xl-secret"
 
 
+def _preference_payload(preference, *, sensitivity="public"):
+    return {
+        "work_grade": _grade("L", sensitivity),
+        "meta": {"routing_preference": preference},
+    }
+
+
+def test_governed_preference_is_normalized_and_bound_to_bucket_sensitivity():
+    payload = _preference_payload(["Claude", "qwen3.5", "claude"])
+    assert routing_preference_for_payload(payload) == ("claude", "qwen3.5")
+    assert bucket_sensitivity(bucket_for_payload(payload)) == "public"
+
+
+def test_preference_without_a_complete_grade_is_refused():
+    with pytest.raises(BucketError, match="requires a complete work grade"):
+        routing_preference_for_payload({"meta": {"routing_preference": ["codex"]}})
+
+
+@pytest.mark.parametrize("raw", ["gpt-5.6-sol", "provider/model", "family_name", ""])
+def test_raw_model_id_shapes_are_refused_before_launch(raw):
+    with pytest.raises(BucketError, match="never raw model ids"):
+        validate_routing_preference([raw], sensitivity="public")
+
+
+@pytest.mark.parametrize("sensitivity", ["internal", "secret"])
+def test_free_preference_is_refused_outside_public(sensitivity):
+    with pytest.raises(BucketError, match="only for public"):
+        routing_preference_for_payload(
+            _preference_payload(["free"], sensitivity=sensitivity)
+        )
+
+
+def test_executor_wires_governed_preference_into_the_launch_brief(mocker):
+    repo = RepoSpec(
+        name="r",
+        path="/repos/r",
+        base_branch="main",
+        integration_branch="develop",
+        test_cmd="pytest",
+        ci="none",
+    )
+    cfg = _t.SimpleNamespace(repo_map={"r": repo}, automerge_repos=[])
+    ex = EngineeringExecutor(cfg, board=mocker.Mock(), journal=mocker.Mock())
+    mocker.patch.object(ex, "claim")
+    mocker.patch.object(ex, "make_worktree", return_value="/wt/t1")
+    mocker.patch.object(ex, "_diff", return_value="DIFF")
+    mocker.patch.object(ex, "_head_sha", return_value="sha1")
+    mocker.patch(
+        "skharness.autocode.engineering.external_ci_verdict",
+        return_value="green",
+    )
+    mocker.patch("skharness.autocode.engineering.diff_coverage", return_value=0.95)
+    harness = mocker.Mock(name="harness")
+    harness.name = "pi"
+    harness.run_task.return_value = HarnessResult(
+        ok=True,
+        artifact=None,
+        tokens=0,
+        cost_usd=0.0,
+        raw={},
+    )
+    harness.grade.return_value = GateResult(
+        score=5,
+        passed=True,
+        notes="ready <promise>COMPLETE</promise>",
+        artifact="pr",
+    )
+    item = WorkItem(
+        kind="engineering",
+        ref="t1",
+        source="coord",
+        repo=None,
+        payload={
+            "tags": ["repo:r"],
+            "title": "t",
+            "description": "d",
+            "acceptance": ["a"],
+            **_preference_payload(["claude"]),
+        },
+    )
+
+    assert ex.run(item, harness).passed is True
+    brief = harness.run_task.call_args.args[0]
+    assert dispatch_model_of(brief) == "sk-l-public"
+    assert brief.routing_preference == ("claude",)
+
+
 # -- the per-call seam -----------------------------------------------------------
 
 def test_per_call_override_reaches_argv_and_models_json_together():
@@ -243,6 +338,40 @@ def test_adapter_without_support_refuses_the_override():
     assert a.supports_model_override() is False
     with pytest.raises(ModelOverrideUnsupported):
         a._run_raw("i", "d", worktree="/tmp", repo=None, model="sk-l-secret")
+    assert sb.specs == []
+
+
+def test_preference_reaches_pi_config_but_never_pi_argv():
+    sb = RecordingSandbox()
+    adapter = _pi(sb)
+    adapter._run_raw(
+        "i",
+        "d",
+        worktree="/tmp",
+        repo=None,
+        model="sk-l-public",
+        preference=("claude", "qwen3.5"),
+    )
+    spec = sb.specs[0]
+    config = json.loads(spec.config_files["/agent/models.json"])
+    assert config["providers"]["skgw"]["headers"]["x-sk-prefer"] == (
+        "claude,qwen3.5"
+    )
+
+
+def test_adapter_without_preference_support_refuses_before_spawn(monkeypatch):
+    sb = RecordingSandbox()
+    adapter = _pi(sb)
+    monkeypatch.setattr(adapter, "supports_routing_preference", lambda: False)
+    with pytest.raises(RoutingPreferenceUnsupported):
+        adapter._run_raw(
+            "i",
+            "d",
+            worktree="/tmp",
+            repo=None,
+            model="sk-l-public",
+            preference=("claude",),
+        )
     assert sb.specs == []
 
 
