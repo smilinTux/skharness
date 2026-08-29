@@ -40,6 +40,11 @@ from skharness.autocode.pi_events import (
 )
 from skharness.autocode.sandbox import AuthMount, InspectionScope, LaunchSpec, Sandbox
 from skharness.autocode.sandbox_lifecycle import SandboxOwnership
+from skharness.pi_spawn_control import (
+    Reservation,
+    SpawnControl,
+    SpawnControlError,
+)
 
 from .controller import ArenaController
 from .models import ExperimentState
@@ -240,7 +245,13 @@ class _PiActivityTailer:
 
 
 class SandboxProcessSupervisor:
-    """Cancellable real Docker supervisor; never a FakeSpawner adaptation."""
+    """Cancellable real Docker supervisor; never a FakeSpawner adaptation.
+
+    The production Arena supervisor routes through the same authoritative
+    SpawnControl reservation and final validation boundary as Sandbox.spawn,
+    ensuring zero subprocess or tmux calls when paused, drained, expired, stale,
+    malformed, or unavailable.
+    """
 
     def __init__(
         self,
@@ -254,6 +265,8 @@ class SandboxProcessSupervisor:
         startup_timeout_s: float = 9.0,
         active_run_ids: Callable[[], Iterable[str]] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        spawn_control_path: str | None = None,
+        spawn_actor: str | None = None,
     ) -> None:
         if not sandbox.live_execution:
             raise ValueError("production arena supervisor requires Sandbox(live_execution=True)")
@@ -278,11 +291,41 @@ class SandboxProcessSupervisor:
         self._process: subprocess.Popen | None = None
         self._container_name: str | None = None
         self._cancel_requested = threading.Event()
+        self._spawn_control_path = spawn_control_path
+        self._spawn_actor = spawn_actor
+        self._spawn_control: SpawnControl | None = None
+        self._reservation: Reservation | None = None
 
     @property
     def cancel_bound_s(self) -> float:
         """Maximum blocking wait inside :meth:`cancel`, excluding scheduler drain."""
         return self.docker_timeout_s + self.shutdown_grace_s
+
+    def _get_spawn_control(self) -> SpawnControl:
+        """Get or initialize the SpawnControl instance."""
+        if self._spawn_control is None:
+            state_path = self._spawn_control_path or os.environ.get("SKHARNESS_PI_SPAWN_STATE")
+            if not state_path:
+                raise DockerSupervisorError(
+                    "Arena Pi spawn control is unavailable: SKHARNESS_PI_SPAWN_STATE required"
+                )
+            self._spawn_control = SpawnControl(state_path)
+        return self._spawn_control
+
+    def _get_spawn_actor(self) -> str:
+        """Get the spawn actor identity."""
+        actor = self._spawn_actor or os.environ.get("SKHARNESS_PI_SPAWN_ACTOR")
+        if not actor:
+            raise DockerSupervisorError(
+                "Arena Pi spawn control is unavailable: SKHARNESS_PI_SPAWN_ACTOR required"
+            )
+        return actor
+
+    def _has_spawn_control(self) -> bool:
+        """Check if SpawnControl is configured."""
+        return bool(
+            self._spawn_control_path or os.environ.get("SKHARNESS_PI_SPAWN_STATE")
+        )
 
     def _raise_if_cancelled(self) -> None:
         if self._cancel_requested.is_set():
@@ -350,6 +393,23 @@ class SandboxProcessSupervisor:
 
     def run(self, spec: LaunchSpec, attempt_dir: Path, timeout_s: float) -> tuple[int, str]:
         self._raise_if_cancelled()
+        
+        # Fail closed through SpawnControl before any Docker mutation if configured
+        control: SpawnControl | None = None
+        actor: str | None = None
+        worker_id: str | None = None
+        
+        if self._has_spawn_control():
+            control = self._get_spawn_control()
+            actor = self._get_spawn_actor()
+            worker_id = spec.sandbox_run_id or f"arena-{secrets.token_hex(8)}"
+            try:
+                control.check_open()
+            except (SpawnControlError, ValueError) as exc:
+                raise DockerSupervisorError(
+                    f"Arena Pi spawn denied at control preflight: {exc}"
+                ) from exc
+        
         reconciliation = self.sandbox.maybe_reconcile_orphans(
             active_run_ids=self.active_run_ids(),
             active_lease_ids_authoritative=True,
@@ -378,6 +438,9 @@ class SandboxProcessSupervisor:
         attempt_dir.mkdir(parents=True, exist_ok=True)
         with self._lock:
             self._container_name = container_name
+        
+        # Reserve the worker immediately before the final process mutation
+        reservation: Reservation | None = None
         try:
             preflight_deadline = self.monotonic() + self.preflight_timeout_s
             self.sandbox._ensure_capable(
@@ -426,6 +489,18 @@ class SandboxProcessSupervisor:
             # classification. The arena must inspect State.OOMKilled after exit,
             # so retain the stopped container until this supervisor's finally.
             argv.remove("--rm")
+            
+            # Final validation boundary immediately before subprocess.Popen
+            if control is not None and actor is not None and worker_id is not None:
+                try:
+                    reservation = control.reserve(
+                        worker_id, actor=actor, scope="pi:all", kind="process"
+                    )
+                    control.validate_reservation(reservation)
+                except (SpawnControlError, ValueError) as exc:
+                    raise DockerSupervisorError(
+                        f"Arena Pi spawn denied at final boundary: {exc}"
+                    ) from exc
             with (
                 (attempt_dir / "stdout.log").open("wb") as stdout,
                 (attempt_dir / "stderr.log").open("wb") as stderr,
@@ -504,6 +579,15 @@ class SandboxProcessSupervisor:
                     classification = "oom"
             return exit_code, classification
         finally:
+            # Clean up spawn control reservation
+            if reservation is not None and control is not None and worker_id is not None:
+                try:
+                    control.finish(worker_id, token=reservation.token)
+                except SpawnControlError as exc:
+                    # Log but don't fail the entire cleanup for reservation errors
+                    (attempt_dir / "reservation-cleanup-error.log").write_text(
+                        f"{type(exc).__name__}: {exc}\n", encoding="utf-8"
+                    )
             with self._lock:
                 self._process = None
                 self._container_name = None
