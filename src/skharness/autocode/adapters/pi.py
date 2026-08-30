@@ -352,6 +352,23 @@ class PiAdapter(BaseCliAdapter):
             "gateway_req_id_reason": (HarnessProvenanceReason.GATEWAY_REQ_ID_NOT_OBSERVED),
         }
 
+    def _result_usage(self, raw: dict) -> tuple[int, float]:
+        """Aggregate Pi's provider-owned usage from every assistant call."""
+        tokens = 0
+        cost = 0.0
+        for _event, message in _assistant_message_events(raw):
+            usage = message.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            total = usage.get("totalTokens")
+            if isinstance(total, int) and total >= 0:
+                tokens += total
+            costs = usage.get("cost")
+            total_cost = costs.get("total") if isinstance(costs, dict) else None
+            if isinstance(total_cost, (int, float)) and total_cost >= 0:
+                cost += float(total_cost)
+        return tokens, round(cost, 8)
+
     def _parse(self, raw: dict) -> dict:
         if not isinstance(raw, dict):
             return {}
