@@ -78,9 +78,10 @@ _SANDBOX_CLOUD_TOKEN_ENV = "SKCODE_SANDBOX_ALLOW_CLOUD_TOKEN"
 #: to the Anthropic cloud. skgateway now exposes an Anthropic-compat
 #: ``/v1/messages`` frontend, so the SAME ``claude`` runner can reach these by
 #: pointing ANTHROPIC_BASE_URL at the gateway (see :meth:`_build_env`). skgateway
-#: routes ``sk-default`` (registry role) to local ornith and ``ornith-big`` to the
-#: chiap08 35B backend.
-_GATEWAY_MODELS = {"sk-default", "ornith-big"}
+#: routes ``sk-default`` (registry role) to local ornith and
+#: ``qwen3.8-27b-huihui-abliterated-q4_k_m`` to the chiap08 27B abliterated
+#: backend (it replaced the retired ``ornith-big`` 35B, which now 404s).
+_GATEWAY_MODELS = {"sk-default", "qwen3.8-27b-huihui-abliterated-q4_k_m"}
 
 #: Map the compose-form model ids onto the values passed to ``claude --model``.
 #: For Anthropic ids this is the concrete ``claude`` alias (sonnet/opus). For
@@ -91,7 +92,8 @@ _MODEL_MAP = {
     "claude-sonnet-5": "sonnet",
     "claude-opus-4-8": "opus",
     "sk-default": "sk-default",   # skgateway registry role -> ornith (cloud-free)
-    "ornith-big": "ornith-big",   # skgateway -> chiap08 ornith 35B (cloud-free)
+    # skgateway -> chiap08 27B abliterated (cloud-free); replaced ornith-big 35B
+    "qwen3.8-27b-huihui-abliterated-q4_k_m": "qwen3.8-27b-huihui-abliterated-q4_k_m",
 }
 
 
@@ -789,7 +791,7 @@ class ClaudeCodeHarness(Harness):
             # sandbox-compatible.
             env["ANTHROPIC_BASE_URL"] = self.gateway_base
             env["ANTHROPIC_AUTH_TOKEN"] = self.gateway_token
-            # A gateway model id (sk-default / ornith-big) is not one `claude`
+            # A gateway model id (sk-default / qwen3.8-27b-huihui-abliterated-q4_k_m)
             # ships a context-window for, so it otherwise prints a noisy
             # "not a model this version recognizes" warning into the transcript
             # and assumes a 200k window. Suppress the enforcement so the session
