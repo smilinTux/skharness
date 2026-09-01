@@ -139,6 +139,17 @@ class _ObservedHarness:
         return result
 
 
+def _build_pi_adapter(config, repo, model, *, session_id: str, card_id: str):
+    """Build the cockpit adapter with the run and card already in local scope."""
+    from skharness.autocode.adapters.pi import PiAdapter
+
+    return PiAdapter(
+        model=model, base_url=config.harness_base_url,
+        egress_hosts=config.mcp_endpoints, live_execution=config.live_execution,
+        image=repo.sandbox_image or config.sandbox_image,
+        max_tokens=config.harness_max_tokens, session_id=session_id, card_id=card_id)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--card", required=True, help="coord task id, e.g. a7e3ca15")
@@ -155,7 +166,6 @@ def main(argv=None) -> int:
     from skharness.autocode import config as autocode_config
     from skharness.autocode import digest as digest_mod
     from skharness.autocode import journal as run_journal
-    from skharness.autocode.adapters.pi import PiAdapter
     from skharness.autocode.engineering import EngineeringExecutor
     from skharness.autocode.types import ClaimRaced, WorkItem
 
@@ -199,11 +209,8 @@ def main(argv=None) -> int:
     ex = EngineeringExecutor(config, board, handle, digest_mod,
                              agent_name=args.agent_name)
 
-    real_harness = PiAdapter(
-        model=model, base_url=config.harness_base_url,
-        egress_hosts=config.mcp_endpoints, live_execution=config.live_execution,
-        image=repo.sandbox_image or config.sandbox_image,
-        max_tokens=config.harness_max_tokens)
+    real_harness = _build_pi_adapter(
+        config, repo, model, session_id=run_id, card_id=card)
     harness = _ObservedHarness(real_harness, args.status_dir, card)
 
     try:
