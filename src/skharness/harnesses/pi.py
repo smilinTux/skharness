@@ -10,13 +10,14 @@ launched with ``--model skgw/<model>``, ``--api-key``, ``--no-session`` and JSON
 mode, whose assistant ``message_end`` content is parsed below.
 
 The security-sensitive lifecycle is inherited, not copied, from
-:class:`ClaudeCodeHarness`.  In particular, ``spawn`` is the exact existing
-implementation and therefore runs the four fail-closed guards in its established
-order (profile, allowlisted canonical repo, git ref validation, session-name
-regex), while ``archive`` captures and durably writes the transcript before it
-stops the tmux window.  This subclass only replaces Pi-specific configuration,
-argv, listing metadata, and structured-event parsing.
+:class:`ClaudeCodeHarness`.  In particular, ``spawn`` runs the four fail-closed
+guards in their established order, atomically reserves a collision-safe identity,
+and checks tmux creation/capture receipts before tracking a session. ``archive``
+captures and writes the transcript before teardown and reports teardown failure
+as a partial receipt. Pi provider configuration lives under a controller-owned
+root outside repository worktrees.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -27,8 +28,14 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from skharness.events import EventType, SessionEvent
-from skharness.harness import BackgroundTask, HarnessCapabilities, SessionDescriptor
-from skharness.harnesses.claude_code import ClaudeCodeHarness, parse_windows
+from skharness.harness import (
+    BackgroundTask,
+    HarnessCapabilities,
+    SessionDescriptor,
+    SpawnRejected,
+)
+from skharness.harnesses.claude_code import ClaudeCodeHarness, CommandResult
+from skharness.securefs import SecureDir
 
 _HARNESS = "pi"
 _DEFAULT_MODEL = "sk-codex"
@@ -89,6 +96,7 @@ class PiHarness(ClaudeCodeHarness):
         default_model: str = _DEFAULT_MODEL,
         gateway_base: str | None = None,
         max_tokens: int = _DEFAULT_MAX_TOKENS,
+        config_root: Path | None = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -103,6 +111,21 @@ class PiHarness(ClaudeCodeHarness):
                 "SKCODE_PI_GATEWAY_BASE"
             )
         self.max_tokens = int(max_tokens)
+        # This root is owned by the host controller and deliberately NOT beneath
+        # a repository worktree. A checked-out repository therefore cannot steer
+        # models.json through a committed .pi-coding-agent or ancestor symlink.
+        raw_config_root = (
+            Path(config_root) if config_root else self.worktree_root.parent / "pi-config"
+        )
+        if ".." in raw_config_root.parts:
+            raise ValueError("PiHarness config_root must not contain traversal")
+        self.config_root = raw_config_root.expanduser().absolute()
+        worktree_root = self.worktree_root.expanduser().absolute()
+        if self.config_root == worktree_root or self.config_root.is_relative_to(worktree_root):
+            raise ValueError("PiHarness config_root must be outside repository worktrees")
+        self._secure_config: SecureDir | None = None
+        self._config_dirs: dict[str, SecureDir] = {}
+        self._config_fds: dict[str, int] = {}
 
     @staticmethod
     def _model_name(model: str | None) -> str:
@@ -121,21 +144,11 @@ class PiHarness(ClaudeCodeHarness):
             "hot_set_model": False,
         }
 
-    def _list_windows(self) -> list[SessionDescriptor]:
-        out = self._runner(
-            [
-                "tmux",
-                "list-windows",
-                "-t",
-                self.tmux_session,
-                "-F",
-                "#{window_name}\t#{window_activity}",
-            ]
-        )
-        sessions = parse_windows(out, host=self.host)
+    def _list_windows_checked(self) -> tuple[CommandResult, list[SessionDescriptor]]:
+        result, sessions = super()._list_windows_checked()
         for session in sessions:
             session.harness = self.name
-        return sessions
+        return result, sessions
 
     def _historical_sessions(self, *, limit: int = 20) -> list[SessionDescriptor]:
         """Read only archives produced by this harness from the shared root."""
@@ -170,15 +183,29 @@ class PiHarness(ClaudeCodeHarness):
     ) -> dict[str, str]:
         """Build the complete ``env -i`` environment and private Pi config.
 
+        Configuration is created below ``config_root``, never under ``worktree``;
+        checked-out repository symlinks therefore cannot affect this write path.
         The provider headers are literal validated values already accepted by the
         inherited session-name guard: ``x-agent-id`` names the full operator or
         the fixed sandbox principal, and ``x-session-id`` is the tmux sid.  Pi's
         ``!``/``$`` magic header prefixes are therefore unreachable.
         """
-        sid = worktree.name
+        sid = next(
+            (
+                owned_sid
+                for owned_sid, directory in self._worktree_dirs.items()
+                if directory.proc_path == str(worktree)
+            ),
+            worktree.name,
+        )
         model_name = self._model_name(model or self.default_model)
-        config_dir = worktree / ".pi-coding-agent"
-        config_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            if self._secure_config is None:
+                self._secure_config = SecureDir.anchor(self.config_root)
+            config_dir = self._secure_config.mkdir(sid, exclusive=True)
+            self._config_dirs[sid] = config_dir
+        except OSError as exc:
+            raise SpawnRejected(f"private Pi config reservation failed: {exc}") from exc
         config = {
             "providers": {
                 "skgw": {
@@ -204,15 +231,19 @@ class PiHarness(ClaudeCodeHarness):
                 }
             }
         }
-        config_path = config_dir / "models.json"
-        config_path.write_text(json.dumps(config), encoding="utf-8")
-        config_path.chmod(0o600)
+        try:
+            fd = config_dir.write_exclusive("models.json", json.dumps(config).encode("utf-8"))
+            self._config_fds[sid] = fd
+        except OSError as exc:
+            raise SpawnRejected(f"private Pi models.json create failed: {exc}") from exc
 
         env = {
             "PATH": self.child_path,
             "TERM": "xterm-256color",
             "LANG": os.environ.get("LANG", "C.UTF-8"),
-            "PI_CODING_AGENT_DIR": str(config_dir),
+            # Stable descriptor path to the exact config inode. A swapped parent
+            # or renamed lexical root cannot redirect Pi's later open.
+            "PI_CODING_AGENT_DIR": config_dir.proc_path,
         }
         if profile == "full":
             env["HOME"] = str(self.full_home)

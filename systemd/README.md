@@ -14,9 +14,11 @@ stages the unit; the operator decides when to enable and start it.
 %h/.venvs/skops/bin/python -m skharness --host ${SKCODE_HOSTD_TAILSCALE_IP} --port 9394 --host-id ${SKCODE_HOSTD_HOST_ID}
 ```
 
-It owns one harness (the claude-code tmux adapter) and serves the capauth-gated
-read routes, the static client, **and a write surface**: `POST
-/api/v1/sessions/{sid}/inject`, `/ratify`, `/deny`, `/cancel`, and `POST
+It owns one **host-local** harness (the claude-code tmux adapter by default, or
+Pi when `SKCODE_SESSION_HARNESS=pi` and `SKCODE_PI_GATEWAY_BASE` is explicitly
+configured) and serves the capauth-gated read routes, the static client, **and a
+write surface**: `POST
+/api/v1/sessions/{sid}/inject`, `/ratify`, `/deny`, `/archive`, `/cancel`, and `POST
 /api/v1/dispatch`, which spawns a new agent session (remote code execution).
 Earlier revisions of this file claimed there was no write surface; that was
 stale. The authoritative route and scope table is [../SOP.md](../SOP.md) section 7.
@@ -41,6 +43,11 @@ stale. The authoritative route and scope table is [../SOP.md](../SOP.md) section
    falls back to deny-all only when capauth cannot be imported. Writes need the
    `skcode.inject` scope and dispatch needs `skcode.dispatch`, each additionally
    decided by the capauth PDP at a `VERIFIED` enrollment floor.
+
+A controller must address each target host's daemon. The request `host` and
+`harness` fields must match that daemon; they never redirect local filesystem or
+tmux calls to another machine. This preserves each host's repo allowlist, audit
+log, pause control, attribution, and transcript receipts.
 
 ### Disarming without stopping the unit
 

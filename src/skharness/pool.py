@@ -35,15 +35,22 @@ prompt-injected worker pane's text can never escalate through this stream:
 the controller reads the board and the harness's own session list, never a
 worker's output.
 """
+
 from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterable
 
 from skharness.activity import ActivityContext, ActivityJournal, ActivityKind
-from skharness.harness import Harness, HarnessSession, SessionDescriptor
+from skharness.harness import (
+    Harness,
+    HarnessSession,
+    SessionDescriptor,
+    SpawnOwnershipError,
+    SpawnRejected,
+)
 
 #: A board-query runner: argv -> stdout str. Injectable so tests never touch a
 #: real coord CLI, mirroring the tmux/git ``Runner`` convention in
@@ -145,9 +152,57 @@ class PoolController:
         event. Nothing is touched before the harness's own guards pass.
         """
         desc = SessionDescriptor(
-            repo=repo, branch=branch, model=model, quality=quality, mode=mode,
+            repo=repo,
+            branch=branch,
+            model=model,
+            quality=quality,
+            mode=mode,
         )
-        session = await self.harness.spawn(desc, prompt=prompt)
+        # The controller's owned SID set is part of the harness reservation,
+        # before launch. A harness that cannot honor this boundary is refused by
+        # the base contract without actuating anything.
+        session = await self.harness.spawn_reserved(
+            desc, prompt=prompt, excluded_sids=frozenset(self._pool)
+        )
+        if session.sid in self._pool:
+            # Contract-violating collaborator: contain only the newly returned
+            # unambiguous resource identity. Never archive by the ambiguous SID.
+            # Snapshot the original so an unresolved receipt proves which member
+            # remains actionable and unchanged in this controller.
+            original = self._pool[session.sid]
+            original_state = asdict(original)
+            try:
+                teardown = await self.harness.teardown_owned(session.resource_id)
+            except Exception as exc:  # noqa: BLE001 - preserve ownership on collaborator failure
+                teardown = {
+                    "resource_id": session.resource_id,
+                    "teardown_succeeded": False,
+                    "reason": f"exact-resource teardown raised: {exc}",
+                }
+            if not teardown.get("teardown_succeeded"):
+                teardown_reason = str(
+                    teardown.get("teardown_reason") or teardown.get("reason") or "unknown failure"
+                )
+                receipt = {
+                    "sid": session.sid,
+                    "resource_id": session.resource_id,
+                    "launched": True,
+                    "tracked": False,
+                    "setup_succeeded": True,
+                    "teardown_succeeded": False,
+                    "teardown_reason": teardown_reason,
+                    "original_member_preserved": self._pool.get(session.sid) is original,
+                    "original_member": original_state,
+                }
+                raise SpawnOwnershipError(
+                    f"duplicate pool member session id {session.sid!r}; "
+                    f"unresolved exact-resource teardown: {teardown_reason}",
+                    receipt=receipt,
+                )
+            raise SpawnRejected(
+                f"duplicate pool member session id {session.sid!r}; contained teardown: "
+                f"{teardown.get('reason', '')}"
+            )
         member = PoolMember(
             sid=session.sid,
             lane=lane,
@@ -194,8 +249,13 @@ class PoolController:
         elif len(active) < target:
             for _ in range(target - len(active)):
                 await self.spawn(
-                    lane=lane, repo=repo, branch=branch, prompt=prompt,
-                    model=model, quality=quality, mode=mode,
+                    lane=lane,
+                    repo=repo,
+                    branch=branch,
+                    prompt=prompt,
+                    model=model,
+                    quality=quality,
+                    mode=mode,
                 )
         return self._active_members(lane)
 
@@ -213,8 +273,7 @@ class PoolController:
                 "sid": sid,
                 "archived": False,
                 "reason": (
-                    "not a pool-tracked session (drain is scoped to panes "
-                    "this controller spawned)"
+                    "not a pool-tracked session (drain is scoped to panes this controller spawned)"
                 ),
             }
         result = await self.harness.archive(sid)
@@ -242,8 +301,7 @@ class PoolController:
         safe.
         """
         targets = [
-            m for m in self._pool.values()
-            if not m.drained and (lane is None or m.lane == lane)
+            m for m in self._pool.values() if not m.drained and (lane is None or m.lane == lane)
         ]
         results = []
         for member in targets:

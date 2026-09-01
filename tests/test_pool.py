@@ -5,6 +5,7 @@ style (see test_claude_code_harness.py) rather than mocking PoolController's
 collaborator away, so the allowlist-refusal test below actually exercises
 ClaudeCodeHarness.spawn's own guard, not an assumption about it.
 """
+
 from __future__ import annotations
 
 import json
@@ -14,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from skharness.activity import ActivityJournal, ActivityKind
-from skharness.harness import SpawnRejected
+from skharness.harness import FakeHarness, HarnessSession, SpawnOwnershipError, SpawnRejected
 from skharness.harnesses.claude_code import ClaudeCodeHarness
 from skharness.pool import PoolController
 
@@ -28,6 +29,8 @@ class FakeTmux:
         self.live: set[str] = set()
         self.calls: list[list[str]] = []
         self.transcripts: dict[str, str] = {}
+        self.ids: dict[str, str] = {}
+        self._next_id = 1
 
     def __call__(self, argv: list[str]) -> str:
         self.calls.append(list(argv))
@@ -35,24 +38,28 @@ class FakeTmux:
             return ""
         if "new-window" in argv:
             sid = argv[argv.index("-n") + 1]
+            resource_id = f"@{self._next_id}"
+            self._next_id += 1
             self.live.add(sid)
-            return ""
+            self.ids[resource_id] = sid
+            return resource_id + "\n"
         if "set-window-option" in argv:
             return ""
         if "pipe-pane" in argv:
             return ""
+        if "display-message" in argv:
+            target = argv[argv.index("-t") + 1]
+            return target + "\n" if target in self.ids else ""
         if "list-windows" in argv:
-            lines = ["monitor\t1700000000"] + [
-                f"{sid}\t1700000100" for sid in sorted(self.live)
-            ]
+            lines = ["monitor\t1700000000"] + [f"{sid}\t1700000100" for sid in sorted(self.live)]
             return "\n".join(lines) + "\n"
         if "capture-pane" in argv:
             target = argv[argv.index("-t") + 1]
-            sid = target.rsplit(":", 1)[-1]
+            sid = self.ids.get(target, target.rsplit(":", 1)[-1])
             return self.transcripts.get(sid, f"transcript for {sid}\n")
         if "kill-window" in argv:
             target = argv[argv.index("-t") + 1]
-            sid = target.rsplit(":", 1)[-1]
+            sid = self.ids.pop(target, target.rsplit(":", 1)[-1])
             self.live.discard(sid)
             return ""
         raise AssertionError(f"unexpected tmux call: {argv}")
@@ -167,8 +174,11 @@ async def test_spawn_empty_allowlist_refuses_via_pool(tmp_path):
     tmux = FakeTmux()
     git, gcalls = _git_ok()
     h = ClaudeCodeHarness(
-        host=".158", runner=tmux, git_runner=git,
-        dispatch_repos=[], worktree_root=tmp_path / "wt",
+        host=".158",
+        runner=tmux,
+        git_runner=git,
+        dispatch_repos=[],
+        worktree_root=tmp_path / "wt",
         sessions_root=tmp_path / "agents",
     )
     pool = _controller(h, tmp_path)
@@ -176,6 +186,185 @@ async def test_spawn_empty_allowlist_refuses_via_pool(tmp_path):
     with pytest.raises(SpawnRejected, match="deny all"):
         await pool.spawn(lane="x", repo=str(repo), branch="main", prompt="p")
     assert pool.members() == []
+
+
+@pytest.mark.asyncio
+async def test_pool_rejects_duplicate_member_key_without_overwrite(tmp_path):
+    class DuplicateHarness(FakeHarness):
+        def __init__(self):
+            super().__init__()
+            self.archived = []
+
+        async def spawn_reserved(self, desc, *, prompt, excluded_sids):
+            del prompt, excluded_sids
+            return HarnessSession(
+                sid="sandbox-duplicate",
+                descriptor=desc,
+                status="running",
+                resource_id="@new",
+            )
+
+        async def teardown_owned(self, resource_id):
+            self.archived.append(resource_id)
+            return {"resource_id": resource_id, "teardown_succeeded": True}
+
+    harness = DuplicateHarness()
+    pool = PoolController(harness)
+    original = await pool.spawn(lane="a", repo="", branch="", prompt="one")
+
+    with pytest.raises(SpawnRejected, match="duplicate pool member"):
+        await pool.spawn(lane="b", repo="", branch="", prompt="two")
+
+    assert pool.members() == [original]
+    assert original.lane == "a"
+    assert harness.archived == ["@new"]
+
+
+@pytest.mark.asyncio
+async def test_pool_unresolved_duplicate_preserves_typed_exact_resource_receipt():
+    class DuplicateHarness(FakeHarness):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+            self.teardown_targets = []
+
+        async def spawn_reserved(self, desc, *, prompt, excluded_sids):
+            del prompt, excluded_sids
+            self.calls += 1
+            return HarnessSession(
+                sid="sandbox-shared",
+                descriptor=desc,
+                status="running",
+                resource_id="@original" if self.calls == 1 else "@new",
+            )
+
+        async def teardown_owned(self, resource_id):
+            self.teardown_targets.append(resource_id)
+            return {
+                "resource_id": resource_id,
+                "teardown_succeeded": False,
+                "reason": "forced @new containment failure",
+            }
+
+    harness = DuplicateHarness()
+    pool = PoolController(harness)
+    original = await pool.spawn(lane="original", repo="repo", branch="main", prompt="one")
+    original_state = dict(vars(original))
+
+    with pytest.raises(SpawnOwnershipError) as caught:
+        await pool.spawn(lane="new", repo="other", branch="next", prompt="two")
+
+    receipt = caught.value.receipt
+    assert receipt == {
+        "sid": "sandbox-shared",
+        "resource_id": "@new",
+        "launched": True,
+        "tracked": False,
+        "setup_succeeded": True,
+        "teardown_succeeded": False,
+        "teardown_reason": "forced @new containment failure",
+        "original_member_preserved": True,
+        "original_member": {
+            "sid": "sandbox-shared",
+            "lane": "original",
+            "repo": "repo",
+            "branch": "main",
+            "session": {
+                "sid": "sandbox-shared",
+                "descriptor": {
+                    "sid": "",
+                    "host": "",
+                    "harness": "",
+                    "repo": "repo",
+                    "branch": "main",
+                    "model": "",
+                    "state": "running",
+                    "last_activity": 0.0,
+                    "last_message": "",
+                    "quality": "sandbox",
+                    "permission_mode": "manual",
+                    "mode": "direct",
+                    "source": "interactive",
+                },
+                "status": "running",
+                "branch": "",
+                "forked_from": None,
+                "resource_id": "@original",
+            },
+            "spawned_at": original.spawned_at,
+            "drained": False,
+            "drain_result": {},
+        },
+    }
+    assert harness.teardown_targets == ["@new"]
+    assert pool.members() == [original]
+    assert vars(original) == original_state
+    assert original.session.resource_id == "@original"
+
+
+@pytest.mark.asyncio
+async def test_pool_unresolved_duplicate_teardown_exception_remains_receipted():
+    class RaisingTeardownHarness(FakeHarness):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def spawn_reserved(self, desc, *, prompt, excluded_sids):
+            del prompt, excluded_sids
+            self.calls += 1
+            return HarnessSession(
+                sid="sandbox-shared",
+                descriptor=desc,
+                status="running",
+                resource_id="@original" if self.calls == 1 else "@new",
+            )
+
+        async def teardown_owned(self, resource_id):
+            assert resource_id == "@new"
+            raise OSError("fake teardown transport failed")
+
+    pool = PoolController(RaisingTeardownHarness())
+    original = await pool.spawn(lane="original", repo="", branch="", prompt="one")
+
+    with pytest.raises(SpawnOwnershipError) as caught:
+        await pool.spawn(lane="new", repo="", branch="", prompt="two")
+
+    assert caught.value.receipt["resource_id"] == "@new"
+    assert caught.value.receipt["teardown_succeeded"] is False
+    assert "fake teardown transport failed" in caught.value.receipt["teardown_reason"]
+    assert caught.value.receipt["original_member"]["session"]["resource_id"] == "@original"
+    assert pool.members() == [original]
+
+
+@pytest.mark.asyncio
+async def test_pool_owned_sid_is_reserved_before_launch_and_collision_never_launches():
+    class ReservingHarness(FakeHarness):
+        def __init__(self):
+            super().__init__()
+            self.launches = 0
+            self.next_sid = "sandbox-owned"
+
+        async def spawn_reserved(self, desc, *, prompt, excluded_sids):
+            del prompt
+            if self.next_sid in excluded_sids:
+                raise SpawnRejected("pre-launch SID collision")
+            self.launches += 1
+            return HarnessSession(
+                sid=self.next_sid,
+                descriptor=desc,
+                status="running",
+                resource_id=f"@{self.launches}",
+            )
+
+    harness = ReservingHarness()
+    pool = PoolController(harness)
+    original = await pool.spawn(lane="a", repo="", branch="", prompt="one")
+
+    with pytest.raises(SpawnRejected, match="pre-launch SID collision"):
+        await pool.spawn(lane="b", repo="", branch="", prompt="two")
+
+    assert harness.launches == 1
+    assert pool.members() == [original]
 
 
 # --- scale --------------------------------------------------------------------

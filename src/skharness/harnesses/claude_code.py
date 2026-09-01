@@ -21,6 +21,7 @@ historical sessions dir FIRST, then stops the tmux window. `inject` targets the
 same tmux window with `send-keys` and is safe on a missing/invalid sid (a clean
 no-op that never touches tmux). There is no spawn path here.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -30,6 +31,7 @@ import re
 import secrets
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator, Callable
 
@@ -39,20 +41,42 @@ from skharness.harness import (
     HarnessCapabilities,
     HarnessSession,
     SessionDescriptor,
+    SpawnOwnershipError,
     SpawnRejected,
 )
+from skharness.securefs import SecureDir
 
-Runner = Callable[[list[str]], str]
-#: A git runner returns a CompletedProcess so spawn can read the RETURNCODE (a
-#: bad branch / a failed worktree add must be observable), unlike the str tmux
-#: runner. Injectable so tests never touch a real repo.
+
+@dataclass(frozen=True)
+class CommandResult:
+    """Checked receipt for an argv-only local command.
+
+    ``str`` runner returns are still accepted at the injection boundary for
+    compatibility with older test doubles, but production execution and every
+    load-bearing tmux decision use this typed receipt.
+    """
+
+    argv: tuple[str, ...]
+    returncode: int
+    stdout: str = ""
+    stderr: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.returncode == 0
+
+
+Runner = Callable[[list[str]], CommandResult | subprocess.CompletedProcess | str]
+#: A git runner returns a CompletedProcess so spawn can read the return code.
 GitRunner = Callable[[list[str]], "subprocess.CompletedProcess"]
 
 _SID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_RESOURCE_RE = re.compile(r"^@[0-9]+$")
 _HARNESS = "claude-code"
 _MONITOR_WINDOW = "monitor"
 _DEFAULT_SESSIONS_ROOT = Path.home() / ".skcapstone" / "agents"
 _DEFAULT_WORKTREE_ROOT = Path.home() / ".skcapstone" / "skcode" / "worktrees"
+_SID_ATTEMPTS = 16
 #: A minimal PATH handed to a spawned child (env -i wipes the environment, so a
 #: child needs an explicit PATH to resolve `claude`, `git`, etc.).
 _DEFAULT_CHILD_PATH = (
@@ -90,8 +114,8 @@ _GATEWAY_MODELS = {"sk-default", "ornith-big"}
 _MODEL_MAP = {
     "claude-sonnet-5": "sonnet",
     "claude-opus-4-8": "opus",
-    "sk-default": "sk-default",   # skgateway registry role -> ornith (cloud-free)
-    "ornith-big": "ornith-big",   # skgateway -> chiap08 ornith 35B (cloud-free)
+    "sk-default": "sk-default",  # skgateway registry role -> ornith (cloud-free)
+    "ornith-big": "ornith-big",  # skgateway -> chiap08 ornith 35B (cloud-free)
 }
 
 
@@ -129,9 +153,12 @@ def map_model(model: str | None) -> str:
     return _MODEL_MAP.get(key, "sonnet")
 
 
-def _default_runner(argv: list[str]) -> str:
-    proc = subprocess.run(argv, capture_output=True, text=True, check=False)
-    return proc.stdout
+def _default_runner(argv: list[str]) -> CommandResult:
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, check=False)
+        return CommandResult(tuple(argv), proc.returncode, proc.stdout, proc.stderr)
+    except OSError as exc:
+        return CommandResult(tuple(argv), 127, "", str(exc))
 
 
 def _default_git_runner(argv: list[str]) -> subprocess.CompletedProcess:
@@ -179,10 +206,15 @@ def parse_windows(out: str, *, host: str) -> list[SessionDescriptor]:
                 activity = float(parts[1].strip())
             except ValueError:
                 activity = 0.0
-        sessions.append(SessionDescriptor(
-            sid=name, host=host, harness=_HARNESS, state="running",
-            last_activity=activity,
-        ))
+        sessions.append(
+            SessionDescriptor(
+                sid=name,
+                host=host,
+                harness=_HARNESS,
+                state="running",
+                last_activity=activity,
+            )
+        )
     return sessions
 
 
@@ -233,10 +265,18 @@ def scan_historical(sessions_root, *, host: str, limit: int = 20) -> list[Sessio
             sid = f"{agent_dir.name}-{f.stem}"
             if not _SID_RE.match(sid):
                 continue
-            found.append((mtime, SessionDescriptor(
-                sid=sid, host=host, harness=_HARNESS,
-                state="ended", last_activity=mtime,
-            )))
+            found.append(
+                (
+                    mtime,
+                    SessionDescriptor(
+                        sid=sid,
+                        host=host,
+                        harness=_HARNESS,
+                        state="ended",
+                        last_activity=mtime,
+                    ),
+                )
+            )
     found.sort(key=lambda t: t[0], reverse=True)
     return [sd for _, sd in found[:limit]]
 
@@ -294,12 +334,18 @@ def parse_stream_json_line(line: str, *, ts: float = 0.0) -> list[SessionEvent]:
         if obj.get("subtype") != "init":
             return []
         model = obj.get("model") or "?"
-        return [SessionEvent(
-            type=EventType.STATUS, ts=ts,
-            text=f"session started · model={model}",
-            data={"subtype": "init", "model": obj.get("model"),
-                  "session_id": obj.get("session_id")},
-        )]
+        return [
+            SessionEvent(
+                type=EventType.STATUS,
+                ts=ts,
+                text=f"session started · model={model}",
+                data={
+                    "subtype": "init",
+                    "model": obj.get("model"),
+                    "session_id": obj.get("session_id"),
+                },
+            )
+        ]
     if etype in ("assistant", "user"):
         msg = obj.get("message") or {}
         content = msg.get("content")
@@ -316,31 +362,52 @@ def parse_stream_json_line(line: str, *, ts: float = 0.0) -> list[SessionEvent]:
                 continue
             btype = block.get("type")
             if btype == "text" and block.get("text"):
-                events.append(SessionEvent(
-                    type=EventType.ASSISTANT_TEXT, text=str(block["text"]), ts=ts))
+                events.append(
+                    SessionEvent(type=EventType.ASSISTANT_TEXT, text=str(block["text"]), ts=ts)
+                )
             elif btype == "tool_use":
-                events.append(SessionEvent(
-                    type=EventType.TOOL_CALL, ts=ts,
-                    text=str(block.get("name") or ""),
-                    data={"id": block.get("id"), "name": block.get("name"),
-                          "input": block.get("input")}))
+                events.append(
+                    SessionEvent(
+                        type=EventType.TOOL_CALL,
+                        ts=ts,
+                        text=str(block.get("name") or ""),
+                        data={
+                            "id": block.get("id"),
+                            "name": block.get("name"),
+                            "input": block.get("input"),
+                        },
+                    )
+                )
             elif btype == "tool_result":
-                events.append(SessionEvent(
-                    type=EventType.TOOL_RESULT, ts=ts,
-                    text=_stringify_tool_content(block.get("content")),
-                    data={"tool_use_id": block.get("tool_use_id"),
-                          "is_error": block.get("is_error")}))
+                events.append(
+                    SessionEvent(
+                        type=EventType.TOOL_RESULT,
+                        ts=ts,
+                        text=_stringify_tool_content(block.get("content")),
+                        data={
+                            "tool_use_id": block.get("tool_use_id"),
+                            "is_error": block.get("is_error"),
+                        },
+                    )
+                )
         return events
     if etype == "result":
         is_error = bool(obj.get("is_error"))
         subtype = obj.get("subtype")
         text = "turn failed" if is_error else "turn complete"
-        return [SessionEvent(
-            type=EventType.STATUS, ts=ts, text=text,
-            data={"subtype": subtype, "is_error": is_error,
-                  "num_turns": obj.get("num_turns"),
-                  "stop_reason": obj.get("stop_reason")},
-        )]
+        return [
+            SessionEvent(
+                type=EventType.STATUS,
+                ts=ts,
+                text=text,
+                data={
+                    "subtype": subtype,
+                    "is_error": is_error,
+                    "num_turns": obj.get("num_turns"),
+                    "stop_reason": obj.get("stop_reason"),
+                },
+            )
+        ]
     return []
 
 
@@ -370,6 +437,7 @@ class ClaudeCodeHarness(Harness):
         # --- dispatch (spawn) config (skcode P2) ---
         dispatch_repos=None,
         worktree_root: Path | None = None,
+        reservation_root: Path | None = None,
         git_runner: GitRunner | None = None,
         claude_bin: str = "claude",
         claude_base_args: list[str] | None = None,
@@ -388,10 +456,21 @@ class ClaudeCodeHarness(Harness):
         self.max_polls = max_polls
         # Dispatch config. The allowlist defaults to the SKCODE_DISPATCH_REPOS env
         # (comma list); unset => empty => DENY ALL. Never falls open.
-        raw_allow = dispatch_repos if dispatch_repos is not None else os.environ.get(
-            "SKCODE_DISPATCH_REPOS", "")
+        raw_allow = (
+            dispatch_repos
+            if dispatch_repos is not None
+            else os.environ.get("SKCODE_DISPATCH_REPOS", "")
+        )
         self.dispatch_repos = parse_repo_allowlist(raw_allow)
         self.worktree_root = Path(worktree_root) if worktree_root else _DEFAULT_WORKTREE_ROOT
+        # SID reservations live outside repository worktrees and are made with an
+        # atomic mkdir. They survive this process, so a daemon restart cannot
+        # unknowingly reuse a still-present session identity.
+        self.reservation_root = (
+            Path(reservation_root)
+            if reservation_root
+            else self.worktree_root.parent / "sid-reservations"
+        )
         self._git = git_runner or _default_git_runner
         self.claude_bin = claude_bin
         self.claude_base_args = list(claude_base_args) if claude_base_args else []
@@ -406,9 +485,9 @@ class ClaudeCodeHarness(Harness):
         # ignores the token (auth is off), but `claude` needs a non-empty auth
         # value set, so default one; both are overridable via env for a remote gw.
         self.gateway_base = gateway_base or os.environ.get(
-            "SKCODE_GATEWAY_BASE", "http://localhost:18780")
-        self.gateway_token = gateway_token or os.environ.get(
-            "SKCODE_GATEWAY_TOKEN", "sk-local")
+            "SKCODE_GATEWAY_BASE", "http://localhost:18780"
+        )
+        self.gateway_token = gateway_token or os.environ.get("SKCODE_GATEWAY_TOKEN", "sk-local")
         # CR-6.2 C2 (inject blast radius): the set of session ids THIS daemon
         # actually spawned. inject is scoped to these by default so it can only
         # drive skcode-spawned sessions, never an arbitrary full-privilege agent
@@ -427,20 +506,163 @@ class ClaudeCodeHarness(Harness):
         # (same lifetime as _spawned_sids), so a daemon restart forgets it exactly
         # as it forgets which sessions it spawned.
         self._denied_sids: set[str] = set()
+        # Security-sensitive roots are opened lazily and then held by descriptor.
+        # No later operation re-traverses a replaceable lexical ancestor.
+        self._secure_reservations: SecureDir | None = None
+        self._secure_worktrees: SecureDir | None = None
+        self._secure_sessions: SecureDir | None = None
+        self._transcript_dirs: dict[str, SecureDir] = {}
+        self._worktree_dirs: dict[str, SecureDir] = {}
+        self._stream_dirs: dict[str, SecureDir] = {}
+        self._stream_fds: dict[str, int] = {}
+        self._resource_ids: dict[str, str] = {}
+
+    def _run(self, argv: list[str]) -> CommandResult:
+        """Normalize an injected runner response into a typed command receipt."""
+        try:
+            value = self._runner(argv)
+        except OSError as exc:
+            return CommandResult(tuple(argv), 127, "", str(exc))
+        if isinstance(value, CommandResult):
+            return value
+        if isinstance(value, subprocess.CompletedProcess):
+            return CommandResult(
+                tuple(argv),
+                int(value.returncode),
+                str(value.stdout or ""),
+                str(value.stderr or ""),
+            )
+        if isinstance(value, str):
+            # Compatibility only: legacy fakes represented successful commands
+            # as stdout. Production never takes this branch.
+            return CommandResult(tuple(argv), 0, value, "")
+        return CommandResult(tuple(argv), 125, "", "runner returned no command receipt")
+
+    @staticmethod
+    def _failure(result: CommandResult, operation: str) -> str:
+        detail = (result.stderr or result.stdout).strip() or "no diagnostic"
+        return f"{operation} failed (rc={result.returncode}): {detail}"
+
+    def _secure_root(self, attribute: str, path: Path, purpose: str) -> SecureDir:
+        current = getattr(self, attribute)
+        if current is not None:
+            return current
+        try:
+            current = SecureDir.anchor(path)
+        except OSError as exc:
+            raise SpawnRejected(f"{purpose} unavailable: {exc}") from exc
+        setattr(self, attribute, current)
+        return current
+
+    def _reservation_dir(self) -> SecureDir:
+        return self._secure_root(
+            "_secure_reservations", self.reservation_root, "session reservation root"
+        )
+
+    def _worktree_dir(self) -> SecureDir:
+        return self._secure_root("_secure_worktrees", self.worktree_root, "worktree root")
+
+    def _sessions_dir(self) -> SecureDir:
+        return self._secure_root("_secure_sessions", self.sessions_root, "transcript root")
+
+    def _reserve_sid(self, agent: str, *, excluded_sids: frozenset[str] = frozenset()) -> str:
+        """Atomically reserve a 128-bit SID before any launch.
+
+        The reservation root and worktree root are descriptor-anchored.  A live
+        tmux listing failure is fatal rather than being treated as an empty set.
+        """
+        reservations = self._reservation_dir()
+        worktrees = self._worktree_dir()
+        listing, live = self._list_windows_checked()
+        if not listing.ok:
+            raise SpawnRejected(self._failure(listing, "tmux list-windows"))
+        live_sids = {item.sid for item in live}
+        for _ in range(_SID_ATTEMPTS):
+            sid = f"{agent}-{secrets.token_hex(16)}"
+            if not _SID_RE.fullmatch(sid):
+                raise SpawnRejected(f"session name {sid!r} breaks the [A-Za-z0-9_-]+ charset")
+            if sid in excluded_sids or sid in self._spawned_sids or sid in live_sids:
+                continue
+            if worktrees.exists(sid):
+                continue
+            try:
+                marker = reservations.mkdir(sid, exclusive=True)
+                marker.close()
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                raise SpawnRejected(f"session reservation failed: {exc}") from exc
+            return sid
+        raise SpawnRejected(
+            f"could not reserve a unique session id after {_SID_ATTEMPTS} attempts"
+        )
 
     def capabilities(self) -> HarnessCapabilities:
         # Session plane over a PTY (tmux): reads + P1 inject/archive + P2 spawn.
-        return {"session_resume": True, "structured_output": "none",
-                "sandbox": False, "tool_restrictions": False,
-                "task_plane": False, "session_plane": True,
-                "headless_api": "pty", "hot_set_model": False}
+        return {
+            "session_resume": True,
+            "structured_output": "none",
+            "sandbox": False,
+            "tool_restrictions": False,
+            "task_plane": False,
+            "session_plane": True,
+            "headless_api": "pty",
+            "hot_set_model": False,
+        }
+
+    def _list_windows_checked(self) -> tuple[CommandResult, list[SessionDescriptor]]:
+        result = self._run(
+            [
+                "tmux",
+                "list-windows",
+                "-t",
+                self.tmux_session,
+                "-F",
+                "#{window_name}\t#{window_activity}",
+            ]
+        )
+        rows = parse_windows(result.stdout, host=self.host) if result.ok else []
+        return result, rows
 
     def _list_windows(self) -> list[SessionDescriptor]:
-        out = self._runner([
-            "tmux", "list-windows", "-t", self.tmux_session,
-            "-F", "#{window_name}\t#{window_activity}",
-        ])
-        return parse_windows(out, host=self.host)
+        result, rows = self._list_windows_checked()
+        if not result.ok:
+            raise RuntimeError(self._failure(result, "tmux list-windows"))
+        return rows
+
+    def _target_if_live(self, sid: str) -> tuple[str | None, str | None]:
+        """Resolve a live target without weakening an owned exact identity.
+
+        Sessions created by this harness retain tmux's immutable ``@N`` window
+        identity.  Once present, that identity is the only acceptable target:
+        a same-name original or replacement must never become a fallback.  The
+        name lookup remains solely for legacy windows this process did not
+        create, preserving the pre-existing attach/archive surface.
+        """
+        resource_id = self._resource_ids.get(sid)
+        if resource_id is not None:
+            if not _RESOURCE_RE.fullmatch(resource_id):
+                return None, "invalid retained resource identity"
+            liveness = self._run(
+                ["tmux", "display-message", "-p", "-t", resource_id, "#{window_id}"]
+            )
+            if not liveness.ok:
+                return None, self._failure(liveness, "tmux exact-resource liveness check")
+            observed = liveness.stdout.strip().splitlines()
+            if observed != [resource_id]:
+                return None, "tmux exact-resource liveness check returned a different identity"
+            return resource_id, None
+
+        listing, live = self._list_windows_checked()
+        if not listing.ok:
+            return None, self._failure(listing, "tmux list-windows")
+        if sid not in {session.sid for session in live}:
+            return None, "no live session"
+        return f"{self.tmux_session}:{sid}", None
+
+    def _target_for_capture(self, sid: str) -> str:
+        """Prefer retained exact identity for read-only legacy stream capture."""
+        return self._resource_ids.get(sid, f"{self.tmux_session}:{sid}")
 
     async def list_sessions(self) -> list[SessionDescriptor]:
         live = self._list_windows()
@@ -448,36 +670,44 @@ class ClaudeCodeHarness(Harness):
         return live + historical
 
     def _persist_transcript(self, sid: str, transcript: str) -> Path:
-        """Write the session's final transcript to the historical sessions dir so
-        `scan_historical` (and thus `list_sessions`) picks it up as an ended row.
-
-        The window name is `<agent>-<short_id>`; the agent is the part up to the
-        last '-'. The record is a JSON file under `<root>/<agent>/sessions/<sid>.json`
-        so the archived session survives with its transcript after the PTY is gone.
-        """
+        """Durably write a transcript through descriptor-anchored directories."""
         agent = sid.rsplit("-", 1)[0] if "-" in sid else sid
-        sdir = self.sessions_root / agent / "sessions"
-        sdir.mkdir(parents=True, exist_ok=True)
-        path = sdir / f"{sid}.json"
-        record = {
-            "sid": sid,
-            "agent": agent,
-            "harness": self.name,
-            "host": self.host,
-            "state": "archived",
-            "archived_at": time.time(),
-            "transcript": transcript,
-        }
-        path.write_text(json.dumps(record, indent=2))
-        return path
+        root = self._sessions_dir()
+        agent_dir = root.mkdir(agent)
+        try:
+            sessions = agent_dir.mkdir("sessions")
+            self._transcript_dirs[sid] = sessions
+            try:
+                name = f"{sid}.json"
+                record = {
+                    "sid": sid,
+                    "agent": agent,
+                    "harness": self.name,
+                    "host": self.host,
+                    "state": "archived",
+                    "archived_at": time.time(),
+                    "transcript": transcript,
+                }
+                fd = sessions.write_exclusive(name, json.dumps(record, indent=2).encode("utf-8"))
+                os.close(fd)
+                # Receipt path is descriptor-based, so it still names the exact
+                # archived inode if a configured ancestor is replaced later.
+                return Path(sessions.child_proc_path(name))
+            finally:
+                # Retained in _transcript_dirs so descriptor receipt paths remain
+                # valid for this harness lifetime.
+                pass
+        finally:
+            agent_dir.close()
 
     async def archive(self, sid: str) -> dict:
         """Archive = STOP + PERSIST a session (never a destructive kill).
 
         Persists the session's full tmux scrollback to the historical sessions dir
         FIRST, then stops the session's tmux window with `tmux kill-window`. Ordering
-        is load-bearing: the transcript is on disk before the PTY is stopped, so a
-        failure can never leave a stopped session with a lost transcript.
+        is load-bearing: the transcript is on disk before the PTY is stopped. A
+        teardown failure returns ``archived: False`` plus a partial persistence
+        receipt rather than pretending the still-live session was archived.
 
         Idempotent + safe: an invalid sid, or a sid with no live tmux window (already
         archived / never running), returns a clean ``archived: False`` no-op result
@@ -486,23 +716,63 @@ class ClaudeCodeHarness(Harness):
         if not _SID_RE.match(sid):
             return {"sid": sid, "archived": False, "reason": "invalid session id"}
 
-        live_ids = {s.sid for s in self._list_windows()}
-        if sid not in live_ids:
-            # Already gone / never running: nothing to stop, no-op (idempotent).
+        target, target_error = self._target_if_live(sid)
+        if target is None:
+            # A retained @N is never replaced with a caller-visible name.  This
+            # also makes a second archive safe when a same-name original remains.
+            result = {
+                "sid": sid,
+                "archived": False,
+                "reason": (
+                    "no live session (already archived or never running)"
+                    if target_error == "no live session"
+                    else str(target_error)
+                ),
+            }
+            if target_error != "no live session":
+                result.update(transcript_persisted=False, teardown_succeeded=False)
+            return result
+
+        # 1. PERSIST first: capture the full scrollback (-S - = from the top).
+        capture = self._run(["tmux", "capture-pane", "-p", "-S", "-", "-t", target])
+        if not capture.ok:
             return {
                 "sid": sid,
                 "archived": False,
-                "reason": "no live session (already archived or never running)",
+                "transcript_persisted": False,
+                "teardown_succeeded": False,
+                "reason": self._failure(capture, "tmux capture-pane"),
             }
-
-        target = f"{self.tmux_session}:{sid}"
-        # 1. PERSIST first: capture the full scrollback (-S - = from the top).
-        transcript = self._runner(["tmux", "capture-pane", "-p", "-S", "-", "-t", target])
-        path = self._persist_transcript(sid, transcript)
-        # 2. STOP only after the transcript is durable: kill just this window, not
-        #    the whole `skchat-agents` session (least-destructive stop of the PTY).
-        self._runner(["tmux", "kill-window", "-t", target])
-        return {"sid": sid, "archived": True, "transcript_path": str(path)}
+        try:
+            path = self._persist_transcript(sid, capture.stdout)
+        except (OSError, SpawnRejected) as exc:
+            return {
+                "sid": sid,
+                "archived": False,
+                "transcript_persisted": False,
+                "teardown_succeeded": False,
+                "reason": f"transcript persistence failed: {exc}",
+            }
+        # 2. STOP only after persistence. A teardown failure is a PARTIAL result:
+        # the receipt names the durable transcript but never claims archival.
+        teardown = self._run(["tmux", "kill-window", "-t", target])
+        if not teardown.ok:
+            return {
+                "sid": sid,
+                "archived": False,
+                "partial": True,
+                "transcript_persisted": True,
+                "teardown_succeeded": False,
+                "transcript_path": str(path),
+                "reason": self._failure(teardown, "tmux kill-window"),
+            }
+        return {
+            "sid": sid,
+            "archived": True,
+            "transcript_persisted": True,
+            "teardown_succeeded": True,
+            "transcript_path": str(path),
+        }
 
     async def cancel(self, sid: str) -> dict:
         """Cancel a live session: kill its process group, then drop the window.
@@ -524,16 +794,30 @@ class ClaudeCodeHarness(Harness):
         if not _SID_RE.match(sid):
             return {"sid": sid, "cancelled": False, "reason": "invalid session id"}
 
-        live_ids = {s.sid for s in self._list_windows()}
-        if sid not in live_ids:
+        target, target_error = self._target_if_live(sid)
+        if target is None:
+            result = {
+                "sid": sid,
+                "cancelled": False,
+                "reason": (
+                    "no live session (already ended or never running)"
+                    if target_error == "no live session"
+                    else str(target_error)
+                ),
+            }
+            if target_error != "no live session":
+                result["teardown_succeeded"] = False
+            return result
+
+        panes = self._run(["tmux", "list-panes", "-t", target, "-F", "#{pane_pid}"])
+        if not panes.ok:
             return {
                 "sid": sid,
                 "cancelled": False,
-                "reason": "no live session (already ended or never running)",
+                "teardown_succeeded": False,
+                "reason": self._failure(panes, "tmux list-panes"),
             }
-
-        target = f"{self.tmux_session}:{sid}"
-        pid_out = self._runner(["tmux", "list-panes", "-t", target, "-F", "#{pane_pid}"])
+        pid_out = panes.stdout
         pid = ""
         stripped = (pid_out or "").strip()
         if stripped:
@@ -541,8 +825,24 @@ class ClaudeCodeHarness(Harness):
         if pid.isdigit():
             # Negative pid == kill(2) targets the whole process GROUP, not just
             # this one process, so a child the session started dies with it.
-            self._runner(["kill", "-KILL", f"-{pid}"])
-        self._runner(["tmux", "kill-window", "-t", target])
+            killed = self._run(["kill", "-KILL", f"-{pid}"])
+            if not killed.ok:
+                return {
+                    "sid": sid,
+                    "cancelled": False,
+                    "teardown_succeeded": False,
+                    "reason": self._failure(killed, "process-group kill"),
+                }
+        teardown = self._run(["tmux", "kill-window", "-t", target])
+        if not teardown.ok:
+            return {
+                "sid": sid,
+                "cancelled": False,
+                "partial": bool(pid),
+                "process_group_killed": bool(pid),
+                "teardown_succeeded": False,
+                "reason": self._failure(teardown, "tmux kill-window"),
+            }
         return {"sid": sid, "cancelled": True}
 
     async def deny(self, sid: str) -> dict:
@@ -594,25 +894,35 @@ class ClaudeCodeHarness(Harness):
             return {
                 "sid": sid,
                 "denied": False,
-                "reason": ("not a daemon-spawned session (deny is scoped to "
-                           "sessions this daemon spawned)"),
+                "reason": (
+                    "not a daemon-spawned session (deny is scoped to sessions this daemon spawned)"
+                ),
             }
 
-        live_ids = {s.sid for s in self._list_windows()}
-        if sid not in live_ids:
+        target, target_error = self._target_if_live(sid)
+        if target is None:
             return {
                 "sid": sid,
                 "denied": False,
-                "reason": "no live session (already ended or never running)",
+                "reason": (
+                    "no live session (already ended or never running)"
+                    if target_error == "no live session"
+                    else str(target_error)
+                ),
             }
 
-        target = f"{self.tmux_session}:{sid}"
         # pane_dead is tmux's own answer to "has this pane's process exited?" (the
         # window outlives it because spawn sets remain-on-exit). Ask BEFORE
         # signalling so "interrupted" reports what really happened rather than
         # whether a kill command was issued.
-        pane_out = self._runner(
-            ["tmux", "list-panes", "-t", target, "-F", "#{pane_pid} #{pane_dead}"])
+        panes = self._run(["tmux", "list-panes", "-t", target, "-F", "#{pane_pid} #{pane_dead}"])
+        if not panes.ok:
+            return {
+                "sid": sid,
+                "denied": False,
+                "reason": self._failure(panes, "tmux list-panes"),
+            }
+        pane_out = panes.stdout
         fields = ((pane_out or "").strip().splitlines() or [""])[0].split()
         pid = fields[0] if fields else ""
         dead = fields[1] if len(fields) > 1 else ""
@@ -620,7 +930,14 @@ class ClaudeCodeHarness(Harness):
         if pid.isdigit() and dead != "1":
             # Negative pid == kill(2) targets the process GROUP. SIGINT, not
             # SIGKILL: the turn is refused, the window and its scrollback stay.
-            self._runner(["kill", "-INT", f"-{pid}"])
+            signal = self._run(["kill", "-INT", f"-{pid}"])
+            if not signal.ok:
+                return {
+                    "sid": sid,
+                    "denied": False,
+                    "interrupted": False,
+                    "reason": self._failure(signal, "process-group interrupt"),
+                }
             interrupted = True
 
         self._denied_sids.add(sid)
@@ -628,9 +945,11 @@ class ClaudeCodeHarness(Harness):
             "sid": sid,
             "denied": True,
             "interrupted": interrupted,
-            "reason": ("in-flight turn interrupted; session refused (not resumable)"
-                       if interrupted else
-                       "nothing in flight to interrupt; session refused (not resumable)"),
+            "reason": (
+                "in-flight turn interrupted; session refused (not resumable)"
+                if interrupted
+                else "nothing in flight to interrupt; session refused (not resumable)"
+            ),
         }
 
     def _inject_target_allowed(self, sid: str) -> bool:
@@ -687,16 +1006,22 @@ class ClaudeCodeHarness(Harness):
             return {
                 "sid": sid,
                 "injected": False,
-                "reason": ("not a daemon-spawned session (inject is scoped to "
-                           "sessions this daemon spawned)"),
+                "reason": (
+                    "not a daemon-spawned session (inject is scoped to "
+                    "sessions this daemon spawned)"
+                ),
             }
 
-        live_ids = {s.sid for s in self._list_windows()}
-        if sid not in live_ids:
+        target, target_error = self._target_if_live(sid)
+        if target is None:
             return {
                 "sid": sid,
                 "injected": False,
-                "reason": "no live session (already archived or never running)",
+                "reason": (
+                    "no live session (already archived or never running)"
+                    if target_error == "no live session"
+                    else str(target_error)
+                ),
             }
 
         ctx = self._resume_ctx.get(sid)
@@ -704,8 +1029,10 @@ class ClaudeCodeHarness(Harness):
             return {
                 "sid": sid,
                 "injected": False,
-                "reason": ("not a resumable session (only interactive sessions this "
-                           "daemon spawned can be injected)"),
+                "reason": (
+                    "not a resumable session (only interactive sessions this "
+                    "daemon spawned can be injected)"
+                ),
             }
 
         session_id = self._read_session_id(sid)
@@ -720,25 +1047,54 @@ class ClaudeCodeHarness(Harness):
         env = self._build_env(ctx["profile"], ctx["agent"], worktree, ctx["model"])
         resume = self._resume_argv(ctx["profile"], ctx["model"], session_id, text)
         env_argv = ["env", "-i", *[f"{k}={v}" for k, v in env.items()]]
-        target = f"{self.tmux_session}:{sid}"
         # Respawn the pane with the resume turn. respawn-pane execs the argv after
         # '--' DIRECTLY (no sh -c), same as new-window; -k replaces the prior
         # (usually exited) one-shot process; -c scopes cwd to the worktree. The
         # message is a distinct argv element, never shell-parsed; the sid is
         # charset-validated above.
-        self._runner([
-            "tmux", "respawn-pane", "-k", "-c", str(worktree), "-t", target,
-            "--", *env_argv, *resume,
-        ])
+        respawn = self._run(
+            [
+                "tmux",
+                "respawn-pane",
+                "-k",
+                "-c",
+                str(worktree),
+                "-t",
+                target,
+                "--",
+                *env_argv,
+                *resume,
+            ]
+        )
+        if not respawn.ok:
+            return {
+                "sid": sid,
+                "injected": False,
+                "reason": self._failure(respawn, "tmux respawn-pane"),
+            }
         # Re-attach pipe-pane so the resumed turn's JSONL appends to the same log.
         # NO -o here: `-o` is a TOGGLE ("open only if none exists"), and respawn
         # preserves the spawn-time pipe, so `-o` would CLOSE it and the resumed
         # turn's output would never reach the file. Plain pipe-pane unconditionally
         # (re)opens the pipe; `cat >>` keeps appending to the same log.
-        self._runner([
-            "tmux", "pipe-pane", "-t", target,
-            f"cat >> '{self._stream_log_path(sid)}'",
-        ])
+        capture = self._run(
+            [
+                "tmux",
+                "pipe-pane",
+                "-t",
+                target,
+                f"cat >> '{self._stream_log_path(sid)}'",
+            ]
+        )
+        if not capture.ok:
+            return {
+                "sid": sid,
+                "injected": False,
+                "partial": True,
+                "turn_started": True,
+                "capture_attached": False,
+                "reason": self._failure(capture, "tmux pipe-pane"),
+            }
         return {"sid": sid, "injected": True}
 
     # --- spawn: start a NEW session (the Dispatch unlock, skcode P2) -----------
@@ -758,8 +1114,9 @@ class ClaudeCodeHarness(Harness):
             return False
         return getattr(r, "returncode", 1) == 0
 
-    def _build_env(self, profile: str, agent: str, worktree: Path,
-                   model: str | None = None) -> dict[str, str]:
+    def _build_env(
+        self, profile: str, agent: str, worktree: Path, model: str | None = None
+    ) -> dict[str, str]:
         """Construct the child's ENTIRE environment for a profile (spec 6.2).
 
         Enforcement is by CONSTRUCTION, not by a flag: the returned dict is the
@@ -834,9 +1191,15 @@ class ClaudeCodeHarness(Harness):
         shell string. The sk* MCP config is added ONLY for the full profile;
         ``--model`` is ALWAYS passed, mapped via :func:`map_model`.
         """
-        argv = [self.claude_bin, "-p", "--dangerously-skip-permissions",
-                "--output-format", "stream-json", "--verbose",
-                *self.claude_base_args]
+        argv = [
+            self.claude_bin,
+            "-p",
+            "--dangerously-skip-permissions",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            *self.claude_base_args,
+        ]
         if profile == "full" and self.mcp_config:
             argv += ["--mcp-config", str(self.mcp_config)]
         argv += ["--model", map_model(model)]
@@ -845,8 +1208,7 @@ class ClaudeCodeHarness(Harness):
         argv += [str(prompt or "")]
         return argv
 
-    def _resume_argv(self, profile: str, model: str, session_id: str,
-                     text: str) -> list[str]:
+    def _resume_argv(self, profile: str, model: str, session_id: str, text: str) -> list[str]:
         """Build the ``claude -p --resume`` argv for an inject follow-up (B2).
 
         Same headless flags as :meth:`_claude_argv`, plus ``--resume <session_id>``
@@ -854,10 +1216,17 @@ class ClaudeCodeHarness(Harness):
         argv element (DATA, never shell-parsed). ``session_id`` is a claude-issued
         UUID read from the session's own stream-json init event.
         """
-        argv = [self.claude_bin, "-p", "--resume", str(session_id),
-                "--dangerously-skip-permissions",
-                "--output-format", "stream-json", "--verbose",
-                *self.claude_base_args]
+        argv = [
+            self.claude_bin,
+            "-p",
+            "--resume",
+            str(session_id),
+            "--dangerously-skip-permissions",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            *self.claude_base_args,
+        ]
         if profile == "full" and self.mcp_config:
             argv += ["--mcp-config", str(self.mcp_config)]
         argv += ["--model", map_model(model)]
@@ -865,6 +1234,15 @@ class ClaudeCodeHarness(Harness):
         return argv
 
     async def spawn(self, desc: SessionDescriptor, *, prompt: str) -> HarnessSession:
+        return await self.spawn_reserved(desc, prompt=prompt, excluded_sids=frozenset())
+
+    async def spawn_reserved(
+        self,
+        desc: SessionDescriptor,
+        *,
+        prompt: str,
+        excluded_sids: frozenset[str],
+    ) -> HarnessSession:
         """Start a NEW claude-code session in an isolated worktree + tmux window.
 
         Every RCE input guard (spec 7.3) runs BEFORE any subprocess, and each fails
@@ -905,7 +1283,8 @@ class ClaudeCodeHarness(Harness):
         if repo:
             if not self.dispatch_repos:
                 raise SpawnRejected(
-                    "repo allowlist is empty (SKCODE_DISPATCH_REPOS unset): deny all")
+                    "repo allowlist is empty (SKCODE_DISPATCH_REPOS unset): deny all"
+                )
             repo_real = os.path.realpath(os.path.expanduser(repo))
             if repo_real not in self.dispatch_repos:
                 raise SpawnRejected(f"repo {repo!r} is not on the dispatch allowlist")
@@ -919,16 +1298,13 @@ class ClaudeCodeHarness(Harness):
         agent = self.full_agent if profile == "full" else "sandbox"
         if not _SID_RE.match(agent):
             raise SpawnRejected(f"agent name {agent!r} breaks the [A-Za-z0-9_-]+ charset")
-        sid = f"{agent}-{secrets.token_hex(4)}"
-        if not _SID_RE.match(sid):
-            raise SpawnRejected(f"session name {sid!r} breaks the [A-Za-z0-9_-]+ charset")
+        sid = self._reserve_sid(agent, excluded_sids=excluded_sids)
 
         # --- all guards passed: now (and only now) touch the machine ---
-        worktree = self.worktree_root / sid
-        try:
-            self.worktree_root.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
+        worktree_root = self._worktree_dir()
+        # Subprocesses receive the stable descriptor path, never the replaceable
+        # configured spelling. Keep the directory descriptor for stream/inject.
+        worktree = Path(worktree_root.child_proc_path(sid))
         if repo_real:
             # Each repo session gets its OWN fresh branch off the requested base via
             # `worktree add -b`: dispatching onto `main` (already checked out in the
@@ -937,18 +1313,39 @@ class ClaudeCodeHarness(Harness):
             # the new branch name is charset-safe by construction (`skcode/<sid>`).
             session_branch = f"skcode/{sid}"
             wt = self._git(
-                ["git", "-C", repo_real, "worktree", "add", "-b", session_branch, str(worktree), branch]
+                [
+                    "git",
+                    "-C",
+                    repo_real,
+                    "worktree",
+                    "add",
+                    "-b",
+                    session_branch,
+                    str(worktree),
+                    branch,
+                ]
             )
             if getattr(wt, "returncode", 1) != 0:
                 raise SpawnRejected(
-                    f"git worktree add failed: {getattr(wt, 'stderr', '') or 'unknown error'}")
+                    f"git worktree add failed: {getattr(wt, 'stderr', '') or 'unknown error'}"
+                )
         else:
             # Repo-less scratch session (fast/direct model work): an isolated empty
             # dir, no repo access. HOME points here (env -i), so nothing leaks.
             try:
-                worktree.mkdir(parents=True, exist_ok=True)
+                scratch = worktree_root.mkdir(sid, exclusive=True)
+                self._worktree_dirs[sid] = scratch
             except OSError as exc:
-                raise SpawnRejected(f"scratch dir create failed: {exc}")
+                raise SpawnRejected(f"scratch dir create failed: {exc}") from exc
+
+        # A real git worktree was created through the anchored /proc path. Open
+        # and retain its exact inode before creating controller state below it.
+        if sid not in self._worktree_dirs:
+            try:
+                self._worktree_dirs[sid] = worktree_root.mkdir(sid)
+            except OSError as exc:
+                raise SpawnRejected(f"worktree anchoring failed: {exc}") from exc
+        worktree = Path(self._worktree_dirs[sid].proc_path)
 
         # B2: both modes launch headless stream-json (-p skips onboarding), so no
         # ~/.claude.json seed is written for either. The mode difference is only
@@ -959,31 +1356,88 @@ class ClaudeCodeHarness(Harness):
         # EVERY session emits stream-json; make the capture dir now so the pipe-pane
         # `cat >>` (attached below) can write the JSONL into it. Its existence is
         # ALSO the signal stream() uses to parse structurally vs screen-scrape.
-        stream_log = self._stream_log_path(sid)
         try:
-            stream_log.parent.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
+            stream_dir = self._worktree_dirs[sid].mkdir(".skcode", exclusive=True)
+            # The live capture is descriptor-only: making an empty writable inode
+            # visible would let a same-uid actor hard-link it before tmux writes.
+            # O_TMPFILE keeps it unlinked for its whole mutable lifetime.
+            stream_fd = stream_dir.create_unlinked_file()
+        except OSError as exc:
+            raise SpawnRejected(f"structured capture state create failed: {exc}") from exc
+        self._stream_dirs[sid] = stream_dir
+        self._stream_fds[sid] = stream_fd
+        stream_log = Path(f"/proc/{os.getpid()}/fd/{stream_fd}")
         # Ensure the target tmux session exists (a fresh host has no tmux server,
         # so `new-window -t skchat-agents` would silently fail and the session
         # would never appear in list_sessions). `new-session -d` creates it if
         # absent; if it already exists tmux errors harmlessly and we ignore it.
         # argv-only.
-        self._runner(["tmux", "new-session", "-d", "-s", self.tmux_session])
+        tmux_session = self._run(["tmux", "new-session", "-d", "-s", self.tmux_session])
+        if not tmux_session.ok:
+            # `new-session` legitimately fails when the named session already
+            # exists. Verify that exact condition; every other failure is fatal.
+            existing = self._run(["tmux", "has-session", "-t", self.tmux_session])
+            if not existing.ok:
+                raise SpawnRejected(self._failure(tmux_session, "tmux new-session"))
         # tmux new-window with the command AFTER '--' as separate argv elements is
         # exec'd DIRECTLY by tmux (no sh -c), so neither the env pairs nor the
         # prompt are ever shell-interpreted. The sid is charset-validated above.
-        self._runner([
-            "tmux", "new-window", "-t", self.tmux_session, "-n", sid,
-            "-c", str(worktree), "--", *env_argv, *launch,
-        ])
+        created = self._run(
+            [
+                "tmux",
+                "new-window",
+                "-P",
+                "-F",
+                "#{window_id}",
+                "-t",
+                self.tmux_session,
+                "-n",
+                sid,
+                "-c",
+                str(worktree),
+                "--",
+                *env_argv,
+                *launch,
+            ]
+        )
+        if not created.ok:
+            raise SpawnRejected(self._failure(created, "tmux new-window"))
+        identities = created.stdout.strip().splitlines()
+        if len(identities) != 1 or not _RESOURCE_RE.fullmatch(identities[0]):
+            # Creation succeeded but did not provide the atomic ownership
+            # receipt.  A name-based rollback could destroy a pre-existing
+            # duplicate, so fail with an unresolved containment receipt instead.
+            receipt = {
+                "sid": sid,
+                "resource_id": "",
+                "launched": True,
+                "tracked": False,
+                "setup_succeeded": False,
+                "teardown_succeeded": False,
+                "setup_reason": "tmux new-window returned no valid window identity",
+                "teardown_reason": "exact resource identity unavailable; name rollback refused",
+            }
+            raise SpawnOwnershipError(receipt["setup_reason"], receipt=receipt)
+        resource_id = identities[0]
+        # Retain the atomic receipt before any later setup can fail.  Every
+        # ownership-sensitive command below and every later lifecycle verb uses
+        # this exact @N, never session:sid.
+        self._resource_ids[sid] = resource_id
         # Keep the pane after the print-mode command exits so its output stays
         # viewable + listable instead of the window vanishing the instant claude
         # finishes. Set immediately (well within the multi-second model call).
-        self._runner([
-            "tmux", "set-window-option", "-t", f"{self.tmux_session}:{sid}",
-            "remain-on-exit", "on",
-        ])
+        remain = self._run(
+            [
+                "tmux",
+                "set-window-option",
+                "-t",
+                resource_id,
+                "remain-on-exit",
+                "on",
+            ]
+        )
+        if not remain.ok:
+            self._rollback_created_window(sid, resource_id, "tmux set-window-option", remain)
         # Copy the pane's output (the stream-json JSONL) to the capture file so
         # stream() can tail + parse it. pipe-pane runs its command via /bin/sh, but
         # the command is a FIXED `cat >> '<path>'`: the path is worktree_root (fixed
@@ -991,11 +1445,28 @@ class ClaudeCodeHarness(Harness):
         # so it contains no shell metacharacters and nothing operator-supplied. The
         # claude launch itself stays shell-free (exec'd directly by new-window
         # above); only this side-channel copy uses sh, with a path this code owns.
-        self._runner([
-            "tmux", "pipe-pane", "-o", "-t", f"{self.tmux_session}:{sid}",
-            f"cat >> '{stream_log}'",
-        ])
-
+        capture = self._run(
+            [
+                "tmux",
+                "pipe-pane",
+                "-o",
+                "-t",
+                resource_id,
+                f"cat >> '{stream_log}'",
+            ]
+        )
+        if not capture.ok:
+            self._rollback_created_window(sid, resource_id, "tmux pipe-pane", capture)
+        liveness = self._run(["tmux", "display-message", "-p", "-t", resource_id, "#{window_id}"])
+        observed = liveness.stdout.strip().splitlines()
+        if not liveness.ok or observed != [resource_id]:
+            operation = "tmux window liveness check"
+            failure = (
+                liveness
+                if not liveness.ok
+                else CommandResult(liveness.argv, 125, "", "window identity changed")
+            )
+            self._rollback_created_window(sid, resource_id, operation, failure)
         # CR-6.2 C2: remember this is a daemon-spawned session so inject may reach
         # it (and ONLY it, plus its siblings). Recorded after the window is created.
         self._spawned_sids.add(sid)
@@ -1005,26 +1476,71 @@ class ClaudeCodeHarness(Harness):
         # them (or any window this daemon did not start as resumable).
         if mode == "interactive":
             self._resume_ctx[sid] = {
-                "profile": profile, "model": desc.model, "agent": agent,
+                "profile": profile,
+                "model": desc.model,
+                "agent": agent,
             }
 
         return HarnessSession(
             sid=sid,
             descriptor=SessionDescriptor(
-                sid=sid, host=self.host, harness=self.name, repo=repo_real,
-                branch=branch, model=desc.model, state="running", quality=profile,
-                permission_mode=desc.permission_mode, mode=mode,
+                sid=sid,
+                host=self.host,
+                harness=self.name,
+                repo=repo_real,
+                branch=branch,
+                model=desc.model,
+                state="running",
+                quality=profile,
+                permission_mode=desc.permission_mode,
+                mode=mode,
             ),
             status="running",
             branch=branch,
+            resource_id=resource_id,
         )
+
+    def _rollback_created_window(
+        self, sid: str, resource_id: str, operation: str, failure: CommandResult
+    ) -> None:
+        """Contain one setup failure by exact identity and receipt it truthfully."""
+        rollback = self._run(["tmux", "kill-window", "-t", resource_id])
+        receipt = {
+            "sid": sid,
+            "resource_id": resource_id,
+            "launched": True,
+            "tracked": False,
+            "setup_succeeded": False,
+            "teardown_succeeded": rollback.ok,
+            "setup_reason": self._failure(failure, operation),
+        }
+        if not rollback.ok:
+            receipt["teardown_reason"] = self._failure(rollback, "tmux rollback kill-window")
+        raise SpawnOwnershipError(receipt["setup_reason"], receipt=receipt)
+
+    async def teardown_owned(self, resource_id: str) -> dict:
+        if not _RESOURCE_RE.fullmatch(resource_id or ""):
+            return {
+                "resource_id": resource_id,
+                "teardown_succeeded": False,
+                "reason": "invalid resource identity",
+            }
+        result = self._run(["tmux", "kill-window", "-t", resource_id])
+        return {
+            "resource_id": resource_id,
+            "teardown_succeeded": result.ok,
+            "reason": "" if result.ok else self._failure(result, "tmux kill-window"),
+        }
 
     def _stream_log_path(self, sid: str) -> Path:
         """The structured stream-json capture file for a DIRECT session:
-        ``<worktree_root>/<sid>/.skcode/stream.jsonl``. Deterministic from the sid
-        (worktree = worktree_root / sid), so :meth:`stream` can find it without any
-        spawn-time state. The parent ``.skcode`` dir's existence is the signal that
-        a session is structured (spawn creates it only for direct mode)."""
+        The controller-created live stream is an anonymous descriptor so no
+        outside alias can be linked while tmux appends to it. Legacy sessions not
+        created by this harness instance retain the deterministic lexical fallback.
+        The parent ``.skcode`` directory signals structured mode."""
+        stream_fd = self._stream_fds.get(sid)
+        if stream_fd is not None:
+            return Path(f"/proc/{os.getpid()}/fd/{stream_fd}")
         return self.worktree_root / sid / ".skcode" / "stream.jsonl"
 
     def _read_session_id(self, sid: str) -> str | None:
@@ -1037,8 +1553,7 @@ class ClaudeCodeHarness(Harness):
         (blank / non-JSON lines are skipped, never raise)."""
         latest = None
         try:
-            with open(self._stream_log_path(sid), "r", encoding="utf-8",
-                      errors="replace") as fh:
+            with open(self._stream_log_path(sid), "r", encoding="utf-8", errors="replace") as fh:
                 for line in fh:
                     line = line.strip()
                     if not line:
@@ -1047,9 +1562,12 @@ class ClaudeCodeHarness(Harness):
                         obj = json.loads(line)
                     except (ValueError, TypeError):
                         continue
-                    if (isinstance(obj, dict) and obj.get("type") == "system"
-                            and obj.get("subtype") == "init"
-                            and obj.get("session_id")):
+                    if (
+                        isinstance(obj, dict)
+                        and obj.get("type") == "system"
+                        and obj.get("subtype") == "init"
+                        and obj.get("session_id")
+                    ):
                         latest = obj["session_id"]
         except FileNotFoundError:
             return None
@@ -1071,12 +1589,11 @@ class ClaudeCodeHarness(Harness):
             return
         prev = ""
         polls = 0
-        target = f"{self.tmux_session}:{sid}"
+        target = self._target_for_capture(sid)
         while self.max_polls is None or polls < self.max_polls:
-            cur = self._runner(["tmux", "capture-pane", "-p", "-t", target])
+            cur = self._run(["tmux", "capture-pane", "-p", "-t", target]).stdout
             for line in new_lines(prev, cur):
-                yield SessionEvent(type=EventType.ASSISTANT_TEXT, text=line,
-                                   ts=time.time())
+                yield SessionEvent(type=EventType.ASSISTANT_TEXT, text=line, ts=time.time())
             prev = cur
             polls += 1
             if self.max_polls is not None and polls >= self.max_polls:
