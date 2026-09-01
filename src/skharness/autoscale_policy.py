@@ -25,6 +25,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Awaitable, Callable, Protocol
 
 from skharness.autocode import autoscale, fleet_dispatch
+from skharness.card_router import SessionAssignment
 from skharness.pool import PoolController
 
 POLICY_SCHEMA = "skharness.autoscale-policy.v1"
@@ -230,9 +231,10 @@ class AutoscalePolicy:
         proposal: ScaleProposal,
         *,
         authorize: AuthorizationCheck,
-        repo: str,
-        branch: str,
-        prompt: str,
+        repo: str = "",
+        branch: str = "",
+        prompt: str = "",
+        assignments: list[SessionAssignment] | None = None,
         model: str = "",
         quality: str = "sandbox",
         mode: str = "direct",
@@ -265,16 +267,30 @@ class AutoscalePolicy:
             if recorded is not None:
                 await recorded
 
-        active = await self.pool.scale(
-            lane=proposal.lane,
-            repo=repo,
-            branch=branch,
-            prompt=prompt,
-            target=proposal.target,
-            model=model,
-            quality=quality,
-            mode=mode,
-        )
+        if proposal.direction == "up":
+            missing = proposal.target - proposal.observation.current
+            if assignments is None or len(assignments) != missing:
+                raise RuntimeError(
+                    f"scale-up requires exactly {missing} governed card assignments"
+                )
+            active = await self.pool.scale_assignments(
+                lane=proposal.lane,
+                assignments=assignments,
+                model=model,
+                quality=quality,
+                mode=mode,
+            )
+        else:
+            active = await self.pool.scale(
+                lane=proposal.lane,
+                repo=repo,
+                branch=branch,
+                prompt=prompt,
+                target=proposal.target,
+                model=model,
+                quality=quality,
+                mode=mode,
+            )
         if proposal.direction == "down":
             after = {member.sid for member in active}
             drained = [

@@ -124,6 +124,11 @@ class SessionDescriptor:
     # has arrived. Defaults "interactive" (every session this plane produced
     # before v2), so an old record round-trips unchanged.
     source: str = "interactive"
+    # Governed dispatch provenance. These are optional for historical/manual
+    # sessions, but card-routed sessions set both before any worktree is made.
+    agent_id: str = ""
+    card_id: str = ""
+    worktree: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
