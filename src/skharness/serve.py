@@ -19,7 +19,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from skharness.activity import ActivityJournal
+from skharness.activity import ActivityJournal, migrate_legacy_activity_layout
 from skharness.arena import ArenaJobService, ArenaStatusService, ArenaStore, ProbeResult
 from skharness.arena.collaboration import RefinementJournal
 from skharness.auth import AuthContext, Verifier
@@ -479,7 +479,11 @@ def _serve(argv: list[str]) -> None:
     sessions_dir = skcode_state_dir() / "sessions"
     event_store = SessionEventStore(root=sessions_dir)
     autocode_registry = AutocodeSessionRegistry(root=sessions_dir)
-    activity_journal = ActivityJournal(root=skcode_state_dir() / "activity")
+    # Journals are partitioned per node; a pre-partition shared events.jsonl
+    # would otherwise sit in the base forever, unread and unowned.
+    activity_root = skcode_state_dir() / "activity"
+    migrate_legacy_activity_layout(activity_root)
+    activity_journal = ActivityJournal(root=activity_root)
     control_journal = ControlJournal(skcode_state_dir() / "control")
 
     app = build_daemon_app(

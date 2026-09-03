@@ -196,3 +196,107 @@ def test_job_identity_is_first_class_and_filterable(tmp_path):
     )
     assert journal.read_after(job_id="job-1")[0].job_id == "job-1"
     assert journal.read_after(job_id="job-other") == []
+
+
+# ── Node partitioning (prb-7810b08e: per-writer files, writer == node) ────────
+
+
+def test_two_nodes_sharing_a_base_never_write_the_same_file(tmp_path):
+    """The replication-safety invariant: disjoint write sets per node.
+
+    ~/.skcapstone is Syncthing-replicated. A shared events.jsonl + head.json
+    + whole-file trim produced a conflict roughly every 40s and duplicated the
+    entire 16MB journal each time. flock orders writers inside a node and does
+    nothing across the mesh, so only the partition makes replication safe.
+    """
+    a = ActivityJournal(root=tmp_path, node="node-a")
+    b = ActivityJournal(root=tmp_path, node="node-b")
+
+    a.publish(_context(), ActivityKind.STATUS, summary="from a")
+    b.publish(_context(), ActivityKind.STATUS, summary="from b")
+
+    assert a.path != b.path
+    assert a.root.parent == b.root.parent == tmp_path
+    # No writable artifact is shared: events, head cursor and lock all differ.
+    for name in ("events.jsonl", "head.json", ".activity.lock"):
+        assert (a.root / name) != (b.root / name)
+    assert "from a" in a.path.read_text(encoding="utf-8")
+    assert "from a" not in b.path.read_text(encoding="utf-8")
+    # Each node keeps its own monotonic cursor rather than racing a global one.
+    assert a.publish(_context(), ActivityKind.PHASE).cursor == 2
+    assert b.publish(_context(), ActivityKind.PHASE).cursor == 2
+
+
+def test_read_fleet_merges_every_node_with_per_node_cursors(tmp_path):
+    clock = {"t": 100.0}
+
+    def tick():
+        clock["t"] += 1.0
+        return clock["t"]
+
+    a = ActivityJournal(root=tmp_path, node="node-a", clock=tick)
+    b = ActivityJournal(root=tmp_path, node="node-b", clock=tick)
+    a.publish(_context(), ActivityKind.STATUS, summary="a1")
+    b.publish(_context(), ActivityKind.STATUS, summary="b1")
+    a.publish(_context(), ActivityKind.STATUS, summary="a2")
+
+    assert a.iter_nodes() == ["node-a", "node-b"]
+
+    rows, cursors = a.read_fleet()
+    assert [summary for _, event in rows for summary in [event.summary]] == ["a1", "b1", "a2"]
+    assert cursors == {"node-a": 2, "node-b": 1}
+
+    # A resumed reader sees only what is new, per node.
+    b.publish(_context(), ActivityKind.STATUS, summary="b2")
+    rows, cursors = a.read_fleet(cursors)
+    assert [event.summary for _, event in rows] == ["b2"]
+    assert cursors == {"node-a": 2, "node-b": 2}
+
+
+def test_read_fleet_ignores_a_node_partition_with_no_events(tmp_path):
+    a = ActivityJournal(root=tmp_path, node="node-a")
+    a.publish(_context(), ActivityKind.STATUS, summary="only")
+    (tmp_path / "node-empty").mkdir()
+
+    assert a.iter_nodes() == ["node-a"]
+    rows, _ = a.read_fleet()
+    assert [event.summary for _, event in rows] == ["only"]
+
+
+@pytest.mark.parametrize("bad", ["", "../escape", "a/b", "node b"])
+def test_journal_rejects_an_unsafe_node_segment(tmp_path, bad):
+    with pytest.raises(ValueError, match="safe path segment"):
+        ActivityJournal(root=tmp_path, node=bad)
+
+
+def test_default_node_is_a_single_safe_segment():
+    from skharness.activity import default_activity_node
+
+    node = default_activity_node()
+    assert node and "/" not in node
+    assert ActivityJournal(node=node).node == node
+
+
+def test_migrate_legacy_layout_moves_the_shared_journal_out_of_the_way(tmp_path):
+    """The pre-partition files belong to every node, so to no node."""
+    from skharness.activity import LEGACY_PARTITION, migrate_legacy_activity_layout
+
+    legacy = ActivityJournal(root=tmp_path, node="node-a")
+    legacy.publish(_context(), ActivityKind.STATUS, summary="historical")
+    # Recreate the old shared layout: files sitting directly in the base.
+    (tmp_path / "events.jsonl").write_bytes(legacy.path.read_bytes())
+    (tmp_path / "head.json").write_text('{"head_cursor": 1}\n', encoding="utf-8")
+    (tmp_path / ".activity.lock").touch()
+
+    moved = migrate_legacy_activity_layout(tmp_path)
+
+    assert set(moved) == {"events.jsonl", "head.json"}
+    assert not (tmp_path / "events.jsonl").exists()
+    assert not (tmp_path / "head.json").exists()
+    assert not (tmp_path / ".activity.lock").exists()
+    # History stays readable through the fleet view, owned by nobody.
+    assert LEGACY_PARTITION in legacy.iter_nodes()
+    rows, _ = legacy.read_fleet()
+    assert any(node == LEGACY_PARTITION for node, _ in rows)
+    # Idempotent.
+    assert migrate_legacy_activity_layout(tmp_path) == {}

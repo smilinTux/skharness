@@ -4,6 +4,14 @@ The activity plane is a VIEW.  Worker-authored text is retained as bounded
 observation data and never becomes completion, scheduling, or authorization
 evidence.  Producers append without needing a connected viewer; skcode-hostd
 reads the same journal for cursor replay and a bounded WebSocket tail.
+
+Every node owns its own journal directory (``<root>/<node>/``).  ``~/.skcapstone``
+is Syncthing-replicated, and a journal is an append-only log plus a rewritten
+``head.json`` plus a whole-file ``_trim`` — three write patterns that collide the
+instant two nodes share one path.  ``fcntl.flock`` orders writers inside a node
+and does nothing across the mesh, so the partition (not the lock) is what makes
+replication safe.  This is the per-writer rule already used for ITIL records in
+skcoord (prb-7810b08e); here the writer is the node.
 """
 
 from __future__ import annotations
@@ -13,6 +21,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import tempfile
 import time
 from contextlib import contextmanager
@@ -31,6 +40,7 @@ MAX_SUMMARY_CHARS = 4_096
 _EVENTS_FILENAME = "events.jsonl"
 _HEAD_FILENAME = "head.json"
 _LOCK_FILENAME = ".activity.lock"
+_NODE_UNSAFE = re.compile(r"[^A-Za-z0-9._:@+-]")
 _SAFE_ID = re.compile(r"[A-Za-z0-9._:@+-]{1,200}\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
@@ -250,6 +260,18 @@ class ActivityEvent:
         return event
 
 
+def default_activity_node() -> str:
+    """Return this node's journal partition name.
+
+    Mirrors ``service_health._HOSTNAME``. The result is constrained to
+    ``_SAFE_ID`` so it is always a single safe path segment.
+    """
+
+    raw = (socket.gethostname() or "").strip() or "unknown-node"
+    node = _NODE_UNSAFE.sub("-", raw)[:200]
+    return node if _SAFE_ID.fullmatch(node) else "unknown-node"
+
+
 def default_activity_root() -> Path:
     state = os.environ.get("SKCODE_STATE_DIR")
     base = Path(state) if state else Path.home() / ".skcapstone" / "skcode"
@@ -296,6 +318,51 @@ def sanitize_activity_data(value: object, *, _depth: int = 0) -> Any:
     return _bounded_text(value, limit=2_048)
 
 
+LEGACY_PARTITION = "_legacy"
+
+
+def migrate_legacy_activity_layout(root: Path | None = None) -> dict[str, str]:
+    """Move a pre-partition shared journal into the read-only ``_legacy`` node.
+
+    Before partitioning, every node appended to ``<root>/events.jsonl`` and
+    rewrote ``<root>/head.json``, which is what produced the Syncthing
+    conflicts. The historical rows are still worth reading, but no node may
+    claim ownership of a file all of them wrote, so they move to a partition
+    that ``read_fleet`` reads and nobody writes.
+
+    Args:
+        root: Activity base directory (defaults to :func:`default_activity_root`).
+
+    Returns:
+        Mapping of moved filename -> destination path (empty when nothing to do).
+    """
+
+    base = Path(root) if root is not None else default_activity_root()
+    legacy_events = base / _EVENTS_FILENAME
+    if not legacy_events.exists():
+        return {}
+    target = base / LEGACY_PARTITION
+    target.mkdir(parents=True, exist_ok=True, mode=0o700)
+    moved: dict[str, str] = {}
+    for name in (_EVENTS_FILENAME, _HEAD_FILENAME):
+        src = base / name
+        if not src.exists():
+            continue
+        dst = target / name
+        if dst.exists():
+            dst = target / f"{name}.{int(time.time())}"
+        os.replace(src, dst)
+        moved[name] = str(dst)
+    # The old lock and any interrupted trim temporaries belong to a layout that
+    # no longer has writers.
+    for stale in (base / _LOCK_FILENAME, *base.glob(".events-*"), *base.glob(".head-*")):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+    return moved
+
+
 class ActivityJournal:
     """Bounded hash-addressed JSONL journal with a global durable cursor."""
 
@@ -303,6 +370,7 @@ class ActivityJournal:
         self,
         *,
         root: Path | None = None,
+        node: str | None = None,
         max_bytes: int = DEFAULT_MAX_BYTES,
         max_event_bytes: int = DEFAULT_MAX_EVENT_BYTES,
         clock=time.time,
@@ -311,7 +379,14 @@ class ActivityJournal:
             raise ValueError("activity max_bytes must retain at least two events")
         if max_event_bytes < 1_024:
             raise ValueError("activity max_event_bytes is too small")
-        self.root = Path(root) if root is not None else default_activity_root()
+        self.base = Path(root) if root is not None else default_activity_root()
+        node = default_activity_node() if node is None else str(node)
+        if not _SAFE_ID.fullmatch(node):
+            raise ValueError("activity node must be a single safe path segment")
+        self.node = node
+        # Only this node ever writes under self.root, so replication has nothing
+        # to conflict on. self.base stays readable for fleet-wide views.
+        self.root = self.base / self.node
         self.max_bytes = int(max_bytes)
         self.max_event_bytes = int(max_event_bytes)
         self.clock = clock
@@ -435,6 +510,62 @@ class ActivityJournal:
             if len(result) >= limit:
                 break
         return result
+
+    def iter_nodes(self) -> list[str]:
+        """Return every node partition present under the shared base."""
+
+        if not self.base.is_dir():
+            return []
+        return sorted(
+            entry.name
+            for entry in self.base.iterdir()
+            if entry.is_dir()
+            and _SAFE_ID.fullmatch(entry.name)
+            and (entry / _EVENTS_FILENAME).exists()
+        )
+
+    def read_fleet(
+        self,
+        after: dict[str, int] | None = None,
+        *,
+        limit: int = DEFAULT_REPLAY_LIMIT,
+    ) -> tuple[list[tuple[str, ActivityEvent]], dict[str, int]]:
+        """Merged chronological view across every node partition.
+
+        Cursors are per-node monotonic sequences, so there is no meaningful
+        single integer cursor across the fleet. Callers therefore pass and
+        receive a ``{node: cursor}`` map. Ordering is
+        ``(published_at, node, cursor)`` — deterministic, and stable for rows
+        already returned, though a slow node's event can still arrive after a
+        later-timestamped one from a faster node.
+
+        Args:
+            after: Per-node cursor map from a previous call ({} or None to start).
+            limit: Maximum rows to return, bounded by ``MAX_REPLAY_LIMIT``.
+
+        Returns:
+            The merged rows as ``(node, event)`` pairs, and the updated cursor map.
+        """
+
+        limit = max(1, min(int(limit), MAX_REPLAY_LIMIT))
+        cursors = dict(after or {})
+        merged: list[tuple[str, ActivityEvent]] = []
+        for node in self.iter_nodes():
+            reader = ActivityJournal(
+                root=self.base,
+                node=node,
+                max_bytes=self.max_bytes,
+                max_event_bytes=self.max_event_bytes,
+                clock=self.clock,
+            )
+            floor = int(cursors.get(node, 0))
+            for event in reader.read_after(floor, limit=MAX_REPLAY_LIMIT):
+                merged.append((node, event))
+        merged.sort(key=lambda row: (row[1].published_at, row[0], row[1].cursor))
+        merged = merged[:limit]
+        for node, event in merged:
+            cursors[node] = max(int(cursors.get(node, 0)), event.cursor)
+        return merged, cursors
 
     def window(self) -> dict[str, int]:
         with self._locked(exclusive=False):
@@ -580,7 +711,9 @@ __all__ = [
     "ActivityKind",
     "DEFAULT_REPLAY_LIMIT",
     "MAX_REPLAY_LIMIT",
+    "default_activity_node",
     "default_activity_root",
+    "migrate_legacy_activity_layout",
     "sanitize_activity_data",
     "sanitize_activity_text",
 ]
