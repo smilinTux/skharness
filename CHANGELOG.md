@@ -22,6 +22,10 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ### Fixed
 
+- Added pi's `x-agent-id` provider header using the shared `resolve_identity()`
+  precedence, making gateway request rows attributable without granting an
+  authorization subject to an unverified header (card `ae072437`).
+
 - Measured autoscale disk headroom on the `SKCODE_STATE_DIR/worktrees`
   filesystem, using its nearest existing ancestor before the first worker, and
   reduced concurrency to one when disk capacity cannot be measured (card
