@@ -23,3 +23,29 @@ tests/test_gh_merge_method_preflight.py::test_gh_merge_issues_zero_merge_subproc
 tests/test_gh_merge_method_preflight.py::test_gh_merge_issues_zero_merge_subprocess_without_exact_head PASSED [100%]
 
 ============================== 14 passed in 0.20s ==============================
+
+Docs-check repair (2026-09-14)
+================================
+
+Hosted failure reproduced from run 34883693720 at head
+5a6acca021eff05dc79fb3ebdbf845ca04579153:
+
+  [tier 2] changelog on code change
+    FAIL code under src/ or pyproject.toml changed but CHANGELOG.md did not.
+
+Root cause: the source change did not include the required CHANGELOG.md entry.
+The smallest correction adds one Unreleased/Fixed bullet for card 3b2b5e54.
+
+Focused verification:
+
+  pytest -q tests/test_gh_merge_method_preflight.py
+  14 passed in 0.19s
+
+Exact hosted validator source: smilinTux/sk-standards
+revision e4e27c04f838fecb4f8279affd0ed7f50f0081aa, tiers 1,2,3, with the
+PR changed-file list.
+
+  tier 1: pass (all 7 required docs present)
+  tier 2: pass (code changed and CHANGELOG.md updated)
+  tier 3: pass (all SOP evidence checks)
+  RESULT: pass
