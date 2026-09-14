@@ -1152,15 +1152,84 @@ class EngineeringExecutor:
                 return "timeout"      # never green on unknown/still-pending
             time.sleep(20)
 
-    def _gh_merge(self, repo: RepoSpec, pr_branch: str) -> bool:
-        """Merge the PR on GitHub (updates origin, deletes the branch). Returns
-        False on failure (e.g. a required check GitHub itself blocks on) so the
-        caller falls back to a human decision rather than silently dropping it."""
-        proc = subprocess.run(
-            ["gh", "pr", "merge", pr_branch, "--merge", "--delete-branch"],
-            cwd=repo.path, capture_output=True, text=True)
+    def _gh_json(self, argv: list[str], repo: RepoSpec) -> object | None:
+        """Run a read-only ``gh`` command and decode JSON, or None on failure."""
+        try:
+            proc = subprocess.run(
+                argv, cwd=repo.path, capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"autopilot: gh json read errored ({argv[:3]}): {exc}")
+            return None
         if proc.returncode != 0:
-            print(f"autopilot: gh pr merge failed for {pr_branch}: {proc.stderr.strip()}")
+            print(f"autopilot: gh json read failed ({argv[:3]}): "
+                  f"{proc.stderr.strip()}")
+            return None
+        try:
+            return json.loads(proc.stdout or "null")
+        except json.JSONDecodeError:
+            return None
+
+    def _protected_merge_policy(self, repo: RepoSpec):
+        """Read repository and protected-branch merge-method policy, or None."""
+        from .merge_method import (
+            ProtectedMergePolicy,
+            branch_allowed_from_rules_json,
+            repository_allowed_from_repo_json,
+        )
+
+        repo_json = self._gh_json(["gh", "api", "repos/:owner/:repo"], repo)
+        repository_allowed = repository_allowed_from_repo_json(repo_json)
+        if repository_allowed is None:
+            return None
+        base = self._pr_base(repo)
+        rules = self._gh_json(
+            ["gh", "api", f"repos/:owner/:repo/rules/branches/{base}"], repo)
+        branch_allowed = branch_allowed_from_rules_json(rules)
+        if branch_allowed is None:
+            return None
+        return ProtectedMergePolicy(
+            repository_allowed=repository_allowed,
+            branch_allowed=branch_allowed,
+        )
+
+    def _pr_head_sha(self, repo: RepoSpec, pr_branch: str) -> str:
+        """Current PR head OID, or empty string when unavailable."""
+        data = self._gh_json(
+            ["gh", "pr", "view", pr_branch, "--json", "headRefOid"], repo)
+        if not isinstance(data, dict):
+            return ""
+        head = data.get("headRefOid")
+        return head if isinstance(head, str) and head else ""
+
+    def _gh_merge(self, repo: RepoSpec, pr_branch: str) -> bool:
+        """Merge the PR on GitHub after protected-method preflight.
+
+        Reads explicit repository and protected-branch method policy, selects
+        squash then rebase then merge only when both allow it, binds
+        ``--match-head-commit``, and issues zero merge subprocess when policy
+        is unavailable or no method is allowed. Returns False on any failure so
+        the caller falls back to a human decision rather than silently dropping
+        it.
+        """
+        from .merge_method import merge_argv, resolve_protected_merge_method
+
+        policy = self._protected_merge_policy(repo)
+        method = resolve_protected_merge_method(policy)
+        if method is None:
+            print(f"autopilot: merge policy unavailable or allows no method "
+                  f"for {pr_branch}; refusing merge mutation")
+            return False
+        head = self._pr_head_sha(repo, pr_branch)
+        if not head:
+            print(f"autopilot: could not resolve exact head for {pr_branch}; "
+                  f"refusing merge mutation")
+            return False
+        argv = merge_argv(pr_branch, method, head)
+        proc = subprocess.run(
+            argv, cwd=repo.path, capture_output=True, text=True)
+        if proc.returncode != 0:
+            print(f"autopilot: gh pr merge failed for {pr_branch}: "
+                  f"{proc.stderr.strip()}")
         return proc.returncode == 0
 
     def _merge_commit_sha(self, repo: RepoSpec, pr_branch: str) -> str:
