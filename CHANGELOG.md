@@ -22,6 +22,10 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ### Fixed
 
+- Made automated PR merges read the target branch's protected merge-method
+  policy and bind the selected method to the exact reviewed head (card
+  `3b2b5e54`).
+
 - Measured autoscale disk headroom on the `SKCODE_STATE_DIR/worktrees`
   filesystem, using its nearest existing ancestor before the first worker, and
   reduced concurrency to one when disk capacity cannot be measured (card
