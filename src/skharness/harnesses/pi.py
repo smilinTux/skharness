@@ -166,7 +166,8 @@ class PiHarness(ClaudeCodeHarness):
         return self._list_windows() + self._historical_sessions()
 
     def _build_env(
-        self, profile: str, agent: str, worktree: Path, model: str | None = None
+        self, profile: str, agent: str, worktree: Path, model: str | None = None,
+        card_id: str = "",
     ) -> dict[str, str]:
         """Build the complete ``env -i`` environment and private Pi config.
 
@@ -191,6 +192,7 @@ class PiHarness(ClaudeCodeHarness):
                     "headers": {
                         "x-agent-id": agent,
                         "x-session-id": sid,
+                        **({"x-sk-card-id": card_id} if card_id else {}),
                     },
                     "models": [
                         {

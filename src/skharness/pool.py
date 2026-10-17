@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
 from skharness.activity import ActivityContext, ActivityJournal, ActivityKind
+from skharness.card_router import SessionAssignment
 from skharness.harness import Harness, HarnessSession, SessionDescriptor
 
 #: A board-query runner: argv -> stdout str. Injectable so tests never touch a
@@ -72,6 +73,9 @@ class PoolMember:
     spawned_at: float
     drained: bool = False
     drain_result: dict[str, Any] = field(default_factory=dict)
+    card_id: str = ""
+    agent_id: str = ""
+    worktree: str = ""
 
 
 class PoolController:
@@ -164,6 +168,97 @@ class PoolController:
             {"lane": lane, "repo": repo, "branch": branch, "quality": quality, "mode": mode},
         )
         return member
+
+    async def spawn_assignment(
+        self,
+        *,
+        lane: str,
+        assignment: SessionAssignment,
+        model: str = "",
+        quality: str = "sandbox",
+        mode: str = "direct",
+    ) -> PoolMember:
+        """Spawn one already-claimed governed assignment.
+
+        The router, not this controller, owns CardStore eligibility and claim.
+        This seam preserves its distinct agent/session/worktree/branch identity
+        through the harness and into Pi's request attribution headers.
+        """
+        desc = SessionDescriptor(
+            sid=assignment.session_id,
+            repo=assignment.repo,
+            branch=assignment.base_branch,
+            model=model,
+            quality=quality,
+            mode=mode,
+            agent_id=assignment.agent_id,
+            card_id=assignment.card_id,
+            worktree=assignment.worktree,
+        )
+        session = await self.harness.spawn(desc, prompt=assignment.prompt)
+        if (
+            session.sid != assignment.session_id
+            or session.branch != assignment.branch
+            or session.descriptor is None
+            or session.descriptor.agent_id != assignment.agent_id
+            or session.descriptor.card_id != assignment.card_id
+            or session.descriptor.worktree != assignment.worktree
+        ):
+            raise RuntimeError("harness did not preserve the governed assignment identity")
+        member = PoolMember(
+            sid=session.sid,
+            lane=lane,
+            repo=assignment.repo,
+            branch=assignment.branch,
+            session=session,
+            spawned_at=self._clock(),
+            card_id=assignment.card_id,
+            agent_id=assignment.agent_id,
+            worktree=assignment.worktree,
+        )
+        self._pool[session.sid] = member
+        self._emit(
+            session.sid,
+            ActivityKind.STATUS,
+            f"lane1 pool spawned routed card {assignment.card_id!r}",
+            {
+                "lane": lane,
+                "card_id": assignment.card_id,
+                "agent_id": assignment.agent_id,
+                "worktree": assignment.worktree,
+                "branch": assignment.branch,
+            },
+        )
+        return member
+
+    async def scale_assignments(
+        self,
+        *,
+        lane: str,
+        assignments: Iterable[SessionAssignment],
+        model: str = "",
+        quality: str = "sandbox",
+        mode: str = "direct",
+    ) -> list[PoolMember]:
+        """Scale up only from distinct, already-claimed card assignments."""
+        routed = list(assignments)
+        cards = [assignment.card_id for assignment in routed]
+        if len(cards) != len(set(cards)):
+            raise ValueError("the same card cannot be assigned to two sessions")
+        already_active = {
+            member.card_id for member in self._active_members(lane) if member.card_id
+        }
+        if already_active.intersection(cards):
+            raise ValueError("the same card cannot be assigned to two sessions")
+        for assignment in routed:
+            await self.spawn_assignment(
+                lane=lane,
+                assignment=assignment,
+                model=model,
+                quality=quality,
+                mode=mode,
+            )
+        return self._active_members(lane)
 
     async def scale(
         self,
