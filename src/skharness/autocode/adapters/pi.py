@@ -33,6 +33,7 @@ from ..pi_events import (
     served_model_evidence,
     valid_pi_event_envelope,
 )
+from ..identity import resolve_identity
 from ..types import HarnessProvenanceReason
 
 # Attribution header values must be plain, inert tokens. pi treats a LEADING `!`
@@ -162,10 +163,11 @@ class PiAdapter(BaseCliAdapter):
     _DEFAULT_MAX_TOKENS = 131072
 
     # Attribution headers pi sends to skgateway so a harness run can be joined to
-    # its gateway request_log row (card A6.1). Names are fixed here; the VALUES are
-    # supplied by the caller.
+    # its gateway request_log row. Names are fixed here; identity comes from the
+    # estate resolver rather than from a client-specific hardcoded name.
     _H_SESSION = "x-session-id"
     _H_CARD = "x-sk-card-id"
+    _H_AGENT = "x-agent-id"
 
     def __init__(
         self,
@@ -185,12 +187,11 @@ class PiAdapter(BaseCliAdapter):
 
         self.model = _model_id(model)
         self.base_url = base_url
-        # Attribution ids. Optional and None by default: a caller that does not know
-        # who it is sends NO attribution headers at all, rather than empty strings.
-        # "no session" and "session is the empty string" are different facts and the
-        # gateway must be able to tell them apart. A follow-up card wires
-        # autocode.identity.resolve_identity() in here; this adapter deliberately does
-        # not import it, so it stays independently mergeable and independently usable.
+        # Agent attribution is always resolved by the shared estate identity
+        # precedence. Session and card remain caller-owned optional join keys: "no
+        # session" and "session is the empty string" are different facts and the
+        # gateway must be able to tell them apart.
+        self.agent_id = _attribution_value(self._H_AGENT, resolve_identity().agent)
         self.session_id = _attribution_value(self._H_SESSION, session_id)
         self.card_id = _attribution_value(self._H_CARD, card_id)
         if capability_profile is not None and capability_profile not in PI_PROFILES:
@@ -296,11 +297,11 @@ class PiAdapter(BaseCliAdapter):
         there is no reason to reach for interpolation. Proven in the card evidence:
         coordination/evidence/4852c56d-pi-custom-headers/ (variant J).
 
-        Each id is independent: supplying one and not the other emits one header, and
-        supplying neither emits no `headers` key at all (see _config_files)."""
+        Session and card ids are independent and optional. Agent identity is always
+        emitted from :func:`resolve_identity`; it is never a hardcoded adapter name."""
         sid = _attribution_value(self._H_SESSION, session_id) or self.session_id
         cid = _attribution_value(self._H_CARD, card_id) or self.card_id
-        headers = {}
+        headers = {self._H_AGENT: self.agent_id}
         if sid:
             headers[self._H_SESSION] = sid
         if cid:
