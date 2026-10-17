@@ -57,6 +57,11 @@ TIGHTEST_SENSITIVITY = "secret"
 #: (adapters/base.py) can never disagree about the key.
 DISPATCH_MODEL_ATTR = "model"
 
+# Ordered family preferences are separate from bucket selection. Dotted broad
+# families such as qwen3.5 are allowed; raw model-id separators are not.
+PREFERENCE_TOKEN_RE = re.compile(r"^[a-z][a-z0-9]*(?:\.[a-z0-9]+)*$")
+PREFERENCE_MAX_TOKENS = 8
+
 
 class BucketError(ValueError):
     """A bucket id could not be constructed or does not match the gateway grammar.
@@ -160,6 +165,74 @@ def bucket_for_payload(payload: object) -> str | None:
     if grade is None:
         return None
     return bucket_for_grade(grade)
+
+
+def bucket_sensitivity(bucket: object) -> str:
+    """Return the sensitivity encoded in one validated bucket id."""
+    valid = validate_bucket(bucket)
+    match = BUCKET_RE.fullmatch(valid)
+    if match is None:  # validate_bucket already guarantees this
+        raise BucketError(f"cannot read sensitivity from bucket {valid!r}")
+    return match.group(2).lower()
+
+
+def validate_routing_preference(
+    value: object,
+    *,
+    sensitivity: str,
+) -> tuple[str, ...]:
+    """Normalize a governed broad-family list before any adapter launch."""
+    if not isinstance(value, (list, tuple)):
+        raise BucketError(
+            "routing preference must be a list of broad family names, never a string"
+        )
+    if len(value) > PREFERENCE_MAX_TOKENS:
+        raise BucketError(
+            f"routing preference allows at most {PREFERENCE_MAX_TOKENS} entries"
+        )
+    if sensitivity not in BUCKET_SENSITIVITIES:
+        raise BucketError(f"unknown routing preference sensitivity {sensitivity!r}")
+
+    normalized = []
+    for raw in value:
+        if not isinstance(raw, str):
+            raise BucketError("routing preference entries must be strings")
+        token = raw.strip().lower()
+        if len(token) > 32 or not PREFERENCE_TOKEN_RE.fullmatch(token):
+            raise BucketError(
+                "routing preference accepts broad family names, "
+                f"never raw model ids: {raw!r}"
+            )
+        if token not in normalized:
+            normalized.append(token)
+
+    if "free" in normalized and sensitivity != "public":
+        raise BucketError(
+            f"free preference is allowed only for public work, not {sensitivity}"
+        )
+    return tuple(normalized)
+
+
+def routing_preference_for_payload(payload: object) -> tuple[str, ...] | None:
+    """Read and validate ``meta.routing_preference`` from a card payload."""
+    if not isinstance(payload, dict):
+        return None
+    meta = payload.get("meta")
+    if not isinstance(meta, dict) or "routing_preference" not in meta:
+        return None
+    raw = meta.get("routing_preference")
+    if raw is None:
+        return None
+    bucket = bucket_for_payload(payload)
+    if bucket is None:
+        raise BucketError(
+            "routing preference requires a complete work grade and validated bucket"
+        )
+    preference = validate_routing_preference(
+        raw,
+        sensitivity=bucket_sensitivity(bucket),
+    )
+    return preference or None
 
 
 def ungraded_floor_bucket() -> str:

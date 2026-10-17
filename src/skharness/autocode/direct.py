@@ -16,6 +16,7 @@ a loosened gate.
 """
 from __future__ import annotations
 
+from .buckets import attach_dispatch_model
 from .engineering import EngineeringExecutor
 from .failure_memory import build_prior_feedback, build_prior_success_feedback
 from .types import GateResult, QualityMode, TaskBrief, WorkItem
@@ -53,11 +54,15 @@ class DirectExecutor(EngineeringExecutor):
         # Direct mode has no rounds, so this card's ONLY prior context is what
         # previous runs recorded. It used to start from None unconditionally,
         # which is what made a failed direct build repeat itself verbatim.
+        dispatch_preference = self._dispatch_preference(item)
         tb = TaskBrief(task_id=item.ref, repo=repo, worktree=wt,
                        title=p.get("title", ""), description=p.get("description", ""),
                        acceptance=p.get("acceptance", []),
                        prior_feedback=build_prior_feedback(p), round=1,
-                       prior_success_feedback=build_prior_success_feedback(p))
+                       prior_success_feedback=build_prior_success_feedback(p),
+                       routing_preference=dispatch_preference)
+        if dispatch_preference is not None:
+            attach_dispatch_model(tb, self._dispatch_model(item))
         res = harness.run_task(tb)              # ONE round; no harness.grade() ever
         diff = self._diff(repo, wt)            # same staging (new files in, byproducts out)
         ok = bool(getattr(res, "ok", False))
