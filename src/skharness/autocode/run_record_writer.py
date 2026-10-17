@@ -59,14 +59,23 @@ import json
 import threading
 from datetime import datetime, timezone
 
-from . import health, identity
+from . import attribution, health, identity
 from .journal import handle as _journal_handle
 from .run_record import (
     AggregateScope,
     AggregateState,
     AttributionState,
+    EnergyMeasurement,
+    Evidence,
+    EvidenceObservation,
+    EvidenceState,
     GateState,
+    GatewayRequestProvenance,
     RecordOrigin,
+    RequestedRouteKind,
+    RequestTiming,
+    SamplingComparison,
+    SamplingProvenance,
     RUN_RECORD_SCHEMA_VERSION,
     RunRecord,
     SourcePointer,
@@ -93,6 +102,142 @@ def _digest_source(namespace: str, evidence: dict) -> str:
     payload = _canonical_json(evidence)
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     return f"{namespace}#sha256:{digest}"
+
+
+def _absent_evidence() -> Evidence:
+    return Evidence(state=EvidenceState.ABSENT, value=None, observations=())
+
+
+def _observed_evidence(value, source: str) -> Evidence:
+    return Evidence(
+        state=EvidenceState.OBSERVED,
+        value=value,
+        observations=(EvidenceObservation(source=source, value=value),),
+    )
+
+
+def _gateway_request(
+    verdict: attribution.JoinVerdict,
+    *,
+    sequence: int,
+    model_requested: str | None,
+) -> GatewayRequestProvenance:
+    """Translate only values the attribution join actually observed.
+
+    In particular, an absent request id remains absent. The join's
+    ``ABSENT_AS_SENT`` result is never replaced with a plausible identifier.
+    """
+    join = verdict.join
+    request_id = (
+        _observed_evidence(verdict.req_id, "skgateway.request_log.id")
+        if join is not None and join.found and verdict.req_id
+        else _absent_evidence()
+    )
+    backend = (
+        _observed_evidence(join.backend_served, "skgateway.attribution.verify_join")
+        if join is not None and join.backend_served is not None and not join.backend_conflict
+        else _absent_evidence()
+    )
+    status = (
+        _observed_evidence(join.status_code, "skgateway.request_log.status_code")
+        if join is not None and join.status_code is not None
+        else _absent_evidence()
+    )
+    energy = (
+        _observed_evidence(
+            EnergyMeasurement(joules=join.joules_total, basis="gateway-energy-log", node=None),
+            "skgateway.energy_log",
+        )
+        if join is not None and join.joules_total is not None
+        else _absent_evidence()
+    )
+    timing_value = None
+    if join is not None and (join.started_at is not None or join.total_ms is not None):
+        started_at = join.started_at
+        if isinstance(started_at, (int, float)):
+            started_at = datetime.fromtimestamp(started_at / 1000, timezone.utc)
+        timing_value = RequestTiming(
+            started_at=started_at,
+            first_token_ms=None,
+            total_ms=join.total_ms,
+        )
+
+    requested_model = (
+        join.model_requested if join is not None and join.model_requested else model_requested
+    ) or "unknown-requested-model"
+    return GatewayRequestProvenance(
+        sequence=sequence,
+        request_id=request_id,
+        requested_role=model_requested,
+        requested_model=requested_model,
+        requested_route_kind=RequestedRouteKind.ROLE,
+        # attribution.py explicitly says the served model is unobserved here.
+        served_model=_absent_evidence(),
+        backend=backend,
+        status=status,
+        usage=_absent_evidence(),
+        cost=_absent_evidence(),
+        energy=energy,
+        timing=(
+            _observed_evidence(timing_value, "skgateway.request_log")
+            if timing_value is not None
+            else _absent_evidence()
+        ),
+        sampling=SamplingProvenance(
+            requested=None,
+            requested_source=None,
+            observed=_absent_evidence(),
+            comparison=SamplingComparison.ABSENT,
+        ),
+    )
+
+
+def _gateway_requests(
+    *,
+    session_id: str | None,
+    card_id: str,
+    model_requested: str | None,
+    started_at: datetime,
+) -> tuple[GatewayRequestProvenance, ...]:
+    """Verify this run's gateway rows, or retain one explicit absent result."""
+    sent = attribution.SentIds(session_id=session_id, card_id=card_id)
+    try:
+        req_ids = (
+            attribution.find_req_ids_for_session(
+                session_id,
+                since_ms=int(started_at.timestamp() * 1000),
+            )
+            if session_id
+            else ()
+        )
+        if req_ids:
+            verdicts = tuple(
+                attribution.verify_join(
+                    sent._replace(req_id=req_id),
+                    attribution.join_rows(attribution.fetch_rows(req_id)),
+                )
+                for req_id in req_ids
+            )
+        else:
+            # Calling verify_join for the negative control preserves its exact
+            # ABSENT_AS_SENT semantics instead of manufacturing a request id.
+            verdicts = (
+                attribution.verify_join(
+                    sent,
+                    attribution.join_rows(attribution.GatewayRows(req_id="")),
+                ),
+            )
+    except (attribution.GatewayStoreUnavailable, OSError):
+        verdicts = (
+            attribution.verify_join(
+                sent,
+                attribution.join_rows(attribution.GatewayRows(req_id="")),
+            ),
+        )
+    return tuple(
+        _gateway_request(verdict, sequence=index, model_requested=model_requested)
+        for index, verdict in enumerate(verdicts, 1)
+    )
 
 
 def build_run_record(
@@ -138,12 +283,20 @@ def build_run_record(
 
     ident = identity.resolve_identity()
     recorded_at = recorded_at or datetime.now(timezone.utc)
-    escalation_reason = reason_from_payload(payload)
 
-    # honest fallbacks for schema-required scalars this boundary cannot
-    # always name (see module docstring gap 3 for the analogous score case)
+    # Honest fallbacks for schema-required scalars this boundary cannot
+    # always name (see module docstring gap 3 for the analogous score case).
+    # Normalize before joining so the role route remains schema-valid even when
+    # the caller did not observe a requested model.
     adapter = adapter or "unknown-adapter"
     model_requested = model_requested or "unspecified"
+    gateway_requests = _gateway_requests(
+        session_id=ident.session_id,
+        card_id=card_id,
+        model_requested=model_requested,
+        started_at=started_at,
+    )
+    escalation_reason = reason_from_payload(payload)
 
     evidence: dict = {
         "run_id": run_id,
@@ -240,7 +393,7 @@ def build_run_record(
         started_at=started_at,
         finished_at=finished_at,
         recorded_at=recorded_at,
-        gateway_requests=(),
+        gateway_requests=gateway_requests,
     )
 
 
