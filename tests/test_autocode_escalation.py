@@ -325,8 +325,11 @@ _ROUTING_MODULES = ("buckets.py", "grading.py", "sensitivity.py", "engineering.p
                     "fleet_dispatch.py", "sandbox_proxy.py", "autoscale.py")
 
 _VOCAB = ("escalation_reason", "escalation_state", "escalation_floor_class",
-          "escalation_served_class", "from .escalation", "from skharness.autocode.escalation",
-          "import escalation")
+          "escalation_served_class", "calibration_candidate", "calibration_report",
+          "from .escalation", "from .calibration",
+          "from skharness.autocode.escalation",
+          "from skharness.autocode.calibration", "import escalation",
+          "import calibration")
 
 
 def test_no_routing_module_mentions_the_escalation_vocabulary():

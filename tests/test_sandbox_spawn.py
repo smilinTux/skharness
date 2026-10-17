@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 from pathlib import Path
 import pytest
@@ -9,6 +10,15 @@ from skharness.autocode.sandbox_lifecycle import (
     RUN_ID_LABEL,
     SandboxOwnership,
 )
+from skharness.pi_spawn_control import SpawnControl
+
+
+@pytest.fixture(autouse=True)
+def _isolated_pi_spawn_control(tmp_path, monkeypatch):
+    state = tmp_path / "pi-spawn-control.json"
+    SpawnControl(state).bootstrap(actor="test-bootstrap")
+    monkeypatch.setenv("SKHARNESS_PI_SPAWN_STATE", str(state))
+    monkeypatch.setenv("SKHARNESS_PI_SPAWN_ACTOR", "pytest")
 
 
 def _spec():
@@ -89,6 +99,106 @@ def test_linked_worktree_admin_dir_must_be_inside_common_dir(tmp_path):
 def test_spawn_disabled_raises_when_not_live():
     with pytest.raises(HarnessUnavailable):
         Sandbox(live_execution=False).spawn(_spec(), repo_remote_host="github.com", ci_host=None)
+
+
+def test_pi_spawn_missing_control_denies_before_docker(monkeypatch):
+    calls = []
+    monkeypatch.delenv("SKHARNESS_PI_SPAWN_STATE")
+    monkeypatch.setattr(
+        "skharness.autocode.sandbox.subprocess.run",
+        lambda argv, **kwargs: calls.append(argv),
+    )
+
+    with pytest.raises(HarnessUnavailable, match="spawn control is unavailable"):
+        Sandbox(live_execution=True).spawn(_spec())
+
+    assert calls == []
+
+
+def test_pi_spawn_pause_denies_before_docker(monkeypatch):
+    state = Path(os.environ["SKHARNESS_PI_SPAWN_STATE"])
+    SpawnControl(state).pause(
+        mode="pause",
+        owner="operator",
+        reason="test window",
+        scope="pi:all",
+        ttl_seconds=60,
+        expected_fence=0,
+    )
+    calls = []
+    monkeypatch.setattr(
+        "skharness.autocode.sandbox.subprocess.run",
+        lambda argv, **kwargs: calls.append(argv),
+    )
+
+    with pytest.raises(HarnessUnavailable, match="control mode is pause"):
+        Sandbox(live_execution=True).spawn(_spec())
+
+    assert calls == []
+
+
+def test_pi_pause_race_at_final_boundary_denies_worker_process(monkeypatch):
+    state = Path(os.environ["SKHARNESS_PI_SPAWN_STATE"])
+    gate = SpawnControl(state)
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+    def pause_before_worker(_name):
+        gate.pause(
+            mode="drain",
+            owner="operator",
+            reason="race test",
+            scope="pi:all",
+            ttl_seconds=60,
+            expected_fence=0,
+        )
+
+    sandbox = Sandbox(live_execution=True)
+    monkeypatch.setattr(sandbox, "_ensure_capable", lambda spec: None)
+    monkeypatch.setattr(sandbox, "_wait_for_proxy", pause_before_worker)
+    monkeypatch.setattr("skharness.autocode.sandbox.subprocess.run", fake_run)
+
+    with pytest.raises(HarnessUnavailable, match="denied at final boundary"):
+        sandbox.spawn(_spec())
+
+    assert not any(
+        call[:2] == ["docker", "run"]
+        and any(str(item).startswith("sbxrun-") for item in call)
+        for call in calls
+    )
+
+
+def test_pi_worker_time_replacement_at_final_boundary_denies_worker_process(monkeypatch):
+    calls = []
+    original_validate = SpawnControl.validate_reservation
+
+    def replace_before_validate(control, reservation):
+        control.reserve(
+            "interloper", actor="other-pool", scope="pi:all", kind="process"
+        )
+        return original_validate(control, reservation)
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+    sandbox = Sandbox(live_execution=True)
+    monkeypatch.setattr(sandbox, "_ensure_capable", lambda spec: None)
+    monkeypatch.setattr(sandbox, "_wait_for_proxy", lambda name: None)
+    monkeypatch.setattr(SpawnControl, "validate_reservation", replace_before_validate)
+    monkeypatch.setattr("skharness.autocode.sandbox.subprocess.run", fake_run)
+
+    with pytest.raises(HarnessUnavailable):
+        sandbox.spawn(_spec())
+
+    assert not any(
+        call[:2] == ["docker", "run"]
+        and any(str(item).startswith("sbxrun-") for item in call)
+        for call in calls
+    )
 
 
 def test_image_preflight_fails_clearly_when_required_test_command_is_absent(monkeypatch):
