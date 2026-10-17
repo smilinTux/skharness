@@ -194,6 +194,26 @@ def test_run_task_records_the_same_effective_model_that_pi_launches(monkeypatch)
     assert config["providers"]["skgw"]["models"][0]["id"] == "sk-l-internal"
 
 
+def test_run_task_aggregates_pi_event_tokens_and_cost(monkeypatch):
+    """HarnessResult carries Pi's provider-owned usage across assistant calls."""
+    stream = (
+        '{"type":"message_end","message":{"role":"assistant",'
+        '"responseModel":"served-qwen","usage":{"totalTokens":42,'
+        '"cost":{"total":0.01}},"content":[]}}\n'
+        '{"type":"message_end","message":{"role":"assistant",'
+        '"responseModel":"served-qwen","usage":{"totalTokens":58,'
+        '"cost":{"total":0.02}},"content":[]}}\n'
+    )
+    sandbox = Sandbox(live_execution=True)
+    monkeypatch.setattr(sandbox, "spawn", lambda _spec, **_kwargs: {"result": stream})
+    adapter = PiAdapter(sandbox, model="requested", base_url="http://gw:18790/v1")
+
+    result = adapter.run_task(_task_brief())
+
+    assert result.tokens == 100
+    assert result.cost_usd == 0.03
+
+
 def test_run_task_rejects_untrusted_gateway_attribution_and_explains_absence(monkeypatch):
     # provider/responseId/id are real Pi fields, but they are not the serving
     # backend or SKGateway x-sk-req-id.  The assistant-authored JSON is less

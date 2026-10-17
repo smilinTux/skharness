@@ -242,6 +242,12 @@ class BaseCliAdapter(Harness):
         """
         return {}
 
+    def _result_usage(self, raw: dict) -> tuple[int, float]:
+        """Return provider-reported token and USD totals for one result."""
+        usage = raw.get("usage", {}) if isinstance(raw, dict) else {}
+        tokens = int(usage.get("input_tokens", 0)) + int(usage.get("output_tokens", 0))
+        return tokens, float(raw.get("total_cost_usd", 0.0) or 0.0)
+
     def supports_model_override(self) -> bool:
         """True only when this adapter honours a per-call model id in BOTH _argv and
         _config_files. Default False, and _run_raw REFUSES a per-call override on a
@@ -569,12 +575,12 @@ class BaseCliAdapter(Harness):
         raw = self._run_raw(
             instruction, data, worktree=brief.worktree, repo=brief.repo, model=model
         )
-        usage = raw.get("usage", {}) if isinstance(raw, dict) else {}
+        tokens, cost_usd = self._result_usage(raw)
         return HarnessResult(
             ok=(not bool(raw.get("is_error"))) and int(raw.get("exit_code", 0) or 0) == 0,
             artifact=brief.worktree,
-            tokens=int(usage.get("input_tokens", 0)) + int(usage.get("output_tokens", 0)),
-            cost_usd=float(raw.get("total_cost_usd", 0.0) or 0.0),
+            tokens=tokens,
+            cost_usd=cost_usd,
             raw=raw,
             **self._result_provenance(raw, model=model),
         )
