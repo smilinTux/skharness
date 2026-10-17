@@ -12,6 +12,8 @@ def test_harness_fields_load_from_yaml(tmp_path):
         "harness: pi\n"
         "harness_model: sk-default\n"
         "harness_base_url: http://localhost:18780/v1\n"
+        "harness_session_id: session-abc123\n"
+        "harness_card_id: a49d1c36\n"
         "live_execution: true\n"
         "mcp_endpoints: [localhost, api.anthropic.com]\n"
         "sandbox_image: sandbox-pi:2\n")
@@ -19,6 +21,8 @@ def test_harness_fields_load_from_yaml(tmp_path):
     assert c.harness == "pi"
     assert c.harness_model == "sk-default"
     assert c.harness_base_url == "http://localhost:18780/v1"
+    assert c.harness_session_id == "session-abc123"
+    assert c.harness_card_id == "a49d1c36"
     assert c.live_execution is True
     assert c.mcp_endpoints == ["localhost", "api.anthropic.com"]
     assert c.sandbox_image == "sandbox-pi:2"
@@ -28,6 +32,7 @@ def test_harness_fields_default_safely():
     c = Config()
     assert c.live_execution is False           # posture stays off by default
     assert c.harness_model is None and c.harness_base_url is None
+    assert c.harness_session_id is None and c.harness_card_id is None
     assert c.mcp_endpoints == [] and c.sandbox_image is None
 
 

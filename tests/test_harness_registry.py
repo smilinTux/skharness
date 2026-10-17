@@ -24,6 +24,20 @@ def test_build_by_name_and_default():
     assert build_harness(_cfg()).name == "claude-code"        # default from config.harness
 
 
+def test_pi_factory_passes_configured_session_and_card_identity():
+    harness = build_harness(_cfg(
+        harness="pi", harness_session_id="session-abc123", harness_card_id="a49d1c36"))
+    assert harness.session_id == "session-abc123"
+    assert harness.card_id == "a49d1c36"
+
+
+def test_pi_factory_does_not_invent_identity_when_config_has_none():
+    harness = build_harness(_cfg(
+        harness="pi", harness_session_id=None, harness_card_id=None))
+    assert harness.session_id is None
+    assert harness.card_id is None
+
+
 def test_unknown_harness_fails_closed():
     with pytest.raises(ValueError):
         build_harness(_cfg(harness="nope"))
