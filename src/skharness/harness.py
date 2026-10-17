@@ -29,6 +29,7 @@ the existing dict-based ``capabilities()`` returns and the ``warn_missing_capabi
 ``.get()`` pattern keep working verbatim; ``headless_api`` is a tier string
 ("server" | "pty" | "none") as the ADR 3.1 capability map specifies, not a bool.
 """
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -47,7 +48,7 @@ from skharness.autocode.harness import (
 # session-plane signatures and callers share a single SessionEvent (no placeholder).
 from skharness.events import EventType, SessionEvent  # noqa: F401  (re-export)
 
-if TYPE_CHECKING:                               # task-plane types (no runtime import)
+if TYPE_CHECKING:  # task-plane types (no runtime import)
     from skharness.autocode.types import (
         AssessBrief,
         GateResult,
@@ -75,18 +76,28 @@ class SpawnRejected(ValueError):  # noqa: N818  (raised-participle name, as Clai
 # Capability shape
 # ---------------------------------------------------------------------------
 
+
+class SpawnOwnershipError(SpawnRejected):
+    """A controller-owned spawn failed and carries a truthful containment receipt."""
+
+    def __init__(self, message: str, *, receipt: dict) -> None:
+        super().__init__(message)
+        self.receipt = receipt
+
+
 class HarnessCapabilities(TypedDict):
     """Merged capability cells. The four existing autocode cells (kept verbatim
     from ``ProviderCapabilities``) plus the four skcode cells (ADR 3.2)."""
+
     # existing autocode cells (harness.py ProviderCapabilities, verbatim)
     session_resume: bool
-    structured_output: str          # "none" | "json" | "schema"
+    structured_output: str  # "none" | "json" | "schema"
     sandbox: bool
     tool_restrictions: bool
     # merged skcode cells (skcode ADR 3.2 capability map)
-    task_plane: bool                # assess/run_task/grade implemented
-    session_plane: bool             # spawn/stream/inject implemented
-    headless_api: str               # "server" | "pty" | "none"
+    task_plane: bool  # assess/run_task/grade implemented
+    session_plane: bool  # spawn/stream/inject implemented
+    headless_api: str  # "server" | "pty" | "none"
     hot_set_model: bool
 
 
@@ -98,6 +109,7 @@ class HarnessCapabilities(TypedDict):
 # model. They will be unified with skharness.session / skcode when the plane lands.
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class SessionDescriptor:
     """The one session record (skcode ADR 2).
@@ -106,18 +118,19 @@ class SessionDescriptor:
     and as a live/historical row returned by the read-only session plane. This is
     what ``list_sessions()`` yields and the daemon serializes over ``/api/v1``.
     """
-    sid: str = ""                    # session id (tmux window name for claude-code)
-    host: str = ""                   # node id, e.g. ".158"
-    harness: str = ""                # "pi" | "opencode" | "claude-code" | "fake"
-    repo: str = ""                   # allowlisted repo root
-    branch: str = ""                 # git branch / worktree ref
-    model: str = ""                  # role or concrete id (resolved via skgateway)
-    state: str = "running"           # "running" | "idle" | "ended" | "spawning"
-    last_activity: float = 0.0       # epoch seconds of last observed activity
-    last_message: str = ""           # last assistant line (for the list preview)
-    quality: str = "sandbox"         # profile / quality tier: "full" | "sandbox"
+
+    sid: str = ""  # session id (tmux window name for claude-code)
+    host: str = ""  # node id, e.g. ".158"
+    harness: str = ""  # "pi" | "opencode" | "claude-code" | "fake"
+    repo: str = ""  # allowlisted repo root
+    branch: str = ""  # git branch / worktree ref
+    model: str = ""  # role or concrete id (resolved via skgateway)
+    state: str = "running"  # "running" | "idle" | "ended" | "spawning"
+    last_activity: float = 0.0  # epoch seconds of last observed activity
+    last_message: str = ""  # last assistant line (for the list preview)
+    quality: str = "sandbox"  # profile / quality tier: "full" | "sandbox"
     permission_mode: str = "manual"  # per-action approval posture: "manual" | "auto"
-    mode: str = "direct"             # session mode: "direct" (print/one-shot) | "interactive" (stays open)
+    mode: str = "direct"  # session mode: "direct" (print/one-shot) | "interactive" (stays open)
     # Additive (skcode Code-section card C-1, spec 2026-08-11 section 5.1): the
     # same source vocabulary as SessionEvent.source ("interactive" | "autocode"
     # | "attach"), so a session shows its origin in the rail before any event
@@ -136,20 +149,23 @@ class SessionDescriptor:
 
 @dataclass
 class HarnessSession:
-    """A live (or archived) session handle the write session plane returns
-    (spawn/fork). Read-only P0 does not construct these; kept for the spawn
-    signature the write plane will fill later."""
+    """A live session handle with its logical SID and unambiguous resource ID."""
+
     sid: str
     descriptor: SessionDescriptor | None = None
-    status: str = "spawning"        # spawning | running | archived
+    status: str = "spawning"  # spawning | running | archived
     branch: str = ""
     forked_from: str | None = None
+    # tmux window id (``@N``), or an equivalent harness-native identity.  Unlike
+    # a caller-visible SID this identifies the exact newly-created resource.
+    resource_id: str = ""
 
 
 @dataclass
 class InputMessage:
     """Operator input injected into a session: text | transcribed voice | files."""
-    kind: str                       # "text" | "voice" | "files"
+
+    kind: str  # "text" | "voice" | "files"
     content: str = ""
     files: list[str] = field(default_factory=list)
 
@@ -157,6 +173,7 @@ class InputMessage:
 @dataclass
 class BackgroundTask:
     """One of the harness's own async/subagent tasks (mapped onto skcoord cards)."""
+
     id: str
     status: str
     description: str = ""
@@ -165,6 +182,7 @@ class BackgroundTask:
 # ---------------------------------------------------------------------------
 # The one contract
 # ---------------------------------------------------------------------------
+
 
 class Harness(ABC):
     """One harness, two capability-gated planes.
@@ -189,15 +207,18 @@ class Harness(ABC):
 
     def assess(self, brief: "AssessBrief") -> "Verdict":
         raise NotImplementedError(
-            f"harness {self.name!r} does not implement the task plane (assess)")
+            f"harness {self.name!r} does not implement the task plane (assess)"
+        )
 
     def run_task(self, brief: "TaskBrief") -> "HarnessResult":
         raise NotImplementedError(
-            f"harness {self.name!r} does not implement the task plane (run_task)")
+            f"harness {self.name!r} does not implement the task plane (run_task)"
+        )
 
     def grade(self, brief: "GradeBrief") -> "GateResult":
         raise NotImplementedError(
-            f"harness {self.name!r} does not implement the task plane (grade)")
+            f"harness {self.name!r} does not implement the task plane (grade)"
+        )
 
     # ---- session plane (async, long-lived): skcode remote control drives it ----
     # Declared per skcode ADR 3.1. Bodies land in the skcode P0 pivot (claude-code
@@ -207,17 +228,40 @@ class Harness(ABC):
     async def spawn(self, desc: SessionDescriptor, *, prompt: str) -> HarnessSession:
         """Start a NEW session (the Dispatch unlock)."""
         raise NotImplementedError(
-            f"harness {self.name!r} does not implement the session plane (spawn)")
+            f"harness {self.name!r} does not implement the session plane (spawn)"
+        )
+
+    async def spawn_reserved(
+        self,
+        desc: SessionDescriptor,
+        *,
+        prompt: str,
+        excluded_sids: frozenset[str],
+    ) -> HarnessSession:
+        """Reserve ownership before launch, excluding controller-owned SIDs.
+
+        Harnesses that cannot make this guarantee must not launch on behalf of a
+        pool controller.
+        """
+        raise SpawnRejected(f"harness {self.name!r} does not support pre-launch ownership")
+
+    async def teardown_owned(self, resource_id: str) -> dict:
+        """Tear down one exact resource identity, never a potentially reused SID."""
+        raise NotImplementedError(
+            f"harness {self.name!r} does not implement exact-resource teardown"
+        )
 
     async def list_sessions(self) -> list["SessionDescriptor"]:
         """Live (and, for claude-code, historical) sessions on THIS host."""
         raise NotImplementedError(
-            f"harness {self.name!r} does not implement the session plane (list_sessions)")
+            f"harness {self.name!r} does not implement the session plane (list_sessions)"
+        )
 
     async def stream(self, sid: str) -> AsyncIterator[SessionEvent]:
         """Ordered event stream for a session."""
         raise NotImplementedError(
-            f"harness {self.name!r} does not implement the session plane (stream)")
+            f"harness {self.name!r} does not implement the session plane (stream)"
+        )
 
     async def inject(self, sid: str, text: str) -> dict:
         """Inject operator text into a running session as keystrokes (P1 WRITE).
@@ -229,22 +273,26 @@ class Harness(ABC):
         that drives it stays behind the capauth bearer gate (see daemon.py).
         """
         raise NotImplementedError(
-            f"harness {self.name!r} does not implement the session plane (inject)")
+            f"harness {self.name!r} does not implement the session plane (inject)"
+        )
 
     async def set_model(self, sid: str, selection: str) -> None:
         """Hot model switch: write the session:<id> resolver pin, rebind the loop."""
         raise NotImplementedError(
-            f"harness {self.name!r} does not implement the session plane (set_model)")
+            f"harness {self.name!r} does not implement the session plane (set_model)"
+        )
 
     async def get_branch(self, sid: str) -> str:
         """Current git branch / worktree ref of the session."""
         raise NotImplementedError(
-            f"harness {self.name!r} does not implement the session plane (get_branch)")
+            f"harness {self.name!r} does not implement the session plane (get_branch)"
+        )
 
     async def background_tasks(self, sid: str) -> list[BackgroundTask]:
         """Enumerate the harness's own async/subagent tasks."""
         raise NotImplementedError(
-            f"harness {self.name!r} does not implement the session plane (background_tasks)")
+            f"harness {self.name!r} does not implement the session plane (background_tasks)"
+        )
 
     async def archive(self, sid: str) -> dict:
         """Stop + persist the session (not a destructive kill).
@@ -256,7 +304,8 @@ class Harness(ABC):
         BEFORE stopping the PTY so a failure never loses the record.
         """
         raise NotImplementedError(
-            f"harness {self.name!r} does not implement the session plane (archive)")
+            f"harness {self.name!r} does not implement the session plane (archive)"
+        )
 
     async def cancel(self, sid: str) -> dict:
         """Cancel a LIVE session: a hard stop (skcode Code-section card C-6).
@@ -274,7 +323,8 @@ class Harness(ABC):
         bearer + PDP gate (see daemon.py).
         """
         raise NotImplementedError(
-            f"harness {self.name!r} does not implement the session plane (cancel)")
+            f"harness {self.name!r} does not implement the session plane (cancel)"
+        )
 
     async def deny(self, sid: str) -> dict:
         """REFUSE what a session is doing / has done (skcode Code-section card C-13).
@@ -304,7 +354,8 @@ class Harness(ABC):
         capauth bearer + PDP gate on ``skcode.inject`` (see daemon.py).
         """
         raise NotImplementedError(
-            f"harness {self.name!r} does not implement the session plane (deny)")
+            f"harness {self.name!r} does not implement the session plane (deny)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +366,7 @@ class Harness(ABC):
 # subset (list_sessions + stream); every write verb stays at the base gated raise,
 # so the double has no write path of its own.
 # ---------------------------------------------------------------------------
+
 
 class FakeHarness(Harness):
     name = "fake"
@@ -329,10 +381,16 @@ class FakeHarness(Harness):
         self._events = dict(events) if events else {}
 
     def capabilities(self) -> HarnessCapabilities:
-        return {"session_resume": False, "structured_output": "none",
-                "sandbox": False, "tool_restrictions": False,
-                "task_plane": False, "session_plane": True,
-                "headless_api": "none", "hot_set_model": False}
+        return {
+            "session_resume": False,
+            "structured_output": "none",
+            "sandbox": False,
+            "tool_restrictions": False,
+            "task_plane": False,
+            "session_plane": True,
+            "headless_api": "none",
+            "hot_set_model": False,
+        }
 
     async def list_sessions(self) -> list[SessionDescriptor]:
         return list(self._sessions)
@@ -346,6 +404,7 @@ class FakeHarness(Harness):
 # The two default bridges (one-directional, optional). Structure + docstrings
 # only; fleshed out when the session plane lands.
 # ---------------------------------------------------------------------------
+
 
 class SessionTaskBridge:
     """Mixin: give a SESSION-capable adapter the task plane for free.
@@ -369,7 +428,8 @@ class SessionTaskBridge:
         """
         raise NotImplementedError(
             "SessionTaskBridge._oneshot lands with the session plane "
-            "(skcode P0 pivot); it will drive spawn/stream/archive")
+            "(skcode P0 pivot); it will drive spawn/stream/archive"
+        )
 
     def assess(self, brief: "AssessBrief") -> "Verdict":
         raise NotImplementedError("SessionTaskBridge.assess: see _oneshot")
@@ -399,21 +459,22 @@ class TaskSessionShim:
         the CLI adapters. Declared async-generator-shaped so the contract type is
         right; raises until wired.
         """
-        raise NotImplementedError(
-            "TaskSessionShim.stream lands with the read-only session plane")
-        if False:                               # pragma: no cover - keeps this an async generator
+        raise NotImplementedError("TaskSessionShim.stream lands with the read-only session plane")
+        if False:  # pragma: no cover - keeps this an async generator
             yield SessionEvent(type=EventType.STATUS)
 
     async def inject(self, sid: str, text: str) -> dict:
         """Read-only shim: injection is unsupported (declared via capabilities)."""
         raise NotImplementedError(
             "TaskSessionShim is read-only; inject is unsupported "
-            "(capabilities advertise hot_set_model=False)")
+            "(capabilities advertise hot_set_model=False)"
+        )
 
 
 # ---------------------------------------------------------------------------
 # Fail-closed builder (unified, name-first per ADR 2.4)
 # ---------------------------------------------------------------------------
+
 
 def build_harness(name: str, config) -> Harness:
     """Construct the harness registered under ``name`` from ``config``.
@@ -424,17 +485,29 @@ def build_harness(name: str, config) -> Harness:
     SAME registry dict.
     """
     import skharness.autocode.adapters  # noqa: F401  ensure adapters self-register
+
     factory = HARNESSES.get(name)
     if factory is None:
-        raise ValueError(
-            f"unknown harness {name!r}; registered: {sorted(HARNESSES)}")
+        raise ValueError(f"unknown harness {name!r}; registered: {sorted(HARNESSES)}")
     return factory(config)
 
 
 __all__ = [
-    "Harness", "HarnessCapabilities", "HARNESSES",
-    "register_harness", "build_harness", "warn_missing_capabilities",
-    "SessionTaskBridge", "TaskSessionShim", "FakeHarness",
-    "SessionDescriptor", "HarnessSession", "SessionEvent", "EventType",
-    "InputMessage", "BackgroundTask", "SpawnRejected",
+    "Harness",
+    "HarnessCapabilities",
+    "HARNESSES",
+    "register_harness",
+    "build_harness",
+    "warn_missing_capabilities",
+    "SessionTaskBridge",
+    "TaskSessionShim",
+    "FakeHarness",
+    "SessionDescriptor",
+    "HarnessSession",
+    "SessionEvent",
+    "EventType",
+    "InputMessage",
+    "BackgroundTask",
+    "SpawnRejected",
+    "SpawnOwnershipError",
 ]
