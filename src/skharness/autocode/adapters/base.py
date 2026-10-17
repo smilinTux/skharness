@@ -224,7 +224,7 @@ class BaseCliAdapter(Harness):
     def _auth_env(self) -> dict:
         raise NotImplementedError
 
-    def _config_files(self, model: str | None = None) -> dict:
+    def _config_files(self, model: str | None = None, family_preference: list[str] | None = None) -> dict:
         return {}
 
     def _required_commands(self) -> list[str]:
@@ -298,6 +298,7 @@ class BaseCliAdapter(Harness):
         repo,
         light: bool = False,
         model: str | None = None,
+        family_preference: list[str] | None = None,
     ) -> dict:
         prompt = frame(instruction, data)
         image = getattr(repo, "sandbox_image", None) or self._image()
@@ -305,6 +306,8 @@ class BaseCliAdapter(Harness):
         # handed different model ids. They must agree: _config_files DECLARES the
         # model to the CLI and _argv REQUESTS it, so a disagreement means the CLI
         # asks for a model it never declared.
+        # SKW-ROUTE-03R1 REPAIR: family_preference goes ONLY to _config_files, never to _argv
+        # This prevents preference keywords from reaching argv hooks.
         mkw: dict = {}
         if model is not None:
             if not self.supports_model_override():
@@ -315,15 +318,18 @@ class BaseCliAdapter(Harness):
                 )
             validate_bucket(model)  # never emit an unvalidated bucket id
             mkw["model"] = model
+        # SKW-ROUTE-03R1: family_preference is passed ONLY to _config_files
+        if family_preference is not None:
+            mkw["family_preference"] = family_preference
         spec = LaunchSpec(
             name=self.name,
-            argv=self._argv(prompt, light=light, **mkw),
+            argv=self._argv(prompt, light=light, **mkw),  # family_preference NOT passed here
             image=image,
             worktree=worktree,
             auth_mounts=self._auth_mounts(),
             auth_env=self._auth_env(),
             egress_hosts=self.egress_hosts,
-            config_files=self._config_files(**mkw),
+            config_files=self._config_files(**mkw),  # family_preference passed here
             stdin=self._stdin_for(prompt),
             required_commands=self._required_commands(),
             required_checks=self._required_checks(),
@@ -566,8 +572,10 @@ class BaseCliAdapter(Harness):
         # hooks in _run_raw and the result-provenance hook, preventing the model
         # recorded as requested from drifting from the model actually launched.
         model = dispatch_model_of(brief)
+        # SKW-ROUTE-03R1: family preference from TaskBrief, passed through to the adapter
+        family_preference = getattr(brief, 'family_preference', None)
         raw = self._run_raw(
-            instruction, data, worktree=brief.worktree, repo=brief.repo, model=model
+            instruction, data, worktree=brief.worktree, repo=brief.repo, model=model, family_preference=family_preference
         )
         usage = raw.get("usage", {}) if isinstance(raw, dict) else {}
         return HarnessResult(
