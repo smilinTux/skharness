@@ -9,6 +9,9 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ## [Unreleased]
 
+- Added Pi gateway request attribution via an `x-agent-id` provider header sourced
+  from the shared `resolve_identity()` precedence (card `ae072437`).
+
 - Added an empty, promotion-only Joule Economy golden-set v2 boundary. Candidate
   creation embeds and hashes exact source text, only ratified entries can gate,
   and v1 entries fail the v2 promotion schema (card `5e3569b9`).

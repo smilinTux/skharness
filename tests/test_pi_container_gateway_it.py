@@ -292,6 +292,7 @@ def test_pi_container_routes_to_mock_gateway_without_direct_egress(tmp_path: Pat
         assert request["path"] == "/v1/chat/completions"
         assert request["body"]["model"] == "reference"
         headers = {key.lower(): value for key, value in request["headers"].items()}
+        assert headers["x-agent-id"] == PiAdapter().agent_id
         assert headers["x-session-id"] == "c0c28bbe-container-it"
         assert headers["x-sk-card-id"] == "c0c28bbe"
 
