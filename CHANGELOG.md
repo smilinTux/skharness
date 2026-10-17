@@ -9,6 +9,11 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ## [Unreleased]
 
+- Added a governed card-to-session router that reserves a distinct card,
+  identity, worktree, and branch per fake-launcher assignment, claims every
+  card through the authoritative SKCoord gate before launch, and refuses
+  duplicate-card routing (card `4c439c6b`).
+
 - Added an empty, promotion-only Joule Economy golden-set v2 boundary. Candidate
   creation embeds and hashes exact source text, only ratified entries can gate,
   and v1 entries fail the v2 promotion schema (card `5e3569b9`).
