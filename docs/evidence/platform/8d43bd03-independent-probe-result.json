@@ -1,0 +1,49 @@
+{
+  "candidate_future_reserved_at_process": [
+    "runner_reached",
+    [
+      [
+        "isolated-fake-launch",
+        "--no-live-action"
+      ]
+    ],
+    true
+  ],
+  "candidate_future_reserved_at_tmux": [
+    "runner_reached",
+    [
+      [
+        "isolated-fake-launch",
+        "--no-live-action"
+      ]
+    ],
+    true
+  ],
+  "candidate_inconsistent_pause_process": [
+    "fail_closed:StateUnavailableError",
+    []
+  ],
+  "candidate_mismatched_resume_tmux": [
+    "fail_closed:StateUnavailableError",
+    []
+  ],
+  "launch_boundary": "injected fake runner only",
+  "parent_inconsistent_pause_process": [
+    "runner_reached",
+    [
+      [
+        "isolated-fake-launch",
+        "--no-live-action"
+      ]
+    ]
+  ],
+  "parent_mismatched_resume_tmux": [
+    "runner_reached",
+    [
+      [
+        "isolated-fake-launch",
+        "--no-live-action"
+      ]
+    ]
+  ]
+}
