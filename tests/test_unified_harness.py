@@ -16,7 +16,7 @@ import pytest
 def _cfg(**over):
     base = {"allowed_tools": [], "mcp_endpoints": None, "live_execution": False,
             "sandbox_image": None, "harness_model": None, "harness_base_url": None,
-            "harness_max_tokens": None}
+            "harness_max_tokens": None, "session_id": None, "card_id": None}
     base.update(over)
     return SimpleNamespace(**base)
 
@@ -52,6 +52,15 @@ def test_capabilities_merge_task_and_session_cells():
     # merged skcode cells
     for key in ("task_plane", "session_plane", "headless_api", "hot_set_model"):
         assert key in caps
+
+
+def test_pi_factory_threads_configured_attribution_identity():
+    from skharness.harness import build_harness
+
+    h = build_harness("pi", _cfg(session_id="session-abc", card_id="a49d1c36"))
+
+    assert h.session_id == "session-abc"
+    assert h.card_id == "a49d1c36"
 
 
 def test_four_adapters_expose_task_plane_not_session_plane():

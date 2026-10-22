@@ -175,6 +175,8 @@ class Config:
     harness_model: str | None = None
     harness_base_url: str | None = None
     harness_max_tokens: int | None = None
+    session_id: str | None = None
+    card_id: str | None = None
     live_execution: bool = False
     mcp_endpoints: list[str] = field(default_factory=list)
     sandbox_image: str | None = None
@@ -239,6 +241,8 @@ class Config:
             harness_model=raw.get("harness_model"),
             harness_base_url=raw.get("harness_base_url"),
             harness_max_tokens=raw.get("harness_max_tokens"),
+            session_id=raw.get("session_id"),
+            card_id=raw.get("card_id"),
             live_execution=bool(raw.get("live_execution", False)),
             mcp_endpoints=list(raw.get("mcp_endpoints") or []),
             sandbox_image=raw.get("sandbox_image"),

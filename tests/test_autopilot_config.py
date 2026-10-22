@@ -142,6 +142,8 @@ def test_every_known_key_still_loads(tmp_path):
         harness_model: ornith-1.0-35b
         harness_base_url: http://localhost:18780/v1
         harness_max_tokens: 131072
+        session_id: session-abc
+        card_id: a49d1c36
         live_execution: true
         mcp_endpoints: [127.0.0.1]
         sandbox_image: sandbox-pi:1
@@ -177,6 +179,8 @@ def test_every_known_key_still_loads(tmp_path):
         """)
     cfg = Config.load(p)
     assert cfg.caps.new_tasks_per_run == 1 and cfg.repo("skos").deploy_cmd == "echo ok"
+    assert cfg.session_id == "session-abc"
+    assert cfg.card_id == "a49d1c36"
 
 
 def test_live_fleet_autopilot_configs_all_load(monkeypatch):

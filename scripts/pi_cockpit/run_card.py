@@ -203,7 +203,7 @@ def main(argv=None) -> int:
         model=model, base_url=config.harness_base_url,
         egress_hosts=config.mcp_endpoints, live_execution=config.live_execution,
         image=repo.sandbox_image or config.sandbox_image,
-        max_tokens=config.harness_max_tokens)
+        max_tokens=config.harness_max_tokens, session_id=run_id, card_id=card)
     harness = _ObservedHarness(real_harness, args.status_dir, card)
 
     try:
