@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from skharness.activity import ActivityJournal, ActivityKind
-from skharness.harness import SpawnRejected
+from skharness.harness import HarnessSession, SpawnRejected
 from skharness.harnesses.claude_code import ClaudeCodeHarness
 from skharness.pool import PoolController
 
@@ -84,6 +84,152 @@ def _harness(repo_root: Path, *, runner: FakeTmux, git_runner, sessions_root: Pa
 def _controller(harness, tmp_path: Path) -> PoolController:
     activity = ActivityJournal(root=tmp_path / "activity")
     return PoolController(harness, activity=activity)
+
+
+class FakeLivenessHarness:
+    """Deterministic pool collaborator; no real process, tmux, git, or sleep."""
+
+    def __init__(self) -> None:
+        self.alive: dict[str, bool] = {}
+        self.spawned: list[str] = []
+        self.probed: list[str] = []
+        self.archived: list[str] = []
+        self.calls: list[tuple[str, str]] = []
+        self.archive_error: Exception | None = None
+
+    async def spawn(self, descriptor, *, prompt: str) -> HarnessSession:
+        sid = f"owned-{len(self.spawned) + 1}"
+        self.spawned.append(sid)
+        self.alive[sid] = True
+        self.calls.append(("spawn", sid))
+        return HarnessSession(sid=sid, descriptor=descriptor, status="running")
+
+    async def is_alive(self, sid: str) -> bool:
+        self.probed.append(sid)
+        return self.alive[sid]
+
+    async def archive(self, sid: str) -> dict:
+        self.calls.append(("archive", sid))
+        if self.archive_error is not None:
+            raise self.archive_error
+        self.archived.append(sid)
+        return {
+            "sid": sid,
+            "archived": True,
+            "transcript_path": f"/fake/transcripts/{sid}.json",
+        }
+
+
+# --- liveness and corpse reaping (card 11a1dc6d) -----------------------------
+
+
+@pytest.mark.asyncio
+async def test_active_members_reaps_dead_tracked_member_once(tmp_path):
+    harness = FakeLivenessHarness()
+    now = iter((100.0, 200.0, 300.0))
+    journal = ActivityJournal(root=tmp_path / "activity")
+    pool = PoolController(harness, activity=journal, clock=lambda: next(now))
+    alive = await pool.spawn(lane="a", repo="repo", branch="main", prompt="p")
+    dead = await pool.spawn(lane="a", repo="repo", branch="main", prompt="p")
+    harness.alive[dead.sid] = False
+
+    assert [member.sid for member in await pool.active_members("a")] == [alive.sid]
+    assert harness.probed == [alive.sid, dead.sid]
+    assert harness.archived == [dead.sid]
+    assert dead.reaped is True
+    assert dead.drained is True
+    assert dead.reap_reason == "harness liveness probe reported dead"
+    assert dead.reaped_at == 300.0
+    assert dead.reap_result["archive"]["transcript_path"].endswith(f"{dead.sid}.json")
+
+    reap_events = [
+        event for event in journal.read_after(0)
+        if event.kind == ActivityKind.DISPOSITION
+    ]
+    assert len(reap_events) == 1
+    assert reap_events[0].session_id == dead.sid
+    assert reap_events[0].data["sid"] == dead.sid
+    assert reap_events[0].data["reason"] == "harness liveness probe reported dead"
+    assert reap_events[0].data["reaped_at"] == 300.0
+
+    # Repeated membership checks never re-probe/re-archive/re-emit the corpse.
+    assert [member.sid for member in await pool.active_members("a")] == [alive.sid]
+    assert harness.archived == [dead.sid]
+    assert len([
+        event for event in journal.read_after(0)
+        if event.kind == ActivityKind.DISPOSITION
+    ]) == 1
+
+
+@pytest.mark.asyncio
+async def test_reap_propagates_transcript_failure_without_state_or_event(tmp_path):
+    harness = FakeLivenessHarness()
+    journal = ActivityJournal(root=tmp_path / "activity")
+    pool = PoolController(harness, activity=journal, clock=lambda: 123.0)
+    dead = await pool.spawn(lane="a", repo="repo", branch="main", prompt="p")
+    harness.alive[dead.sid] = False
+    harness.archive_error = OSError("transcript capture failed")
+
+    with pytest.raises(OSError, match="transcript capture failed"):
+        await pool.active_members("a")
+
+    assert dead.reaped is False
+    assert dead.drained is False
+    assert dead.reaped_at is None
+    assert dead.reap_result == {}
+    assert [
+        event for event in journal.read_after(0)
+        if event.kind == ActivityKind.DISPOSITION
+    ] == []
+
+
+@pytest.mark.asyncio
+async def test_active_members_never_probes_or_reaps_untracked_sid():
+    harness = FakeLivenessHarness()
+    harness.alive["unowned"] = False
+    pool = PoolController(harness)
+    owned = await pool.spawn(lane="a", repo="repo", branch="main", prompt="p")
+
+    assert await pool.active_members("other") == []
+    assert harness.probed == []
+    assert harness.archived == []
+    assert owned.drained is False
+    assert "unowned" not in harness.probed
+
+
+@pytest.mark.asyncio
+async def test_scale_reaps_before_delta_and_refills_with_existing_spawn_semantics(tmp_path):
+    harness = FakeLivenessHarness()
+    pool = PoolController(harness)
+    dead = await pool.spawn(lane="a", repo="repo", branch="main", prompt="original")
+    harness.alive[dead.sid] = False
+    harness.calls.clear()
+
+    active = await pool.scale(
+        lane="a", repo="repo", branch="main", prompt="replacement", target=1,
+    )
+
+    assert len(active) == 1
+    assert active[0].sid != dead.sid
+    assert harness.calls == [("archive", dead.sid), ("spawn", active[0].sid)]
+    assert dead.reaped is True
+
+
+@pytest.mark.asyncio
+async def test_explicit_injected_liveness_contract_is_supported():
+    harness = FakeLivenessHarness()
+    probed: list[str] = []
+
+    async def injected(sid: str) -> bool:
+        probed.append(sid)
+        return False
+
+    pool = PoolController(harness, liveness_probe=injected)
+    member = await pool.spawn(lane="a", repo="repo", branch="main", prompt="p")
+
+    assert await pool.active_members("a") == []
+    assert probed == [member.sid]
+    assert harness.probed == []
 
 
 # --- the drill (acceptance criterion 1 + 2) ----------------------------------

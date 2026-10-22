@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
@@ -49,6 +50,11 @@ from skharness.harness import Harness, HarnessSession, SessionDescriptor
 #: real coord CLI, mirroring the tmux/git ``Runner`` convention in
 #: harnesses/claude_code.py (argv list, never ``shell=True``).
 BoardRunner = Callable[[list[str]], str]
+
+#: The harness-owned liveness contract consumed by the pool.  The harness
+#: implementation decides whether its controller-owned worker is alive; the
+#: pool only asks about sids it already tracks.
+LivenessProbe = Callable[[str], Awaitable[bool]]
 
 #: Sensible default: the same command the inline controller ran every poll.
 _DEFAULT_BOARD_ARGV = ["skcapstone", "coord", "kanban", "--json"]
@@ -72,6 +78,10 @@ class PoolMember:
     spawned_at: float
     drained: bool = False
     drain_result: dict[str, Any] = field(default_factory=dict)
+    reaped: bool = False
+    reap_reason: str = ""
+    reaped_at: float | None = None
+    reap_result: dict[str, Any] = field(default_factory=dict)
 
 
 class PoolController:
@@ -89,11 +99,17 @@ class PoolController:
         *,
         activity: ActivityJournal | None = None,
         board_runner: BoardRunner | None = None,
+        liveness_probe: LivenessProbe | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.harness = harness
         self.activity = activity
         self._board_runner = board_runner
+        # During the split A/B implementation, the explicit injection keeps
+        # this side testable before the Harness contract lands.  Once present,
+        # harness.is_alive is consumed automatically.  Older harnesses remain
+        # compatible and simply have no dead-member observations to act on.
+        self._liveness_probe = liveness_probe or getattr(harness, "is_alive", None)
         self._clock = clock
         self._pool: dict[str, PoolMember] = {}
 
@@ -186,7 +202,9 @@ class PoolController:
         """
         if target < 0:
             raise ValueError("scale target must be >= 0")
-        active = self._active_members(lane)
+        # Reap first: a dead tracked worker must not consume a target slot and
+        # suppress the replacement spawn.
+        active = await self.active_members(lane)
         if len(active) > target:
             surplus = sorted(active, key=lambda m: m.spawned_at)[: len(active) - target]
             for member in surplus:
@@ -198,6 +216,87 @@ class PoolController:
                     model=model, quality=quality, mode=mode,
                 )
         return self._active_members(lane)
+
+    async def active_members(self, lane: str) -> list[PoolMember]:
+        """Return live, undrained members after reaping dead tracked workers.
+
+        Only members in ``self._pool`` and the requested lane are probed.  The
+        pool never discovers or inspects arbitrary harness/tmux panes.
+        """
+        await self.reap_dead(lane)
+        return self._active_members(lane)
+
+    async def reap_dead(self, lane: str | None = None) -> list[dict[str, Any]]:
+        """Transcript-first reap every dead active member in the owned scope.
+
+        A harness without the liveness contract yields no observations.  This
+        compatibility path is needed while the independently implemented
+        harness side is integrated; it never guesses that a worker is dead.
+        """
+        if self._liveness_probe is None:
+            return []
+        candidates = [
+            member
+            for member in self._pool.values()
+            if not member.drained and not member.reaped
+            and (lane is None or member.lane == lane)
+        ]
+        results: list[dict[str, Any]] = []
+        for member in candidates:
+            alive = await self._liveness_probe(member.sid)
+            if type(alive) is not bool:
+                raise TypeError("harness liveness probe must return bool")
+            if not alive:
+                results.append(
+                    await self.reap(member.sid, reason="harness liveness probe reported dead")
+                )
+        return results
+
+    async def reap(self, sid: str, *, reason: str) -> dict[str, Any]:
+        """Reap one owned dead member, preserving transcript before state.
+
+        ``archive`` is the transcript-first harness primitive.  If transcript
+        capture/archive raises, the exception propagates and no reap state or
+        event is recorded.  A completed reap is idempotent: subsequent calls
+        return its immutable-by-convention record without another archive or
+        activity event.
+        """
+        member = self._pool.get(sid)
+        if member is None:
+            return {
+                "sid": sid,
+                "reaped": False,
+                "reason": "not a pool-tracked session",
+            }
+        if member.reaped:
+            return member.reap_result
+
+        archive_result = await self.harness.archive(sid)
+        reaped_at = self._clock()
+        result: dict[str, Any] = {
+            "sid": sid,
+            "reaped": True,
+            "reason": reason,
+            "reaped_at": reaped_at,
+            "archive": archive_result,
+        }
+
+        # Record and emit only after transcript-first archive succeeds, then
+        # remove the corpse from active membership.  The reaped member stays in
+        # tracked history so operators can inspect its reason and timestamp.
+        member.reap_reason = reason
+        member.reaped_at = reaped_at
+        member.reap_result = result
+        member.drain_result = archive_result
+        self._emit(
+            sid,
+            ActivityKind.DISPOSITION,
+            f"lane1 pool reaped dead member {sid!r}: {reason}",
+            result,
+        )
+        member.reaped = True
+        member.drained = True
+        return result
 
     async def drain(self, sid: str) -> dict:
         """Stop ONE pane, transcript-first, via the harness's own ``archive``.
@@ -304,7 +403,11 @@ class PoolController:
     # ---- introspection ------------------------------------------------------
 
     def _active_members(self, lane: str) -> list[PoolMember]:
-        return [m for m in self._pool.values() if m.lane == lane and not m.drained]
+        return [
+            member
+            for member in self._pool.values()
+            if member.lane == lane and not member.drained and not member.reaped
+        ]
 
     def members(self, lane: str | None = None) -> list[PoolMember]:
         """All tracked panes (optionally scoped to one lane), spawned or drained."""
