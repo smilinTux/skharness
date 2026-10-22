@@ -1,0 +1,884 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="skcode-client" content="read-only">
+<title>skcode (read-only)</title>
+<style>
+  :root {
+    --bg: #111; --panel: #1b1b1b; --line: #333; --line2: #222;
+    --fg: #ddd; --muted: #888; --accent: #7cf; --good: #6a6;
+    --warn: #fc6; --tool: #9ad; --diff: #b9a;
+    /* Type scale (density pass, spec 2026-08-11 section 7.2). Six rem tokens
+       anchored to the browser's 16px root so pinch/ctrl zoom keeps working;
+       px does not scale with zoom, rem does. Values reproduce, exactly, the
+       px literals they replace at a 16px root: 0.625 / 0.6875 / 0.75 /
+       0.8125 / 0.875 / 0.9375 rem times 16 = 10 / 11 / 12 / 13 / 14 / 15px.
+       The mobile media query below swaps --fs-body and --fs-emph to their
+       mobile targets in one place instead of re-declaring font-size on
+       every affected selector. */
+    --fs-badge: 0.625rem;
+    --fs-micro: 0.6875rem;
+    --fs-caption: 0.75rem;
+    --fs-body: 0.8125rem;
+    --fs-emph: 0.875rem;
+    --fs-title: 0.9375rem;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0;
+         background: var(--bg); color: var(--fg); font-size: var(--fs-body); }
+  header { padding: 10px 12px; background: var(--panel);
+           display: flex; gap: 10px; align-items: center;
+           border-bottom: 1px solid var(--line); }
+  header strong { color: var(--accent); }
+  header .tag { color: var(--muted); font-size: var(--fs-caption); }
+  header .host { color: var(--muted); font-size: var(--fs-caption); margin-left: auto; }
+  button { background: #264; color: #fff; border: 0; padding: 6px 12px;
+           border-radius: 4px; cursor: pointer; font: inherit; }
+  button:hover { background: #375; }
+  main { display: flex; height: calc(100vh - 45px); }
+  #list { width: 340px; min-width: 240px; overflow-y: auto;
+          border-right: 1px solid var(--line); }
+  .row { padding: 10px 12px; border-bottom: 1px solid var(--line2); cursor: pointer; }
+  .row:hover { background: #1e1e1e; }
+  .row.active { background: #24303a; }
+  .row .name { color: var(--accent); }
+  .row .meta { color: var(--muted); font-size: var(--fs-caption); margin-top: 3px; }
+  .empty { padding: 24px; color: var(--muted); line-height: 1.6; }
+  .empty h2 { color: var(--fg); font-size: var(--fs-title); margin: 0 0 8px; }
+  .empty code { color: var(--accent); }
+  #convo { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #transcript { flex: 1; overflow-y: auto; padding: 12px;
+                white-space: pre-wrap; word-break: break-word; }
+  #transcript .placeholder { color: var(--muted); }
+  #activity-bar { display: none; gap: 6px; flex-wrap: wrap; align-items: center;
+                  padding: 8px 12px; border-bottom: 1px solid var(--line);
+                  background: var(--panel); }
+  #activity-bar.open { display: flex; }
+  #activity-bar input, #activity-bar select { background: #151515; color: var(--fg);
+                  border: 1px solid var(--line); border-radius: 4px;
+                  padding: 5px 7px; font: inherit; min-width: 90px; }
+  #activity-state { color: var(--muted); font-size: var(--fs-caption); }
+  #activity-state.live { color: var(--good); }
+  #activity-state.err { color: var(--warn); }
+  .activity { border-bottom: 1px solid var(--line2); padding: 7px 2px; }
+  .activity .activity-head { color: var(--accent); }
+  .activity .activity-meta { color: var(--muted); font-size: var(--fs-caption); }
+  .activity details { margin-top: 4px; color: var(--muted); }
+  .activity pre { white-space: pre-wrap; margin: 4px 0 0; color: var(--fg); }
+  /* Inject bar: send a follow-up into the active session. This is a gated WRITE
+     (POST /api/v1/sessions/<sid>/inject, skcode.inject scope), the second and
+     last write this client issues (dispatch is the other). Disabled until a
+     session is selected. */
+  #inject-bar { display: flex; gap: 8px; align-items: center; padding: 8px 12px;
+                border-top: 1px solid var(--line); background: var(--panel); }
+  #inject-bar input { flex: 1; background: #151515; color: var(--fg);
+                      border: 1px solid var(--line); border-radius: 4px;
+                      padding: 6px 8px; font: inherit; }
+  #inject-bar input:disabled, #inject-bar button:disabled { opacity: 0.5; cursor: default; }
+  #inject-msg { font-size: var(--fs-caption); }
+  #inject-msg.err { color: var(--warn); }
+  .ev { margin: 2px 0; }
+  .ev.status { color: var(--good); }
+  .ev.needs_input { color: var(--warn); }
+  .ev.tool_call, .ev.tool_result { color: var(--tool); }
+  .ev.tool_call, .ev.tool_result { white-space: pre-wrap; font-size: var(--fs-body); }
+  .ev.tool_result.err { color: var(--warn); }
+  .ev.diff { color: var(--diff); }
+  /* Compose (New session) panel. This holds the ONLY write affordance in the
+     whole client: the gated POST /api/v1/dispatch. Everything else stays GET /
+     read-only WS. Hidden by default; toggled from the header and remembered. */
+  #compose { display: none; padding: 12px; background: var(--panel);
+             border-bottom: 1px solid var(--line); }
+  #compose.open { display: block; }
+  #compose h2 { margin: 0 0 10px; font-size: var(--fs-emph); color: var(--fg); }
+  #compose .grid { display: flex; flex-wrap: wrap; gap: 12px; }
+  #compose .field { display: flex; flex-direction: column; gap: 4px; }
+  #compose label { color: var(--muted); font-size: var(--fs-caption); }
+  #compose .hint { color: var(--muted); font-size: var(--fs-micro); }
+  #compose .hint.warn { color: var(--warn); }
+  #compose select, #compose input, #compose textarea {
+    background: #151515; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 4px; padding: 6px 8px; font: inherit; }
+  #compose textarea { width: 100%; min-height: 70px; resize: vertical; }
+  #compose .prompt-field { margin-top: 10px; }
+  #compose .actions { margin-top: 10px; display: flex; gap: 10px; align-items: center; }
+  #compose .msg { font-size: var(--fs-caption); }
+  #compose .msg.err { color: var(--warn); }
+  #compose .msg.ok { color: var(--good); }
+  #compose button:disabled { opacity: 0.5; cursor: default; }
+  /* Phone: shrink fonts + the session list so the transcript is not squeezed to
+     half the screen, and tighten the chrome. Layout is unchanged on desktop.
+     Fonts shrink by swapping --fs-body and --fs-emph VALUES here once; every
+     selector above that reads var(--fs-body) or var(--fs-emph) (body itself,
+     .ev.tool_call/.tool_result, #compose h2, and everything that inherits
+     body's size: .row .name, #transcript, the compose form fields, the inject
+     bar input) picks up the new value automatically, no per-selector
+     re-declaration needed. .row .meta and #compose label are the two
+     exceptions: their desktop size shares --fs-caption with #inject-msg and
+     #compose .msg, which do NOT shrink on mobile, so they switch to a
+     different, already-declared token (--fs-badge / --fs-micro) instead of
+     a literal. */
+  @media (max-width: 640px) {
+    :root {
+      --fs-body: 0.75rem;   /* 12px, was 13px */
+      --fs-emph: 0.8125rem; /* 13px, was 14px */
+    }
+    header { padding: 6px 8px; gap: 6px; }
+    header .tag, header .host { display: none; }
+    button { padding: 5px 9px; }
+    main { height: calc(100vh - 40px); }
+    #list { width: 40%; min-width: 118px; }
+    .row { padding: 6px 8px; }
+    .row .meta { font-size: var(--fs-badge); margin-top: 2px; }
+    #transcript { padding: 8px; }
+    #compose { padding: 8px; }
+    #compose .grid { gap: 8px; }
+    #compose h2 { margin-bottom: 6px; }
+    #compose label { font-size: var(--fs-micro); }
+    #compose select, #compose input, #compose textarea { padding: 4px 6px; }
+    #compose textarea { min-height: 54px; }
+    #inject-bar { padding: 6px 8px; gap: 6px; }
+    #inject-bar input { padding: 5px 7px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <strong>skcode</strong>
+  <span class="tag">read-only</span>
+  <button id="compose-toggle" type="button">New session</button>
+  <button id="activity-toggle" type="button">Activity</button>
+  <button id="refresh" type="button">Refresh</button>
+  <span class="host" id="host"></span>
+</header>
+<section id="compose" aria-label="New session">
+  <h2>New session</h2>
+  <div class="grid">
+    <div class="field">
+      <label for="repo">repo</label>
+      <select id="repo"></select>
+      <input id="repo-text" type="text" placeholder="owner/repo" style="display:none">
+      <div class="hint" id="repo-hint"></div>
+    </div>
+    <div class="field">
+      <label for="branch">base branch</label>
+      <input id="branch" type="text" value="main">
+      <div class="hint">base only; the host cuts a fresh skcode/&lt;id&gt; branch off it</div>
+    </div>
+    <div class="field">
+      <label for="profile">profile</label>
+      <select id="profile">
+        <option value="sandbox">sandbox (isolated clean-room)</option>
+        <option value="full">full (your real environment)</option>
+      </select>
+      <div class="hint" id="profile-hint"></div>
+    </div>
+    <div class="field">
+      <label for="harness">harness</label>
+      <select id="harness"></select>
+      <div class="hint">claude-code is the only wired harness today</div>
+    </div>
+    <div class="field">
+      <label for="model">model</label>
+      <select id="model">
+        <option value="sk-default">sk-default (local Ornith, cloud-free)</option>
+        <option value="claude-sonnet-5">claude-sonnet-5 (Anthropic cloud)</option>
+        <option value="claude-opus-4-8">claude-opus-4-8 (Anthropic cloud)</option>
+        <option value="ornith-big">ornith-big (local Ornith 35B, cloud-free)</option>
+      </select>
+      <div class="hint" id="model-hint"></div>
+    </div>
+  </div>
+  <div class="field prompt-field">
+    <label for="prompt">prompt</label>
+    <textarea id="prompt" placeholder="What should this session do?"></textarea>
+  </div>
+  <div class="actions">
+    <button id="dispatch-btn" type="button">Start session</button>
+    <span class="msg" id="compose-msg"></span>
+  </div>
+</section>
+<main>
+  <div id="list"></div>
+  <div id="convo">
+    <div id="activity-bar" aria-label="Activity filters">
+      <input id="activity-session" placeholder="session id">
+      <input id="activity-run" placeholder="run/card id">
+      <input id="activity-agent" placeholder="agent id">
+      <input id="activity-job" placeholder="job id">
+      <input id="activity-card" placeholder="card id">
+      <input id="activity-contract" placeholder="contract id">
+      <input id="activity-lease" placeholder="lease id">
+      <input id="activity-role" placeholder="role">
+      <select id="activity-kind">
+        <option value="">all kinds</option>
+        <option value="status">status</option>
+        <option value="phase">phase</option>
+        <option value="assistant_text">assistant text</option>
+        <option value="tool_call">tool call</option>
+        <option value="tool_result">tool result</option>
+        <option value="file_change">file change</option>
+        <option value="test">test</option>
+        <option value="budget">budget</option>
+        <option value="disposition">disposition</option>
+        <option value="error">error</option>
+      </select>
+      <button id="activity-apply" type="button">Apply</button>
+      <span id="activity-state">offline</span>
+    </div>
+    <div id="transcript"><div class="placeholder">Select a session to tail its output.</div></div>
+    <div id="inject-bar">
+      <input id="inject-text" type="text" placeholder="Send a follow-up to this session..." disabled>
+      <button id="inject-btn" type="button" disabled>Send</button>
+      <span class="msg" id="inject-msg"></span>
+    </div>
+  </div>
+</main>
+<script>
+"use strict";
+// skcode read-only web client (P0). Consumes ONLY the read routes on
+// skcode-hostd: GET /api/v1/hosts/self, GET /api/v1/sessions,
+// GET /api/v1/sessions/{sid}, and the WS tail /api/v1/sessions/{sid}/stream.
+// There is deliberately NO write affordance of any kind (it issues only GET and
+// a read-only WS tail): this client can view sessions, nothing more.
+
+var listEl = document.getElementById("list");
+var transcriptEl = document.getElementById("transcript");
+var hostEl = document.getElementById("host");
+var injectText = document.getElementById("inject-text");
+var injectBtn = document.getElementById("inject-btn");
+var injectMsg = document.getElementById("inject-msg");
+var activityBar = document.getElementById("activity-bar");
+var activityState = document.getElementById("activity-state");
+var ws = null;
+var activeSid = null;
+var activityMode = false;
+var activityCursor = 0;
+var activityReconnect = null;
+
+// The parent shell (skchat) mints a capauth wire token scoped to audience
+// "skcode" and hands it to this read-only client through the iframe URL as
+// "?token=<wire>". hostd wants it as an "Authorization: Bearer" header on the
+// HTTP read routes, and as "?token=" on the WS tail (a browser cannot set
+// headers on a WebSocket). This client stays strictly read-only: the token is
+// only ever attached to the GET read routes and the WS tail, never to a write.
+// When no token is present every call goes out exactly as before and hostd's
+// verifier returns its gated empty state, so an unpaired/tokenless load is
+// unchanged.
+function wireToken() {
+  try {
+    return new URLSearchParams(location.search).get("token") || "";
+  } catch (e) {
+    return "";
+  }
+}
+var TOKEN = wireToken();
+
+// Merge the bearer into a fetch headers object when a token is present.
+function authHeaders(extra) {
+  var h = extra || {};
+  if (TOKEN) { h["Authorization"] = "Bearer " + TOKEN; }
+  return h;
+}
+
+// Origin-relative + proxy-aware. The page is served at ".../app": at the daemon
+// root that is "/app", behind the 443 funnel it is "/skcode/app". Stripping the
+// trailing "app" leaf yields the mount prefix ("" or "/skcode") so every API and
+// WS call resolves against wherever this page is actually mounted.
+function mountPrefix() {
+  var p = location.pathname.replace(/\/+$/, "");
+  return p.replace(/\/app$/, "");
+}
+function apiUrl(path) { return location.origin + mountPrefix() + path; }
+function wsUrl(path) {
+  var scheme = (location.protocol === "https:") ? "wss:" : "ws:";
+  var base = scheme + "//" + location.host + mountPrefix() + path;
+  if (TOKEN) {
+    base += (path.indexOf("?") >= 0 ? "&" : "?") + "token=" + encodeURIComponent(TOKEN);
+  }
+  return base;
+}
+
+function clearTranscript(msg) {
+  if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+  if (activityReconnect) { clearTimeout(activityReconnect); activityReconnect = null; }
+  _lastRenderedText = "";
+  transcriptEl.textContent = "";
+  var d = document.createElement("div");
+  d.className = "placeholder";
+  d.textContent = msg || "Select a session to tail its output.";
+  transcriptEl.appendChild(d);
+}
+
+function setActivityState(text, cls) {
+  activityState.textContent = text;
+  activityState.className = cls || "";
+}
+
+function activityFilters() {
+  return {
+    session_id: document.getElementById("activity-session").value.trim(),
+    run_id: document.getElementById("activity-run").value.trim(),
+    agent_id: document.getElementById("activity-agent").value.trim(),
+    job_id: document.getElementById("activity-job").value.trim(),
+    card_id: document.getElementById("activity-card").value.trim(),
+    contract_id: document.getElementById("activity-contract").value.trim(),
+    lease_id: document.getElementById("activity-lease").value.trim(),
+    role: document.getElementById("activity-role").value.trim(),
+    kind: document.getElementById("activity-kind").value
+  };
+}
+
+function activityQuery(after) {
+  var params = ["after=" + encodeURIComponent(String(after || 0))];
+  var filters = activityFilters();
+  Object.keys(filters).forEach(function (key) {
+    if (filters[key]) { params.push(key + "=" + encodeURIComponent(filters[key])); }
+  });
+  return "?" + params.join("&");
+}
+
+function renderActivity(event) {
+  if (!event || !event.cursor) { return; }
+  activityCursor = Math.max(activityCursor, Number(event.cursor) || 0);
+  if (transcriptEl.firstChild && transcriptEl.firstChild.className === "placeholder") {
+    transcriptEl.textContent = "";
+  }
+  var item = document.createElement("div");
+  item.className = "activity";
+  var head = document.createElement("div");
+  head.className = "activity-head";
+  var when = event.published_at ? new Date(event.published_at * 1000).toLocaleTimeString() : "";
+  head.textContent = when + "  " + (event.agent_id || event.source || "agent")
+    + (event.role ? "/" + event.role : "") + "  " + event.kind + "  "
+    + (event.summary || "");
+  var meta = document.createElement("div");
+  meta.className = "activity-meta";
+  meta.textContent = "cursor " + event.cursor
+    + (event.phase ? " · " + event.phase : "")
+    + (event.run_id ? " · run " + event.run_id : "")
+    + (event.card_id ? " · card " + event.card_id : "")
+    + (event.contract_id ? " · contract " + event.contract_id : "")
+    + (event.job_id ? " · job " + event.job_id : "")
+    + (event.session_id ? " · session " + event.session_id : "");
+  item.appendChild(head);
+  item.appendChild(meta);
+  var hasDetails = (event.data && Object.keys(event.data).length)
+    || (event.artifact_refs && event.artifact_refs.length)
+    || event.card_id || event.contract_id || event.lease_id || event.evidence_id;
+  if (hasDetails) {
+    var details = document.createElement("details");
+    var summary = document.createElement("summary");
+    summary.textContent = "structured evidence";
+    var pre = document.createElement("pre");
+    pre.textContent = JSON.stringify({
+      lineage: {
+        card_id: event.card_id || null,
+        card_hash: event.card_hash || null,
+        trajectory_id: event.trajectory_id || null,
+        team_id: event.team_id || null,
+        parent_agent_id: event.parent_agent_id || null,
+        contract_id: event.contract_id || null,
+        contract_hash: event.contract_hash || null,
+        plan_hash: event.plan_hash || null,
+        lease_id: event.lease_id || null,
+        attempt_id: event.attempt_id || null,
+        base_commit: event.base_commit || null,
+        evidence_id: event.evidence_id || null
+      },
+      data: event.data || {}, artifact_refs: event.artifact_refs || []
+    }, null, 2);
+    details.appendChild(summary); details.appendChild(pre); item.appendChild(details);
+  }
+  transcriptEl.appendChild(item);
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+function openActivityStream(reset) {
+  activityMode = true;
+  activeSid = null;
+  if (reset) { activityCursor = 0; transcriptEl.textContent = ""; }
+  if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+  if (activityReconnect) { clearTimeout(activityReconnect); activityReconnect = null; }
+  activityBar.classList.add("open");
+  injectText.disabled = true; injectBtn.disabled = true; injectMsg.textContent = "";
+  if (!transcriptEl.firstChild) {
+    var placeholder = document.createElement("div");
+    placeholder.className = "placeholder";
+    placeholder.textContent = "Waiting for agent activity…";
+    transcriptEl.appendChild(placeholder);
+  }
+  setActivityState("connecting", "");
+  try {
+    ws = new WebSocket(wsUrl("/api/v1/activity/stream" + activityQuery(activityCursor)));
+  } catch (e) {
+    setActivityState("connection failed", "err");
+    return;
+  }
+  ws.onopen = function () { if (activityMode) { setActivityState("live", "live"); } };
+  ws.onmessage = function (message) {
+    var envelope; try { envelope = JSON.parse(message.data); } catch (e) { return; }
+    if (envelope.type === "activity") { renderActivity(envelope.event); }
+    else if (envelope.type === "gap") {
+      activityCursor = Math.max(0, Number(envelope.retained_from_cursor || 1) - 1);
+      appendEvDiv("ev needs_input", "Older activity expired; resumed at retained cursor.");
+    } else if (envelope.type === "error") {
+      setActivityState("journal integrity error", "err");
+    }
+  };
+  ws.onclose = function (event) {
+    ws = null;
+    if (!activityMode) { return; }
+    setActivityState(event && event.code === 1008 ? "access refused" : "reconnecting", "err");
+    if (!event || event.code !== 1008) {
+      activityReconnect = setTimeout(function () { openActivityStream(false); }, 1000);
+    }
+  };
+  ws.onerror = function () { if (activityMode) { setActivityState("stream error", "err"); } };
+}
+
+// The stream is a raw capture of claude's full-screen TUI, so it carries terminal
+// FURNITURE we do not want in a chat view. Drop ONLY unambiguous chrome so no real
+// content is ever lost: full-width box-drawing separators, the status bar, and the
+// "thinking" spinner line. The prompt (U+276F) and answer bullet (U+25CF) lines,
+// and any normal text, always pass through.
+function isChromeLine(text) {
+  var t = (text || "").trim();
+  if (!t) { return false; }               // blanks handled by the dedupe below
+  // Full-width separator: every non-space glyph is a box-drawing char (U+2500..U+257F).
+  var boxOnly = true;
+  for (var i = 0; i < t.length; i++) {
+    var c = t.charCodeAt(i);
+    if (c === 0x20) { continue; }
+    if (c < 0x2500 || c > 0x257F) { boxOnly = false; break; }
+  }
+  if (boxOnly && t.length >= 8) { return true; }
+  // The persistent status bar.
+  if (t.indexOf("manual mode on") >= 0 || t.indexOf("for shortcuts") >= 0
+      || t.indexOf("for agents") >= 0) { return true; }
+  // The thinking spinner line, always begins with the U+273B glyph.
+  if (t.charCodeAt(0) === 0x273B) { return true; }
+  return false;
+}
+
+var _lastRenderedText = "";
+// A DIRECT session streams structured stream-json events (tool_call / tool_result
+// / status-with-subtype), not a scraped TUI. The moment we see any structured-only
+// event we flip into structured render mode for the rest of THIS stream: clean
+// per-type rendering, no chrome filter, no TUI-redraw dedupe (structured events
+// are each emitted once, so dedupe would wrongly drop a legitimately repeated
+// line). A capture-pane session only ever sends assistant_text + the "attached"
+// status, so it never trips this and keeps the chrome-filter + dedupe path.
+var _structured = false;
+
+function isStructuredSignal(ev) {
+  if (ev.type === "tool_call" || ev.type === "tool_result") { return true; }
+  if (ev.type === "status" && ev.data && ev.data.subtype) { return true; }
+  return false;
+}
+
+function appendEvDiv(cls, text) {
+  if (transcriptEl.firstChild && transcriptEl.firstChild.className === "placeholder") {
+    transcriptEl.textContent = "";
+  }
+  var div = document.createElement("div");
+  div.className = cls;
+  div.textContent = text;
+  transcriptEl.appendChild(div);
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+function renderStructured(ev) {
+  var d = ev.data || {};
+  if (ev.type === "tool_call") {
+    var name = d.name || ev.text || "tool";
+    var input = "";
+    try { input = d.input ? " " + JSON.stringify(d.input) : ""; } catch (e) {}
+    appendEvDiv("ev tool_call", "⚙ " + name + input);
+  } else if (ev.type === "tool_result") {
+    var body = (ev.text || "").replace(/\s+$/, "");
+    appendEvDiv("ev tool_result" + (d.is_error ? " err" : ""),
+                "↳ " + (body || "(no output)"));
+  } else if (ev.type === "assistant_text") {
+    if (ev.text) { appendEvDiv("ev assistant_text", ev.text); }
+  } else if (ev.type === "status") {
+    if (ev.text) { appendEvDiv("ev status", ev.text); }
+  } else if (ev.text) {
+    appendEvDiv("ev " + (ev.type || ""), ev.text);
+  }
+}
+
+function addEvent(ev) {
+  if (!_structured && isStructuredSignal(ev)) { _structured = true; }
+  if (_structured) { renderStructured(ev); return; }
+  // --- capture-pane (TUI) path: chrome-filter + dedupe raw terminal lines ---
+  var text = ev.text || "";
+  if (isChromeLine(text)) { return; }
+  // Collapse TUI redraws: skip a line identical to the one just rendered, and
+  // skip a blank line following a blank line (the TUI pads with many blanks).
+  var isBlank = !text.trim();
+  if (text === _lastRenderedText) { return; }
+  if (isBlank && !_lastRenderedText.trim()) { return; }
+  _lastRenderedText = text;
+  appendEvDiv("ev " + (ev.type || ""), text || JSON.stringify(ev.data || {}));
+}
+
+function openStream(sid) {
+  // Never activate (and never enable the follow-up inject) on an empty sid:
+  // that produced POST /api/v1/sessions//inject -> 404. Defense in depth on top
+  // of the injectSubmit guard.
+  if (!sid) { return; }
+  activityMode = false;
+  activityBar.classList.remove("open");
+  if (activityReconnect) { clearTimeout(activityReconnect); activityReconnect = null; }
+  if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+  activeSid = sid;
+  // A session is selected: enable the follow-up input (gated inject write).
+  if (injectText) { injectText.disabled = false; }
+  if (injectBtn) { injectBtn.disabled = false; }
+  if (injectMsg) { injectMsg.textContent = ""; }
+  _lastRenderedText = "";
+  _structured = false;
+  transcriptEl.textContent = "";
+  var url = wsUrl("/api/v1/sessions/" + encodeURIComponent(sid) + "/stream");
+  try {
+    ws = new WebSocket(url);
+  } catch (e) {
+    addEvent({ type: "status", text: "(could not open stream)" });
+    return;
+  }
+  ws.onmessage = function (m) { try { addEvent(JSON.parse(m.data)); } catch (e) {} };
+  ws.onclose = function (e) {
+    // 1008 = policy violation: the daemon rejects a bad/absent token BEFORE
+    // accept. Report it honestly rather than looking like an empty session.
+    if (e && e.code === 1008) {
+      addEvent({ type: "needs_input",
+                 text: "(stream refused: pair this device with the code host)" });
+    } else {
+      addEvent({ type: "status", text: "(stream closed)" });
+    }
+  };
+  ws.onerror = function () { addEvent({ type: "status", text: "(stream error)" }); };
+}
+
+function pairingEmptyState() {
+  listEl.textContent = "";
+  var box = document.createElement("div");
+  box.className = "empty";
+  var h = document.createElement("h2");
+  h.textContent = "No access yet";
+  var p1 = document.createElement("p");
+  p1.textContent = "Pair this device with the code host to view sessions.";
+  var p2 = document.createElement("p");
+  p2.textContent = "skcode-hostd is running and reachable, but it is not sharing "
+                 + "sessions with this device. Once pairing is set up, your live "
+                 + "sessions will appear here.";
+  box.appendChild(h);
+  box.appendChild(p1);
+  box.appendChild(p2);
+  listEl.appendChild(box);
+  clearTranscript("Not paired - no sessions to show.");
+}
+
+function errorState(msg) {
+  listEl.textContent = "";
+  var box = document.createElement("div");
+  box.className = "empty";
+  box.textContent = msg;
+  listEl.appendChild(box);
+}
+
+function noSessionsState() {
+  listEl.textContent = "";
+  var box = document.createElement("div");
+  box.className = "empty";
+  box.textContent = "No active sessions on this host.";
+  listEl.appendChild(box);
+  clearTranscript();
+}
+
+function renderList(rows) {
+  listEl.textContent = "";
+  if (!rows.length) { noSessionsState(); return; }
+  rows.forEach(function (s) {
+    var row = document.createElement("div");
+    row.className = "row";
+    if (s.sid === activeSid) { row.className += " active"; }
+    var name = document.createElement("div");
+    name.className = "name";
+    name.textContent = s.sid + "  [" + (s.state || "") + "]";
+    var meta = document.createElement("div");
+    meta.className = "meta";
+    var bits = [s.harness, s.host && ("@ " + s.host), s.repo, s.branch, s.model,
+                s.last_message].filter(function (x) { return x; });
+    meta.textContent = bits.join("  ");
+    row.appendChild(name);
+    row.appendChild(meta);
+    row.addEventListener("click", function () {
+      var all = listEl.querySelectorAll(".row");
+      for (var i = 0; i < all.length; i++) { all[i].classList.remove("active"); }
+      row.classList.add("active");
+      openStream(s.sid);
+    });
+    listEl.appendChild(row);
+  });
+}
+
+function loadHost() {
+  fetch(apiUrl("/api/v1/hosts/self"), { headers: authHeaders({ "Accept": "application/json" }) })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (j) { if (j && j.host) { hostEl.textContent = "host: " + j.host; } })
+    .catch(function () {});
+}
+
+function refresh() {
+  fetch(apiUrl("/api/v1/sessions"), { headers: authHeaders({ "Accept": "application/json" }) })
+    .then(function (r) {
+      if (r.status === 401 || r.status === 403) { pairingEmptyState(); return null; }
+      if (!r.ok) { errorState("Could not load sessions (" + r.status + ")."); return null; }
+      return r.json();
+    })
+    .then(function (j) { if (j) { renderList(j.sessions || []); } })
+    .catch(function () { errorState("Could not reach the code host (network error)."); });
+}
+
+document.getElementById("refresh").addEventListener("click", refresh);
+document.getElementById("activity-toggle").addEventListener("click", function () {
+  openActivityStream(true);
+});
+document.getElementById("activity-apply").addEventListener("click", function () {
+  openActivityStream(true);
+});
+
+// --- New session (compose) --------------------------------------------------
+// The ONLY write this client issues is the gated POST /api/v1/dispatch below.
+// Every VIEW path stays exactly as it was (GET read routes + read-only WS tail).
+// GET /api/v1/dispatch/targets is advisory: it just narrows the offered repos /
+// harnesses / profiles so the UI never proposes a forbidden target. The server
+// re-derives and re-enforces everything on dispatch and never trusts our choice.
+var composeEl = document.getElementById("compose");
+var composeToggle = document.getElementById("compose-toggle");
+var repoSel = document.getElementById("repo");
+var repoText = document.getElementById("repo-text");
+var repoHint = document.getElementById("repo-hint");
+var branchEl = document.getElementById("branch");
+var profileEl = document.getElementById("profile");
+var profileHintEl = document.getElementById("profile-hint");
+// Make the profile choice, and its consequences, explicit. FULL runs as the
+// operator (real HOME + tools + repos), so surface the skvault reminder: a
+// session cannot unlock the vault itself, and full-profile work that needs
+// secrets fails silently until the operator unlocks it out of band.
+function updateProfileHint() {
+  if (profileEl.value === "full") {
+    profileHintEl.textContent = "runs as YOU: your real HOME, tools/MCP, and repos. "
+      + "If the task needs secrets, unlock skvault first (skvault unlock), a session "
+      + "cannot unlock it for you. Treat it like handing over your terminal.";
+    profileHintEl.className = "hint warn";
+  } else {
+    profileHintEl.textContent = "isolated clean-room: no SKAGENT, no MCP, no skvault "
+      + "or repo access. Good for questions and scratch work.";
+    profileHintEl.className = "hint";
+  }
+}
+profileEl.addEventListener("change", updateProfileHint);
+updateProfileHint();
+var harnessEl = document.getElementById("harness");
+var modelEl = document.getElementById("model");
+// Say plainly where each model runs. The sk-* / ornith ids route THROUGH
+// skgateway to a local Ornith backend (no Anthropic cloud call, no cloud
+// token); the claude-* ids call the Anthropic cloud. This is live routing,
+// not a placeholder.
+var modelHintEl = document.getElementById("model-hint");
+function updateModelHint() {
+  if (modelEl.value === "sk-default" || modelEl.value === "ornith-big") {
+    modelHintEl.textContent = "routes through skgateway to local Ornith: "
+      + "cloud-free, no Anthropic call, no cloud token. Fast, private, sovereign.";
+  } else {
+    modelHintEl.textContent = "calls the Anthropic cloud (needs the operator's "
+      + "cloud token; withheld from sandbox by default).";
+  }
+}
+modelEl.addEventListener("change", updateModelHint);
+updateModelHint();
+// Sessions are always interactive (stays open, chat-like) from the UI. The
+// backend still supports a one-shot "direct" mode, reserved for the fast/cheap
+// skgateway model path (a follow-on), so it is not offered as a picker here.
+var promptEl = document.getElementById("prompt");
+var dispatchBtn = document.getElementById("dispatch-btn");
+var composeMsg = document.getElementById("compose-msg");
+var repoUsesText = false;
+
+// Panel show/hide, remembered in localStorage. This is the lightweight operator
+// toggle; it does NOT enable/disable dispatch server-side (that gate lives in hostd).
+var COMPOSE_KEY = "skcode.compose.open";
+function setComposeOpen(open) {
+  if (open) { composeEl.classList.add("open"); } else { composeEl.classList.remove("open"); }
+  try { localStorage.setItem(COMPOSE_KEY, open ? "1" : "0"); } catch (e) {}
+}
+composeToggle.addEventListener("click", function () {
+  setComposeOpen(!composeEl.classList.contains("open"));
+});
+try { setComposeOpen(localStorage.getItem(COMPOSE_KEY) === "1"); } catch (e) {}
+
+function setComposeMsg(text, isErr) {
+  composeMsg.textContent = text || "";
+  composeMsg.className = "msg" + (text ? (isErr ? " err" : " ok") : "");
+}
+
+function fillSelect(sel, values) {
+  sel.textContent = "";
+  values.forEach(function (v) {
+    var o = document.createElement("option");
+    o.value = v; o.textContent = v;
+    sel.appendChild(o);
+  });
+}
+
+function useRepoText(note) {
+  repoUsesText = true;
+  repoSel.style.display = "none";
+  repoText.style.display = "";
+  repoHint.textContent = note || "";
+}
+
+// Seed a sane harness default up front so the panel is usable before (or without)
+// a targets response. claude-code is the only wired harness today.
+fillSelect(harnessEl, ["claude-code"]);
+
+// Advisory allowlist. This route is gated on the dispatch scope, so a view-only
+// token gets 403 here: we fall back to a free-text repo field and say so.
+function loadTargets() {
+  fetch(apiUrl("/api/v1/dispatch/targets"), { headers: authHeaders({ "Accept": "application/json" }) })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (j) {
+      if (!j) { useRepoText("Repo list unavailable; enter a repo the host allows."); return; }
+      var harnesses = j.harnesses || [];
+      if (harnesses.indexOf("claude-code") < 0) { harnesses = ["claude-code"].concat(harnesses); }
+      fillSelect(harnessEl, harnesses);
+      fillSelect(profileEl, j.profiles || ["sandbox", "full"]);
+      var repos = j.repos || [];
+      repoUsesText = false;
+      repoSel.style.display = "";
+      repoText.style.display = "none";
+      fillSelect(repoSel, repos);
+      // Prepend a "direct (no repo)" option and default to it: a fast, isolated
+      // scratch session (model Q&A) with no repo access. Pick a repo instead to
+      // start a coding session in an isolated worktree off its base branch.
+      var directOpt = document.createElement("option");
+      directOpt.value = "";
+      directOpt.textContent = "direct (no repo)";
+      repoSel.insertBefore(directOpt, repoSel.firstChild);
+      repoSel.value = "";
+      repoHint.textContent = repos.length
+        ? "direct = fast model session (no repo); or pick an allowed repo for a coding session"
+        : "direct model session (no repo)";
+    })
+    .catch(function () { useRepoText("Repo list unavailable; enter a repo the host allows."); });
+}
+
+function currentRepo() {
+  return repoUsesText ? repoText.value.trim() : (repoSel.value || "");
+}
+
+function dispatchSubmit() {
+  var prompt = promptEl.value.trim();
+  if (!prompt) { setComposeMsg("Prompt is required.", true); return; }
+  var repo = currentRepo();
+  var payload = {
+    harness: harnessEl.value || "claude-code",
+    model: modelEl.value || "sk-default",
+    repo: repo,
+    branch: repo ? (branchEl.value.trim() || "main") : "",
+    profile: profileEl.value || "sandbox",
+    permission_mode: "manual",
+    mode: "interactive",
+    prompt: prompt
+  };
+  dispatchBtn.disabled = true;
+  setComposeMsg("Starting session...", false);
+  fetch(apiUrl("/api/v1/dispatch"), {
+    method: "POST",
+    headers: authHeaders({ "Content-Type": "application/json", "Accept": "application/json" }),
+    body: JSON.stringify(payload)
+  })
+    .then(function (r) {
+      return r.text().then(function (t) {
+        var j = {};
+        try { j = t ? JSON.parse(t) : {}; } catch (e) {}
+        return { ok: r.ok, status: r.status, body: j };
+      });
+    })
+    .then(function (res) {
+      dispatchBtn.disabled = false;
+      if (!res.ok) {
+        var detail = (res.body && res.body.detail) || ("dispatch failed (" + res.status + ")");
+        setComposeMsg(String(detail), true);
+        return;
+      }
+      var sid = res.body.sid || "";
+      setComposeMsg("Started " + sid + (res.body.branch ? " on " + res.body.branch : "") + ".", false);
+      promptEl.value = "";
+      if (sid) {
+        activeSid = sid;
+        refresh();
+        openStream(sid);
+      } else {
+        refresh();
+      }
+    })
+    .catch(function () {
+      dispatchBtn.disabled = false;
+      setComposeMsg("Could not reach the code host (network error).", true);
+    });
+}
+dispatchBtn.addEventListener("click", dispatchSubmit);
+
+// Inject: send a follow-up into the ACTIVE session. Second (and last) gated
+// write this client issues (POST /api/v1/sessions/<sid>/inject, skcode.inject
+// scope). The session's own WS tail surfaces the reply, so on success we just
+// clear the box. Disabled until a session is selected.
+function injectSubmit() {
+  var text = (injectText.value || "").trim();
+  if (!text || !activeSid) { return; }
+  injectBtn.disabled = true;
+  injectMsg.textContent = "";
+  injectMsg.className = "msg";
+  fetch(apiUrl("/api/v1/sessions/" + encodeURIComponent(activeSid) + "/inject"), {
+    method: "POST",
+    headers: authHeaders({ "Content-Type": "application/json", "Accept": "application/json" }),
+    body: JSON.stringify({ text: text })
+  })
+    .then(function (r) {
+      return r.text().then(function (t) {
+        var j = {}; try { j = t ? JSON.parse(t) : {}; } catch (e) {}
+        return { ok: r.ok, status: r.status, body: j };
+      });
+    })
+    .then(function (res) {
+      injectBtn.disabled = false;
+      if (!res.ok) {
+        injectMsg.textContent = String((res.body && res.body.detail) || ("send failed (" + res.status + ")"));
+        injectMsg.className = "msg err";
+        return;
+      }
+      injectText.value = "";
+    })
+    .catch(function () {
+      injectBtn.disabled = false;
+      injectMsg.textContent = "send failed (network)";
+      injectMsg.className = "msg err";
+    });
+}
+injectBtn.addEventListener("click", injectSubmit);
+injectText.addEventListener("keydown", function (e) {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); injectSubmit(); }
+});
+
+loadHost();
+refresh();
+loadTargets();
+</script>
+</body>
+</html>
