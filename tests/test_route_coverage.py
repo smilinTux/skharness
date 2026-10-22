@@ -131,6 +131,11 @@ def test_cancel_route_is_gated_on_dispatch_scope():
 
     assert classify_route("POST", "/api/v1/sessions/{sid}/cancel") == ("gated", "skcode.dispatch")
     assert ROUTE_SCOPES[("POST", "/api/v1/sessions/{sid}/cancel")] == "skcode.dispatch"
+    assert classify_route("POST", "/api/v1/sessions/{sid}/archive") == (
+        "gated",
+        "skcode.dispatch",
+    )
+    assert ROUTE_SCOPES[("POST", "/api/v1/sessions/{sid}/archive")] == "skcode.dispatch"
     # skcode.dispatch is a PDP-decided scope with an existing rule row (shared
     # with dispatch/dispatch-targets); cancel needs no NEW capauth rule.
     assert "skcode.dispatch" in PDP_SCOPES

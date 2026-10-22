@@ -28,7 +28,9 @@ from skharness.control import ControlJournal
 from skharness.daemon import build_daemon_app
 from skharness.digest import read_latest_digest
 from skharness.harnesses.claude_code import ClaudeCodeHarness, parse_repo_allowlist
+from skharness.harnesses.pi import PiHarness
 from skharness.jobs import read_job_runs
+from skharness.securefs import SecureDir
 from skharness.session_events import SessionEventStore
 
 DEFAULT_PORT = 9394
@@ -220,23 +222,23 @@ def skcode_state_dir() -> Path:
 
 
 def build_audit_log():
-    """A structured audit sink for the dispatch surface (spec 7.4).
+    """Build a durable, descriptor-anchored, fail-closed audit sink.
 
-    Appends one JSON line per event to ``<state>/audit.log``. The dispatch route
-    REQUIRES an audit sink to be configured (fails closed to 501 without one), so
-    every allow/deny/spawn/reject is recorded. Best-effort on I/O errors: an audit
-    write failure must never crash the daemon, but the sink is always present.
+    Construction rejects every ancestor symlink. Each append verifies the final
+    file is a singly-linked regular file owned by this uid, then fsyncs both file
+    and containing directory before returning. Any failure propagates to the PEP;
+    it is never converted into a successful actuation receipt.
     """
-    path = skcode_state_dir() / "audit.log"
+    root = SecureDir.anchor(skcode_state_dir())
 
     def _audit(line: str) -> None:
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps({"ts": time.time(), "record": line}) + "\n")
-        except OSError:
-            pass
+        payload = (
+            json.dumps({"ts": time.time(), "record": line}, sort_keys=True).encode("utf-8") + b"\n"
+        )
+        root.append_durable("audit.log", payload)
 
+    # Retain the descriptor in the closure for the daemon lifetime.
+    _audit.secure_root = root  # type: ignore[attr-defined]
     return _audit
 
 
@@ -367,6 +369,25 @@ def build_dispatch_targets():
     return _targets
 
 
+def build_host_harness(*, host_id: str, harness_name: str):
+    """Build the one host-local session harness owned by this daemon.
+
+    Host selection is service configuration, never request metadata: all git,
+    tmux, Pi configuration, capture, and transcript I/O execute on this daemon's
+    host. Remote controllers reach each host through its authenticated hostd.
+    """
+    common = {
+        "host": host_id,
+        "worktree_root": skcode_state_dir() / "worktrees",
+        "reservation_root": skcode_state_dir() / "sid-reservations",
+    }
+    if harness_name == "claude-code":
+        return ClaudeCodeHarness(**common)
+    if harness_name == "pi":
+        return PiHarness(config_root=skcode_state_dir() / "pi-config", **common)
+    raise ValueError(f"unsupported host-local harness {harness_name!r}")
+
+
 def build_jobs_provider():
     """Wire ``GET /api/v1/jobs`` (spec section 8, card C-8) to the REAL cron
     ledger at its default path (``~/.skcapstone/logs/cron-ledger.jsonl``, or
@@ -460,15 +481,19 @@ def _serve(argv: list[str]) -> None:
     parser.add_argument("--host", required=True, help="Tailscale IP to bind")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--host-id", default=".158", help="node id for hosts/self")
+    parser.add_argument(
+        "--harness",
+        choices=("claude-code", "pi"),
+        default=os.environ.get("SKCODE_SESSION_HARNESS", "claude-code"),
+        help="host-local session harness (default: SKCODE_SESSION_HARNESS or claude-code)",
+    )
     args = parser.parse_args(argv)
 
     host = resolve_bind(args.host)
-    # The harness reads its dispatch allowlist from SKCODE_DISPATCH_REPOS by default
-    # (empty => deny all) and scopes worktrees under the skcode state dir.
-    harness = ClaudeCodeHarness(
-        host=args.host_id,
-        worktree_root=skcode_state_dir() / "worktrees",
-    )
+    # The selected harness executes the complete lifecycle on THIS host. It reads
+    # this host's allowlist (empty => deny all) and shares the authenticated,
+    # audited, pause-controlled daemon surface.
+    harness = build_host_harness(host_id=args.host_id, harness_name=args.harness)
     from skharness.operator_cli import dispatch_is_paused
 
     # SessionEvent v2 (card C-1, spec 5.3): a real, persisting event store, and
