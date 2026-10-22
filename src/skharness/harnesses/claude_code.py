@@ -493,6 +493,9 @@ class ClaudeCodeHarness(Harness):
         # drive skcode-spawned sessions, never an arbitrary full-privilege agent
         # window (lumina/jarvis) that merely shares the `skchat-agents` tmux.
         self._spawned_sids: set[str] = set()
+        # Exact pane executable recorded from the launch argv at spawn. Liveness
+        # intentionally does not inspect process children.
+        self._spawned_executables: dict[str, str] = {}
         # B2: for an interactive (resumable) session, the spawn context inject needs
         # to rebuild the `claude -p --resume` env + argv (profile/model/agent; the
         # worktree is derived from the sid). Populated only for interactive spawns,
@@ -668,6 +671,46 @@ class ClaudeCodeHarness(Harness):
         live = self._list_windows()
         historical = scan_historical(self.sessions_root, host=self.host)
         return live + historical
+
+    async def is_alive(self, sid: str) -> bool:
+        """Match one owned exact tmux resource to its spawn-time executable.
+
+        The pane PID must exist and tmux must report the exact executable recorded
+        from the launch argv. Child-process count is never queried or considered.
+        """
+        resource_id = self._resource_ids.get(sid)
+        expected = self._spawned_executables.get(sid)
+        if (
+            sid not in self._spawned_sids
+            or resource_id is None
+            or expected is None
+            or not _SID_RE.fullmatch(sid)
+            or not _RESOURCE_RE.fullmatch(resource_id)
+        ):
+            return False
+        result = self._run(
+            [
+                "tmux",
+                "list-panes",
+                "-t",
+                resource_id,
+                "-F",
+                "#{window_id}\\t#{pane_pid}\\t#{pane_current_command}\\t#{pane_dead}",
+            ]
+        )
+        rows = result.stdout.splitlines() if result.ok else []
+        if len(rows) != 1:
+            return False
+        fields = rows[0].split("\\t")
+        if len(fields) != 4:
+            return False
+        window_id, pane_pid, executable, pane_dead = (field.strip() for field in fields)
+        return (
+            window_id == resource_id
+            and pane_pid.isdigit()
+            and executable == expected
+            and pane_dead == "0"
+        )
 
     def _persist_transcript(self, sid: str, transcript: str) -> Path:
         """Durably write a transcript through descriptor-anchored directories."""
@@ -1468,8 +1511,10 @@ class ClaudeCodeHarness(Harness):
             )
             self._rollback_created_window(sid, resource_id, operation, failure)
         # CR-6.2 C2: remember this is a daemon-spawned session so inject may reach
-        # it (and ONLY it, plus its siblings). Recorded after the window is created.
+        # it (and ONLY it, plus its siblings). Record the exact pane executable
+        # from the launch argv without widening to aliases or child process names.
         self._spawned_sids.add(sid)
+        self._spawned_executables[sid] = os.path.basename(launch[0])
         # B2: an interactive session is resumable; record what inject needs to
         # rebuild the `claude -p --resume` env + argv. Direct sessions are one-shot
         # and get NO resume context, so inject's destructive respawn cannot touch

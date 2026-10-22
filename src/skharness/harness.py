@@ -257,6 +257,16 @@ class Harness(ABC):
             f"harness {self.name!r} does not implement the session plane (list_sessions)"
         )
 
+    async def is_alive(self, sid: str) -> bool:
+        """Whether an owned worker still runs its exact spawned executable.
+
+        Implementations fail closed for unowned sessions. Process children are
+        outside this contract: an idle agent with no children remains alive.
+        """
+        raise NotImplementedError(
+            f"harness {self.name!r} does not implement the session plane (is_alive)"
+        )
+
     async def stream(self, sid: str) -> AsyncIterator[SessionEvent]:
         """Ordered event stream for a session."""
         raise NotImplementedError(
