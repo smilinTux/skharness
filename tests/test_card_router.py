@@ -50,7 +50,7 @@ class FakeLauncher:
     async def __call__(self, assignment):
         self.assignments.append(assignment)
         receipt = LaunchReceipt(
-            session_id=f"session-{len(self.assignments)}",
+            session_id=assignment.session_id,
             card_id=assignment.card_id,
             agent_identity=assignment.agent_identity,
             worktree=assignment.worktree,
@@ -98,6 +98,7 @@ async def test_n_cards_yield_distinct_claimed_assignments_and_launcher_identity(
 
     assert len(result) == 3
     assert len({item.assignment.card_id for item in result}) == 3
+    assert len({item.assignment.session_id for item in result}) == 3
     assert len({item.assignment.agent_identity for item in result}) == 3
     assert len({item.assignment.worktree for item in result}) == 3
     assert len({item.assignment.branch for item in result}) == 3
@@ -111,8 +112,13 @@ async def test_n_cards_yield_distinct_claimed_assignments_and_launcher_identity(
         item.assignment.card_id: item.assignment.agent_identity for item in result
     }
     for item in result:
+        assert item.assignment.session_id == item.assignment.agent_identity
+        assert item.receipt.session_id == item.assignment.session_id
         assert item.receipt.card_id == item.assignment.card_id
         assert item.receipt.agent_identity == item.assignment.agent_identity
+    assert [row["session_id"] for row in launcher.request_log] == [
+        item.assignment.session_id for item in result
+    ]
     assert [row["card_id"] for row in launcher.request_log] == ["card0", "card1", "card2"]
     assert [row["agent_id"] for row in launcher.request_log] == [
         item.assignment.agent_identity for item in result
@@ -181,13 +187,37 @@ async def test_batch_claim_failure_releases_prior_claim_and_launches_nothing(tmp
 
 
 @pytest.mark.asyncio
-async def test_launcher_cannot_substitute_card_identity_worktree_or_branch(tmp_path):
+async def test_launcher_cannot_substitute_session_card_identity_worktree_or_branch(tmp_path):
     gate = FakeClaimGate()
 
     async def bad_launcher(assignment):
         return LaunchReceipt(
             session_id="session-1",
             card_id="different-card",
+            agent_identity=assignment.agent_identity,
+            worktree=assignment.worktree,
+            branch=assignment.branch,
+        )
+
+    router = CardSessionRouter(
+        gate,
+        bad_launcher,
+        worktree_root=tmp_path,
+        identity_token=tokens("aa11"),
+    )
+
+    with pytest.raises(LaunchInvariantError, match="honor"):
+        await router.route(routes(1))
+
+
+@pytest.mark.asyncio
+async def test_launcher_cannot_substitute_request_log_session_identity(tmp_path):
+    gate = FakeClaimGate()
+
+    async def bad_launcher(assignment):
+        return LaunchReceipt(
+            session_id="different-session",
+            card_id=assignment.card_id,
             agent_identity=assignment.agent_identity,
             worktree=assignment.worktree,
             branch=assignment.branch,

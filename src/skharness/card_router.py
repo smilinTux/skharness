@@ -48,6 +48,7 @@ class SessionAssignment:
     repo: str
     base_branch: str
     prompt: str
+    session_id: str
     agent_identity: str
     worktree: str
     branch: str
@@ -157,6 +158,7 @@ class CardSessionRouter:
             repo=route.repo,
             base_branch=route.base_branch,
             prompt=route.prompt,
+            session_id=identity,
             agent_identity=identity,
             worktree=str(self.worktree_root / identity),
             branch=f"skcode/{identity}",
@@ -167,6 +169,7 @@ class CardSessionRouter:
         """Reject any duplicate reserved dimension before the first claim."""
         dimensions = {
             "card": [item.card_id for item in assignments],
+            "session identity": [item.session_id for item in assignments],
             "agent identity": [item.agent_identity for item in assignments],
             "worktree": [item.worktree for item in assignments],
             "branch": [item.branch for item in assignments],
@@ -185,12 +188,14 @@ class CardSessionRouter:
     ) -> None:
         """Reject a launcher that substitutes or reuses an assignment fact."""
         expected = (
+            assignment.session_id,
             assignment.card_id,
             assignment.agent_identity,
             assignment.worktree,
             assignment.branch,
         )
         actual = (
+            receipt.session_id,
             receipt.card_id,
             receipt.agent_identity,
             receipt.worktree,
@@ -198,7 +203,7 @@ class CardSessionRouter:
         )
         if actual != expected:
             raise LaunchInvariantError("launcher did not honor the governed assignment")
-        if not receipt.session_id or receipt.session_id in seen_session_ids:
+        if receipt.session_id in seen_session_ids:
             raise LaunchInvariantError("launcher returned an empty or duplicate session identity")
 
     async def route(self, routes: Sequence[CardRoute]) -> list[RoutedSession]:
