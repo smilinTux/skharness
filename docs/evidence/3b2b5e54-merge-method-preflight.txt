@@ -1,0 +1,51 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /home/skuser01/.skenv/bin/python
+cachedir: .pytest_cache
+rootdir: /home/skuser01/work/skharness-3b2b5e54-merge-method-preflight
+configfile: pyproject.toml
+plugins: anyio-4.14.2, cov-7.1.0, mock-3.15.1, asyncio-1.4.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 14 items
+
+tests/test_gh_merge_method_preflight.py::test_resolve_prefers_squash_when_merge_commits_are_branch_rejected PASSED [  7%]
+tests/test_gh_merge_method_preflight.py::test_resolve_preference_is_deterministic[allowed0-squash] PASSED [ 14%]
+tests/test_gh_merge_method_preflight.py::test_resolve_preference_is_deterministic[allowed1-rebase] PASSED [ 21%]
+tests/test_gh_merge_method_preflight.py::test_resolve_preference_is_deterministic[allowed2-merge] PASSED [ 28%]
+tests/test_gh_merge_method_preflight.py::test_resolve_fails_closed_without_shared_method[None] PASSED [ 35%]
+tests/test_gh_merge_method_preflight.py::test_resolve_fails_closed_without_shared_method[policy1] PASSED [ 42%]
+tests/test_gh_merge_method_preflight.py::test_resolve_fails_closed_without_shared_method[policy2] PASSED [ 50%]
+tests/test_gh_merge_method_preflight.py::test_branch_rules_without_method_clause_allow_all_known_methods PASSED [ 57%]
+tests/test_gh_merge_method_preflight.py::test_branch_rules_intersect_explicit_allowed_methods PASSED [ 64%]
+tests/test_gh_merge_method_preflight.py::test_repository_flags_require_explicit_bools PASSED [ 71%]
+tests/test_gh_merge_method_preflight.py::test_gh_merge_argv_uses_squash_and_match_head PASSED [ 78%]
+tests/test_gh_merge_method_preflight.py::test_gh_merge_issues_zero_merge_subprocess_when_policy_blocks[None] PASSED [ 85%]
+tests/test_gh_merge_method_preflight.py::test_gh_merge_issues_zero_merge_subprocess_when_policy_blocks[policy1] PASSED [ 92%]
+tests/test_gh_merge_method_preflight.py::test_gh_merge_issues_zero_merge_subprocess_without_exact_head PASSED [100%]
+
+============================== 14 passed in 0.20s ==============================
+
+Docs-check repair (2026-09-14)
+================================
+
+Hosted failure reproduced from run 34883693720 at head
+5a6acca021eff05dc79fb3ebdbf845ca04579153:
+
+  [tier 2] changelog on code change
+    FAIL code under src/ or pyproject.toml changed but CHANGELOG.md did not.
+
+Root cause: the source change did not include the required CHANGELOG.md entry.
+The smallest correction adds one Unreleased/Fixed bullet for card 3b2b5e54.
+
+Focused verification:
+
+  pytest -q tests/test_gh_merge_method_preflight.py
+  14 passed in 0.19s
+
+Exact hosted validator source: smilinTux/sk-standards
+revision e4e27c04f838fecb4f8279affd0ed7f50f0081aa, tiers 1,2,3, with the
+PR changed-file list.
+
+  tier 1: pass (all 7 required docs present)
+  tier 2: pass (code changed and CHANGELOG.md updated)
+  tier 3: pass (all SOP evidence checks)
+  RESULT: pass
