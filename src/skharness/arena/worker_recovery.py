@@ -10,7 +10,7 @@ import hashlib
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, TextIO
+from typing import Callable
 
 
 @dataclass(frozen=True)

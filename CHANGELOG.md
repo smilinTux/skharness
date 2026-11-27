@@ -9,6 +9,13 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ## [Unreleased]
 
+- Added `skharness.arena.worker_recovery`: typed transport receipts, a strict
+  append-only JSONL event store, and `WorkerRecovery`, which records a provider
+  transport failure (for example an HTTP 400 before any useful output), releases
+  only the exact claim revision, and allows one bounded retry for work that is
+  retryable and has no side effects. Library API only; nothing calls it yet
+  (card `84f2c6a1`).
+
 - Added an empty, promotion-only Joule Economy golden-set v2 boundary. Candidate
   creation embeds and hashes exact source text, only ratified entries can gate,
   and v1 entries fail the v2 promotion schema (card `5e3569b9`).

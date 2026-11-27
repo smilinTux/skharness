@@ -1,5 +1,8 @@
 from skharness.arena.worker_recovery import (
-    AppendOnlyEventStore, TransportReceipt, WorkerProjection, WorkerRecovery,
+    AppendOnlyEventStore,
+    TransportReceipt,
+    WorkerProjection,
+    WorkerRecovery,
 )
 
 
@@ -29,7 +32,9 @@ def test_retry_is_bounded_and_side_effectful_never_replayed(tmp_path):
     recovery = WorkerRecovery(AppendOnlyEventStore(tmp_path / "events.jsonl"))
     receipt = TransportReceipt("card", "owner", 1, "lane", "http_400", 400)
     projection = WorkerProjection("card", "worker", "running")
-    release = lambda *_: True
+    def release(*_):
+        return True
+
     assert recovery.provider_failure(receipt, projection, release_claim=release).retry_allowed
     assert not recovery.provider_failure(receipt, projection, release_claim=release).retry_allowed
     assert not recovery.provider_failure(receipt, projection, release_claim=release, side_effectful=True).retry_allowed
