@@ -1,4 +1,9 @@
-from skharness.pi_startup import coordination_brief, interactive_profile, startup_environment, worker_profile
+from skharness.pi_startup import (
+    coordination_brief,
+    interactive_profile,
+    startup_environment,
+    worker_profile,
+)
 
 
 def test_interactive_keeps_safety_and_proxy_without_direct_registration():

@@ -9,6 +9,13 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
 
 ## [Unreleased]
 
+- Added `skharness.pi_startup`: bounded startup profiles for Pi sessions. The
+  interactive profile keeps project instructions and uses on-demand (proxy) MCP;
+  the worker profile is card scoped, loads no project-wide instruction files,
+  and only registers MCP tools that are explicitly allowlisted (wildcards are
+  rejected). Both carry the same safety invariants. Library API only; nothing
+  calls it yet (card `9ebf64bc`).
+
 - Added an empty, promotion-only Joule Economy golden-set v2 boundary. Candidate
   creation embeds and hashes exact source text, only ratified entries can gate,
   and v1 entries fail the v2 promotion schema (card `5e3569b9`).
