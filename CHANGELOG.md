@@ -16,6 +16,12 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   retryable and has no side effects. Library API only; nothing calls it yet
   (card `84f2c6a1`).
 
+- The RunRecord writer now joins gateway attribution: `build_run_record` calls
+  `attribution.verify_join` and records the observed gateway request rows in
+  `gateway_requests`. When the metrics store has no rows for the session, or is
+  unavailable, the record carries one request with explicitly ABSENT evidence
+  and never an invented request id (card `f142e229`).
+
 - Added an empty, promotion-only Joule Economy golden-set v2 boundary. Candidate
   creation embeds and hashes exact source text, only ratified entries can gate,
   and v1 entries fail the v2 promotion schema (card `5e3569b9`).
