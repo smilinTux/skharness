@@ -39,6 +39,9 @@ def _isolate_run_journal(tmp_path, monkeypatch):
     ledger and the joule wallet, now closed here for the run journal too.
     """
     monkeypatch.setenv("SK_AUTOPILOT_RUNS_DIR", str(tmp_path / "runs"))
+    # The writer joins against the gateway metrics store; never read the
+    # operator's live one from a test.
+    monkeypatch.setenv("SKHARNESS_GATEWAY_METRICS_DB", str(tmp_path / "no-gateway.db"))
 
 
 def _spec(name="skrender"):
@@ -326,3 +329,29 @@ def test_verdict_with_no_run_record_written_fails_the_drill(mocker):
 
     with pytest.raises(AssertionError):
         _drill_assert_run_record_exists()
+
+
+def test_unavailable_gateway_store_yields_one_explicit_absent_request():
+    """No gateway rows is recorded as ABSENT evidence, not a fabricated request id."""
+    from skharness.autocode.run_record import EvidenceState
+
+    started = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
+    record = run_record_writer.build_run_record(
+        run_id="airun-card-2-20260825T120000Z", card_id="card-2",
+        repository="skharness", round=1, adapter="claude-code",
+        model_requested="sk-creative", grader_model="sk-creative",
+        effort_tier="gated", work_grade=None, score=5, passed=True,
+        notes="ready COMPLETE", outcome="pass", ci_status="green",
+        diff_coverage=0.93, min_diff_coverage=0.8, pr=None, retries=0,
+        payload=None, started_at=started,
+        finished_at=started + timedelta(seconds=30),
+        recorded_at=started + timedelta(seconds=31),
+        source_namespace="skharness.autocode.engineering.run",
+    )
+    assert len(record.gateway_requests) == 1
+    request = record.gateway_requests[0]
+    assert request.sequence == 1
+    assert request.request_id.state is EvidenceState.ABSENT
+    assert request.request_id.value is None
+    assert request.served_model.state is EvidenceState.ABSENT
+    assert request.usage.state is EvidenceState.ABSENT
