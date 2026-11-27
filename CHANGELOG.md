@@ -16,6 +16,13 @@ dispatching `publish.yml` on `main`, which cuts the next patch tag itself.
   rejected). Both carry the same safety invariants. Library API only; nothing
   calls it yet (card `9ebf64bc`).
 
+- Added `skharness.arena.worker_recovery`: typed transport receipts, a strict
+  append-only JSONL event store, and `WorkerRecovery`, which records a provider
+  transport failure (for example an HTTP 400 before any useful output), releases
+  only the exact claim revision, and allows one bounded retry for work that is
+  retryable and has no side effects. Library API only; nothing calls it yet
+  (card `84f2c6a1`).
+
 - The RunRecord writer now joins gateway attribution: `build_run_record` calls
   `attribution.verify_join` and records the observed gateway request rows in
   `gateway_requests`. When the metrics store has no rows for the session, or is
