@@ -37,10 +37,13 @@ patched around silently:
    that at the verdict boundary today -- ``joules.BuildUsage`` is a build-wide
    aggregate with no per-request ordered trail. Writing fabricated per-request
    rows to satisfy the aggregate reconciliation would be worse than omitting
-   them, so this writer reports usage/cost/energy as ``AggregateState.ABSENT``
-   with no ``gateway_requests``, honestly declaring "not observed at this
-   boundary" rather than manufacturing evidence. Wiring the real join lives in
-   ``attribution.py`` (card c7aea2e0) and is a separate, larger project.
+   them, so this writer reports usage/cost/energy as ``AggregateState.ABSENT``,
+   declaring "not observed at this boundary" rather than manufacturing
+   evidence. The record now carries the
+   gateway rows ``attribution.verify_join`` can actually observe, one
+   ``GatewayRequestProvenance`` per request found for the session; when the
+   store holds none (or is unavailable) it carries a single request whose
+   evidence is explicitly ABSENT, never an invented request id.
 3. When the LLM grader returns no parseable score (``gr.score is None`` --
    the "grade-resilience" / salvage path), ``twin_gate_passed`` still returns
    a definite boolean (always ``False`` in that case). The frozen
